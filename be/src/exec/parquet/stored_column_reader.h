@@ -42,7 +42,7 @@ public:
     // If need_levels is set, client will get all levels through get_levels function.
     // If need_levels is not set, read_records may not records levels information, this will
     // improve performance. So set this flag when you only needs it.
-    // TODO(zc): to recosiderate to move this flag to StoredColumnReaderOptions
+    // TODO(zc): to reconsider to move this flag to StoredColumnReaderOptions
     virtual void set_needs_levels(bool need_levels) {}
 
     // Try to read values that can assemble up to num_rows rows. For example if we want to read

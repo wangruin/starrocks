@@ -649,7 +649,7 @@ public:
     }
 
     Status canonicalize(const std::string& path, std::string* result) override {
-        // NOTE: we must use free() to release the buffer retruned by realpath(),
+        // NOTE: we must use free() to release the buffer returned by realpath(),
         // because the buffer is allocated by malloc(), see `man 3 realpath`.
         std::unique_ptr<char[], FreeDeleter> r(realpath(path.c_str(), nullptr));
         if (r == nullptr) {

@@ -63,7 +63,7 @@ private:
     Status _filter_group(const tparquet::RowGroup& group, bool* is_filter);
 
     // get row group to read
-    // if scan range conatain the first byte in the row group, will be read
+    // if scan range contain the first byte in the row group, will be read
     // TODO: later modify the larger block should be read
     bool _select_row_group(const tparquet::RowGroup& row_group);
 
@@ -87,7 +87,7 @@ private:
     int _get_partition_column_idx(const std::string& col_name) const;
 
     // check magic number of parquet file
-    // current olny support "PAR1"
+    // current only support "PAR1"
     static Status _check_magic(const uint8_t* file_magic);
 
     // decode min/max value from row group stats

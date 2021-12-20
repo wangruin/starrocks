@@ -40,7 +40,7 @@ public:
 private:
     Status _next_page();
 
-    // Try to deocde enough levels in levels buffer, except there is no enough levels in current
+    // Try to decode enough levels in levels buffer, except there is no enough levels in current
     void _decode_levels(size_t num_levels);
 
     void _delimit_rows(size_t* num_rows, size_t* num_levels_parsed);

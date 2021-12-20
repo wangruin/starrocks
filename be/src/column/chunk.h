@@ -146,12 +146,12 @@ public:
 
     // columns in chunk may have same column ptr
     // append_safe will check size of all columns in dest chunk
-    // to ensure same column will not apppend repeatedly
+    // to ensure same column will not append repeatedly
     void append_safe(const Chunk& src) { append_safe(src, 0, src.num_rows()); }
 
     // columns in chunk may have same column ptr
     // append_safe will check size of all columns in dest chunk
-    // to ensure same column will not apppend repeatedly
+    // to ensure same column will not append repeatedly
     void append_safe(const Chunk& src, size_t offset, size_t count);
 
     // This function will append data from src according to the input indexes. 'indexes' contains

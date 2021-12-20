@@ -130,7 +130,7 @@ static uint32_t crc_hash_32(const void* data, int32_t bytes, uint32_t hash) {
         ++p;
     }
 
-    // The lower half of the CRC hash has has poor uniformity, so swap the halves
+    // The lower half of the CRC hash has poor uniformity, so swap the halves
     // for anyone who only uses the first several bits of the hash.
     hash = (hash << 16u) | (hash >> 16u);
     return hash;

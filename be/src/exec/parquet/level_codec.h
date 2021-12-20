@@ -21,8 +21,8 @@ public:
     LevelDecoder() = default;
     ~LevelDecoder() = default;
 
-    // Decode will try to decode data in slice, only some of the input slice will used.
-    // This function will changed slice to undecoded part.
+    // Decode will try to decode data in slice, only some inputs slice will be used.
+    // This function will change slice to undecoded part.
     // For example:
     //     input 1000 length data, and decoder digest 100 bytes. slice will be set to
     //     the last 900.

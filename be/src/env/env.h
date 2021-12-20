@@ -82,7 +82,7 @@ public:
     // Creates a new readable and writable file. If a file with the same name
     // already exists on disk, it is deleted.
     //
-    // Some of the methods of the new file may be accessed concurrently,
+    // Some methods of the new file may be accessed concurrently,
     // while others are only safe for access by one thread at a time.
     virtual Status new_random_rw_file(const std::string& fname, std::unique_ptr<RandomRWFile>* result) = 0;
 
@@ -113,7 +113,7 @@ public:
     //
     // The function call extra cost is acceptable. Compared with returning all children
     // into a given vector, the performance of this method is 5% worse. However this
-    // approach is more flexiable and efficient in fulfilling other requirements.
+    // approach is more flexible and efficient in fulfilling other requirements.
     //
     // Returns OK if "dir" exists.
     //         NotFound if "dir" does not exist, the calling process does not have

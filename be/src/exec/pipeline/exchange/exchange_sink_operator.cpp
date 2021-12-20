@@ -53,7 +53,7 @@ public:
     Status send_one_chunk(const vectorized::Chunk* chunk, bool eos);
 
     // Send one chunk to remote, this chunk may be batched in this channel.
-    // When the chunk is sent really rather than bachend, *is_real_sent will
+    // When the chunk is sent really rather than backend, *is_real_sent will
     // be set to true.
     Status send_one_chunk(const vectorized::Chunk* chunk, bool eos, bool* is_real_sent);
 
@@ -344,7 +344,7 @@ Status ExchangeSinkOperator::push_chunk(RuntimeState* state, const vectorized::C
         // 2. serialize input chunk to pchunk
         RETURN_IF_ERROR(serialize_chunk(chunk.get(), pchunk, &_is_first_chunk, _channels.size()));
         _current_request_bytes += pchunk->data().size();
-        // 3. if request bytes exceede the threshold, send current request
+        // 3. if request bytes exceed the threshold, send current request
         if (_current_request_bytes > _request_bytes_threshold) {
             butil::IOBuf attachment;
             construct_brpc_attachment(_chunk_request, attachment);

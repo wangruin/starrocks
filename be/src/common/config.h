@@ -66,7 +66,7 @@ CONF_Int64(tc_max_total_thread_cache_bytes, "1073741824");
 // process memory limit specified as number of bytes
 // ('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'),
 // or percentage of the physical memory ('<int>%').
-// defaults to bytes if no unit is given"
+// defaults to bytes if no unit is given
 // must larger than 0. and if larger than physical memory size,
 // it will be set to physical memory size.
 CONF_String(mem_limit, "90%");
@@ -105,7 +105,7 @@ CONF_Int32(download_worker_count, "1");
 CONF_Int32(make_snapshot_worker_count, "5");
 // the count of thread to release snapshot
 CONF_Int32(release_snapshot_worker_count, "5");
-// the interval time(seconds) for agent report tasks signatrue to FE
+// the interval time(seconds) for agent report tasks signature to FE
 CONF_mInt32(report_task_interval_seconds, "10");
 // the interval time(seconds) for agent report disk state to FE
 CONF_mInt32(report_disk_state_interval_seconds, "60");
@@ -329,7 +329,7 @@ CONF_Int32(number_tablet_writer_threads, "16");
 
 // Automatically detect whether a char/varchar column to use dictionary encoding
 // If the number of keys in a dictionary is greater than this fraction of the total number of rows
-// turn off dictionary dictionary encoding. This only will detect first chunk
+// turn off dictionary encoding. This only will detect first chunk
 // set to 1 means always use dictionary encoding
 CONF_Double(dictionary_encoding_ratio, "0.7");
 // The minimum chunk size for dictionary encoding speculation
@@ -390,7 +390,7 @@ CONF_Bool(disable_mem_pools, "false");
 // you can do it as root via "sysctl -w vm.max_map_count=262144" or
 // "echo 262144 > /proc/sys/vm/max_map_count"
 // NOTE: When this is set to true, you must set chunk_reserved_bytes_limit
-// to a relative large number or the performace is very very bad.
+// to a relative large number or the performance is very very bad.
 CONF_Bool(use_mmap_allocate_chunk, "false");
 
 // Chunk Allocator's reserved bytes limit,
@@ -494,7 +494,7 @@ CONF_mInt32(max_consumer_num_per_group, "3");
 // this should be larger than FE config 'max_concurrent_task_num_per_be' (default 5)
 CONF_Int32(routine_load_thread_pool_size, "10");
 
-// Is set to true, index loading failure will not causing BE exit,
+// Is set to true, index loading failure will not cause BE exit,
 // and the tablet will be marked as bad, so that FE will try to repair it.
 // CONF_Bool(auto_recover_index_loading_failure, "false");
 
@@ -550,17 +550,17 @@ CONF_Int64(brpc_socket_max_unwritten_bytes, "1073741824");
 CONF_mInt64(max_runnings_transactions_per_txn_map, "100");
 
 // tablet_map_lock shard size, the value must be power of two.
-// this is a an enhancement for better performance to manage tablet
+// this is an enhancement for better performance to manage tablet
 CONF_Int32(tablet_map_shard_size, "32");
 
 CONF_String(plugin_path, "${STARROCKS_HOME}/plugin");
 
 // txn_map_lock shard size, the value is 2^n, n=0,1,2,3,4
-// this is a an enhancement for better performance to manage txn
+// this is an enhancement for better performance to manage txn
 CONF_Int32(txn_map_shard_size, "128");
 
 // txn_lock shard size, the value is 2^n, n=0,1,2,3,4
-// this is a an enhancement for better performance to commit and publish txn
+// this is an enhancement for better performance to commit and publish txn
 CONF_Int32(txn_shard_size, "1024");
 
 // Whether to continue to start be when load tablet from header failed.

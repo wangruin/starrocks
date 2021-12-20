@@ -131,7 +131,7 @@ public:
             _offset += length;
             num_decoded++;
         }
-        // never happend
+        // never happened
         if (num_decoded < count || _offset > _data.size) {
             return Status::InternalError(strings::Substitute(
                     "going to read out-of-bounds data, offset=$0,count=$1,size=$2", _offset, count, _data.size));
@@ -151,7 +151,7 @@ public:
             _offset += length;
             num_decoded++;
         }
-        // never happend
+        // never happened
         if (num_decoded < count || _offset > _data.size) {
             return Status::InternalError(strings::Substitute(
                     "going to read out-of-bounds data, offset=$0,count=$1,size=$2", _offset, count, _data.size));

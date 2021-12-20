@@ -89,7 +89,7 @@ bool init_glog(const char* basename, bool install_signal_handler) {
     }
 
     // set log buffer level
-    // defalut is 0
+    // default is 0
     std::string& logbuflevel = config::log_buffer_level;
     if (iequals(logbuflevel, "-1")) {
         FLAGS_logbuflevel = -1;

@@ -31,7 +31,7 @@ public:
     const tparquet::PageHeader* current_header() const { return &_cur_header; }
 
     // Must call this function ater next_header called. The total read size
-    // after one next_header can not exceede the page's compressed_page_size.
+    // after one next_header can not exceed the page's compressed_page_size.
     Status read_bytes(const uint8_t** buffer, size_t size);
 
     // seek to read position, this position must be a start of a page header.

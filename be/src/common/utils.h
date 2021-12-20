@@ -39,7 +39,7 @@ void set_request_auth(T* req, const AuthInfo& auth) {
     if (auth.auth_code != -1) {
         // if auth_code is set, no need to set other info
         req->__set_auth_code(auth.auth_code);
-        // user name and passwd is unused, but they are required field.
+        // username and passwd is unused, but they are required field.
         // so they have to be set.
         req->user = "";
         req->passwd = "";

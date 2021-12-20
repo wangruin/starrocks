@@ -6,7 +6,7 @@
 namespace starrocks {
 namespace pipeline {
 
-// For uni cast stream sink, we just add a exchange sink operator
+// For uni cast stream sink, we just add an exchange sink operator
 // at the end of the pipeline. It works like
 // [source pipeline]  -> exchange_sink_operator
 
@@ -16,16 +16,16 @@ namespace pipeline {
 //                                                     |             -> [new pipeline2]
 //                                                     |             -> [new pipeline3]
 // and for each new pipeline, the internal structure is
-// [new pileine]: mcast_local_source -> exchange_sink_operator
+// [new pipeline]: mcast_local_source -> exchange_sink_operator
 
 // The dataflow works like:
 // 1. mcast_local_sink push chunks to exchanger
 // 2. mcast_local_source pull chunks from exchanger
 
 // The exchanger should take care of several things:
-// 1. can accept chunk or not. we don't want to block any consumer. we can accept chunk only when a any consumer needs chunk.
+// 1. can accept chunk or not. we don't want to block any consumer. we can accept chunk only when an any consumer needs chunk.
 // 2. can throw chunk or not. we can only throw any chunk when all consumers have consumed that chunk.
-// 3. can pull chiunk. we maintain the progress of consumers.
+// 3. can pull chunk. we maintain the progress of consumers.
 
 // ===== exchanger =====
 class MultiCastLocalExchanger {

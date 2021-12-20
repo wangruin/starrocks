@@ -73,7 +73,7 @@ void SinkBuffer::add_request(const TransmitChunkInfo& request) {
 
 bool SinkBuffer::is_full() const {
     // std::queue' read is concurrent safe without mutex
-    // Judgement may not that accurate because we do not known in advance which
+    // Judgement may not that accurate because we do not know in advance which
     // instance the data to be sent corresponds to
     size_t max_buffer_size = config::pipeline_sink_buffer_size * _buffers.size();
     size_t buffer_size = 0;
@@ -100,7 +100,7 @@ void SinkBuffer::cancel_one_sinker() {
 }
 
 void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_t sequence) {
-    // Both sender side and receiver side can tolerate disorder of tranmission
+    // Both senders side and receiver side can tolerate disorder of transmission
     // if receiver side is not ExchangeMergeSortSourceOperator
     if (!_is_dest_merge) {
         return;
@@ -150,7 +150,7 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id) {
             buffer.pop();
         });
 
-        // The order of data transmiting in IO level may not be strictly the same as
+        // The order of data transmitting in IO level may not be strictly the same as
         // the order of submitting data packets
         // But we must guarantee that first packet must be received first
         if (_num_finished_rpcs[instance_id.lo] == 0 && _num_in_flight_rpcs[instance_id.lo] > 0) {
@@ -180,7 +180,7 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id) {
                     request.params->set_eos(false);
                 }
             } else {
-                // The order of data transmiting in IO level may not be strictly the same as
+                // The order of data transmitting in IO level may not be strictly the same as
                 // the order of submitting data packets
                 // But we must guarantee that eos packent must be the last packet
                 if (_num_in_flight_rpcs[instance_id.lo] > 0) {

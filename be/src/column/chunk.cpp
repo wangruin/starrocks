@@ -216,7 +216,7 @@ Status Chunk::deserialize(const uint8_t* src, size_t len, const RuntimeChunkMeta
     // For some object column types like bitmap/hll/percentile, "estimated" and "real" are not always the same.
     // And for bitmap, sometimes `len` and `expected` are different. So to fix that problem, we fallback to compare "real" serialized size.
 
-    // We compare "real" serialized size first. It may fails because of backward compatibility. For old version of BE,
+    // We compare "real" serialized size first. It may fail because of backward compatibility. For old version of BE,
     // there is no "serialized_size" this field(which means the value is zero), and we fallback to compare "estimated" serialized size.
     // And for new version of BE, the "real" serialized size always matches, and we can save the cost of calling `serialzied_size`.
     size_t read_size = src - head;

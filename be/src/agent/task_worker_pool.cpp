@@ -392,7 +392,7 @@ void* TaskWorkerPool::_alter_tablet_worker_thread_callback(void* arg_this) {
             agent_task_req = worker_pool_this->_tasks.front();
             worker_pool_this->_tasks.pop_front();
         }
-        int64_t signatrue = agent_task_req.signature;
+        int64_t signature = agent_task_req.signature;
         LOG(INFO) << "get alter table task, signature: " << agent_task_req.signature;
         bool is_task_timeout = false;
         if (agent_task_req.__isset.recv_time) {
@@ -407,7 +407,7 @@ void* TaskWorkerPool::_alter_tablet_worker_thread_callback(void* arg_this) {
             TTaskType::type task_type = agent_task_req.task_type;
             switch (task_type) {
             case TTaskType::ALTER:
-                worker_pool_this->_alter_tablet(worker_pool_this, agent_task_req, signatrue, task_type,
+                worker_pool_this->_alter_tablet(worker_pool_this, agent_task_req, signature, task_type,
                                                 &finish_task_request);
                 break;
             default:
@@ -443,7 +443,7 @@ void TaskWorkerPool::_alter_tablet(TaskWorkerPool* worker_pool_this, const TAgen
 
     // Check last schema change status, if failed delete tablet file
     // Do not need to adjust delete success or not
-    // Because if delete failed create rollup will failed
+    // Because if delete failed create rollup will fail
     TTabletId new_tablet_id;
     TSchemaHash new_schema_hash = 0;
     if (status == STARROCKS_SUCCESS) {

@@ -423,7 +423,7 @@ Status ScalarColumnReader::_init_convert_info() {
             _converter = std::make_unique<Int32ToDateConverter>();
             break;
             // when decimal precision is greater than 27, precision may be lost in the following
-            // process. However to handle most enviroment, we also make progress other than
+            // process. However to handle most environment, we also make progress other than
             // rejection
         case PrimitiveType::TYPE_DECIMALV2:
             // All DecimalV2 use scale 9 as scale
@@ -461,7 +461,7 @@ Status ScalarColumnReader::_init_convert_info() {
             _converter = std::make_unique<IntToIntConverter<int64_t, int32_t>>();
             break;
             // when decimal precision is greater than 27, precision may be lost in the following
-            // process. However to handle most enviroment, we also make progress other than
+            // process. However to handle most environment, we also make progress other than
             // rejection
         case PrimitiveType::TYPE_DECIMALV2:
             // All DecimalV2 use scale 9 as scale
@@ -595,7 +595,7 @@ static void def_rep_to_offset(const LevelInfo& level_info, const level_t* def_le
         }
 
         // when del_level equals with max_def_level, this is a null element or a required element
-        // when del_level equals with (max_def_level - 1), this indicates a empty array
+        // when del_level equals with (max_def_level - 1), this indicates an empty array
         // when del_level less than (max_def_level - 1) it means this array is null
         if (def_levels[i] >= level_info.max_def_level - 1) {
             is_nulls[offset_pos - 1] = 0;

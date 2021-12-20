@@ -59,17 +59,17 @@ public:
     // used to set fixed length
     virtual void set_type_legth(int32_t type_length) {}
 
-    // Set a new page to decoded.
+    // Set a new page to decode.
     virtual Status set_data(const Slice& data) = 0;
 
-    // For history reason, decoder don't known how many elements encoded in one page.
+    // For history reason, decoder don't know how many elements encoded in one page.
     // Caller must assure that no out-of-bounds access.
     // It will return ERROR if caller wants to read out-of-bound data.
     virtual Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) = 0;
 
     // Currently, this function is only used to read dictionary values.
     virtual Status next_batch(size_t count, uint8_t* dst) {
-        return Status::NotSupported("next_batch is not supportted");
+        return Status::NotSupported("next_batch is not supported");
     }
 };
 

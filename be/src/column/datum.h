@@ -120,9 +120,9 @@ public:
 
     void set_null() { _value = std::monostate(); }
 
-    template <class Vistor>
-    void visit(Vistor&& vistor) {
-        vistor(_value);
+    template <class Visitor>
+    void visit(Visitor&& visitor) {
+        visitor(_value);
     }
 
 private:

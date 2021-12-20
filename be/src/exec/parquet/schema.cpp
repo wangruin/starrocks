@@ -142,7 +142,7 @@ Status SchemaDescriptor::list_to_field(const std::vector<tparquet::SchemaElement
             // this is 3-level case, it will generate a list<element>
             RETURN_IF_ERROR(node_to_field(t_schemas, pos + 2, cur_level_info, element, next_pos));
         } else {
-            // Have a required group field with chidren, this will generate a group element
+            // Have a required group field with children, this will generate a group element
             // list<group<child>>
             RETURN_IF_ERROR(group_to_struct_field(t_schemas, pos + 1, cur_level_info, element, next_pos));
         }

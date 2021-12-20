@@ -277,7 +277,7 @@ Status EsPredicate::_build_binary_predicate(const Expr* conjunct, bool* handled)
         // doris on es should ignore this doris native cast transformation, we push down this `cast` to elasticsearch
         // conjunct->get_child(0)->node_type() return CAST_EXPR
         // conjunct->get_child(1)->node_type() return FLOAT_LITERAL
-        // the left child is literal and right child is SlotRef maybe not happend, but here we just process
+        // the left child is literal and right child is SlotRef maybe not happen, but here we just process
         // this situation regardless of the rewrite logic from the FE's Query Engine
         if (TExprNodeType::SLOT_REF == conjunct->get_child(0)->node_type() ||
             TExprNodeType::CAST_EXPR == conjunct->get_child(0)->node_type()) {
@@ -519,8 +519,8 @@ Status EsPredicate::_build_in_predicate(const Expr* conjunct, bool* handled) {
             break;
         }
         default:
-            DCHECK(false) << "unsupport type:" << expr->type().type;
-            return Status::InternalError("unsupport type to push down to ES");
+            DCHECK(false) << "unsupported type:" << expr->type().type;
+            return Status::InternalError("unsupported type to push down to ES");
         }
 
         std::string col = slot_desc->col_name();
@@ -541,7 +541,7 @@ Status EsPredicate::_build_compound_predicate(const Expr* conjunct, bool* handle
 
     if (TExprNodeType::COMPOUND_PRED == conjunct->node_type()) {
         *handled = true;
-        // processe COMPOUND_AND, such as:
+        // process COMPOUND_AND, such as:
         // k = 1 or (k1 = 7 and (k2 in (6,7) or k3 = 12))
         // k1 = 7 and (k2 in (6,7) or k3 = 12) is compound pred, we should rebuild this sub tree
         if (conjunct->op() == TExprOpcode::COMPOUND_AND) {

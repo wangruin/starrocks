@@ -336,7 +336,7 @@ void ArrayColumn::crc32_hash_at(uint32_t* hash, int32_t idx) const {
 }
 
 // TODO: fnv_hash and crc32_hash in array column may has performance problem
-// We need to make it possible in the future to provide vistor interface to iterator data
+// We need to make it possible in the future to provide visitor interface to iterator data
 // as much as possible
 
 void ArrayColumn::fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const {

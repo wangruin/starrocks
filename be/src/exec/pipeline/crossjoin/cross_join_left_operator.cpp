@@ -272,7 +272,7 @@ StatusOr<vectorized::ChunkPtr> CrossJoinLeftOperator::pull_chunk(RuntimeState* s
             // get left chunk's size.
             size_t probe_chunk_size = _probe_chunk_index;
             // step 2:
-            // if left chunk is bigger than right, we shuld scan left based on right.
+            // if left chunk is bigger than right, we should scan left based on right.
             if (probe_chunk_size > _curr_build_rows_remainder) {
                 if (row_count > probe_chunk_size - _probe_rows_index) {
                     row_count = probe_chunk_size - _probe_rows_index;

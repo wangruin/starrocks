@@ -35,14 +35,14 @@ StatusOr<vectorized::ChunkPtr> RepeatOperator::pull_chunk(RuntimeState* state) {
 }
 
 void RepeatOperator::extend_and_update_columns(ChunkPtr* curr_chunk) {
-    // extend virtual columns for gourping_id and grouping()/grouping_id() columns.
+    // extend virtual columns for grouping_id and grouping()/grouping_id() columns.
     for (int i = 0; i < _grouping_list.size(); ++i) {
         auto grouping_column = generate_repeat_column(_grouping_list[i][_repeat_times_last], (*curr_chunk)->num_rows());
 
         (*curr_chunk)->append_column(grouping_column, _tuple_desc->slots()[i]->id());
     }
 
-    // update columns for unneed columns.
+    // update columns for unneeded columns.
     const std::vector<SlotId>& null_slot_ids = _null_slot_ids[_repeat_times_last];
     for (auto slot_id : null_slot_ids) {
         auto null_column = ColumnHelper::create_const_null_column((*curr_chunk)->num_rows());

@@ -68,7 +68,7 @@ private:
     void _pre_process_columns_and_conjunct_ctxs();
     bool _can_using_dict_filter(const SlotDescriptor* slot, const SlotIdExprContextsMap& slot_conjunct_ctxs,
                                 const tparquet::ColumnMetaData& column_metadata);
-    // Returns true if all of the data pages in the column chunk are dict encoded
+    // Returns true if all the data pages in the column chunk are dict encoded
     bool _column_all_pages_dict_encoded(const tparquet::ColumnMetaData& column_metadata);
     Status _rewrite_dict_column_predicates();
     void _init_read_chunk();
@@ -99,7 +99,7 @@ private:
 
     // dict filter column
     std::vector<GroupReaderParam::Column> _dict_filter_columns;
-    // direct read conlumns
+    // direct read columns
     std::vector<GroupReaderParam::Column> _direct_read_columns;
 
     // dict value is empty after conjunct eval, file group can be skipped

@@ -91,7 +91,7 @@ Status AggregateStreamingSinkOperator::_push_chunk_by_auto(const size_t chunk_si
         _aggregator->should_expand_preagg_hash_tables(_aggregator->num_input_rows(), chunk_size,
                                                       _aggregator->mem_pool()->total_allocated_bytes(),
                                                       _aggregator->hash_map_variant().size())) {
-        // hash table is not full or allow expand the hash table according reduction rate
+        // hash table is not full or allow to expand the hash table according reduction rate
         SCOPED_TIMER(_aggregator->agg_compute_timer());
         if (false) {
         }
