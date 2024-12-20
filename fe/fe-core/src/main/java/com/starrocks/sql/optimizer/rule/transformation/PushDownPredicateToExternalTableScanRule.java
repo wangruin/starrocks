@@ -45,6 +45,8 @@ public class PushDownPredicateToExternalTableScanRule extends TransformationRule
             new PushDownPredicateToExternalTableScanRule(OperatorType.LOGICAL_MYSQL_SCAN);
     public static final PushDownPredicateToExternalTableScanRule JDBC_SCAN =
             new PushDownPredicateToExternalTableScanRule(OperatorType.LOGICAL_JDBC_SCAN);
+    public static final PushDownPredicateToExternalTableScanRule ODPS_SCAN =
+            new PushDownPredicateToExternalTableScanRule(OperatorType.LOGICAL_ODPS_SCAN);
 
     public PushDownPredicateToExternalTableScanRule(OperatorType type) {
         super(RuleType.TF_PUSH_DOWN_PREDICATE_TO_EXTERNAL_TABLE_SCAN,
@@ -62,8 +64,8 @@ public class PushDownPredicateToExternalTableScanRule extends TransformationRule
         ScalarOperator predicate = Utils.compoundAnd(lfo.getPredicate(), operator.getPredicate());
         ScalarOperator scanPredicate = operator.getPredicate();
         ScalarOperator filterPredicate = lfo.getPredicate();
-
-        ExternalTablePredicateExtractor extractor = new ExternalTablePredicateExtractor();
+        ExternalTablePredicateExtractor extractor = new ExternalTablePredicateExtractor(
+                operator.getOpType() == OperatorType.LOGICAL_MYSQL_SCAN);
         extractor.extract(predicate);
         ScalarOperator pushedPredicate = extractor.getPushPredicate();
         ScalarOperator reservedPredicate = extractor.getReservePredicate();

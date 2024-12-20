@@ -38,17 +38,17 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.BrokerDesc;
-import com.starrocks.catalog.AuthorizationInfo;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.common.LoadException;
 import com.starrocks.common.MetaNotFoundException;
-import com.starrocks.common.io.Text;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.LogBuilder;
 import com.starrocks.common.util.LogKey;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.load.BrokerFileGroup;
 import com.starrocks.load.BrokerFileGroupAggInfo;
 import com.starrocks.load.FailMsg;
@@ -65,13 +65,9 @@ import com.starrocks.transaction.TransactionState;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.RejectedExecutionException;
 
 /**
  * parent class of BrokerLoadJob and SparkLoadJob from load stmt
@@ -80,10 +76,12 @@ public abstract class BulkLoadJob extends LoadJob {
     private static final Logger LOG = LogManager.getLogger(BulkLoadJob.class);
 
     // input params
+    @SerializedName("bds")
     protected BrokerDesc brokerDesc;
     // this param is used to persist the expr of columns
     // the origin stmt is persisted instead of columns expr
     // the expr of columns will be reanalyze when the log is replayed
+    @SerializedName("ost")
     protected OriginStatement originStmt;
 
     // include broker desc and data desc
@@ -93,24 +91,31 @@ public abstract class BulkLoadJob extends LoadJob {
 
     // sessionVariable's name -> sessionVariable's value
     // we persist these sessionVariables due to the session is not available when replaying the job.
+    @SerializedName("svs")
     protected Map<String, String> sessionVariables = Maps.newHashMap();
 
     protected static final String PRIORITY_SESSION_VARIABLE_KEY = "priority.session.variable.key";
+    public static final String LOG_REJECTED_RECORD_NUM_SESSION_VARIABLE_KEY =
+            "log.rejected.record.num.session.variable.key";
+    public static final String CURRENT_USER_IDENT_KEY = "current.user.ident.key";
+    public static final String CURRENT_QUALIFIED_USER_KEY = "current.qualified.user.key";
 
     // only for log replay
     public BulkLoadJob() {
         super();
     }
 
-    public BulkLoadJob(long dbId, String label, OriginStatement originStmt) throws MetaNotFoundException {
+    public BulkLoadJob(long dbId, String label, OriginStatement originStmt) {
         super(dbId, label);
         this.originStmt = originStmt;
-        this.authorizationInfo = gatherAuthInfo();
 
         if (ConnectContext.get() != null) {
             SessionVariable var = ConnectContext.get().getSessionVariable();
             sessionVariables.put(SessionVariable.SQL_MODE, Long.toString(var.getSqlMode()));
-            sessionVariables.put(SessionVariable.LOAD_TRANSMISSION_COMPRESSION_TYPE, var.getloadTransmissionCompressionType());
+            sessionVariables.put(SessionVariable.LOAD_TRANSMISSION_COMPRESSION_TYPE,
+                    var.getloadTransmissionCompressionType());
+            sessionVariables.put(CURRENT_QUALIFIED_USER_KEY, ConnectContext.get().getQualifiedUser());
+            sessionVariables.put(CURRENT_USER_IDENT_KEY, ConnectContext.get().getCurrentUserIdentity().toString());
         } else {
             sessionVariables.put(SessionVariable.SQL_MODE, String.valueOf(SqlModeHelper.MODE_DEFAULT));
         }
@@ -119,7 +124,7 @@ public abstract class BulkLoadJob extends LoadJob {
     public static BulkLoadJob fromLoadStmt(LoadStmt stmt, ConnectContext context) throws DdlException {
         // get db id
         String dbName = stmt.getLabel().getDbName();
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
         if (db == null) {
             throw new DdlException("Database[" + dbName + "] does not exist");
         }
@@ -149,6 +154,10 @@ public abstract class BulkLoadJob extends LoadJob {
                 bulkLoadJob.sessionVariables.put(BulkLoadJob.PRIORITY_SESSION_VARIABLE_KEY,
                         Integer.toString(bulkLoadJob.priority));
             }
+            if (bulkLoadJob.logRejectedRecordNum != 0) {
+                bulkLoadJob.sessionVariables.put(BulkLoadJob.LOG_REJECTED_RECORD_NUM_SESSION_VARIABLE_KEY,
+                        Long.toString(bulkLoadJob.logRejectedRecordNum));
+            }
             bulkLoadJob.checkAndSetDataSourceInfo(db, stmt.getDataDescriptions());
             return bulkLoadJob;
         } catch (MetaNotFoundException e) {
@@ -158,7 +167,8 @@ public abstract class BulkLoadJob extends LoadJob {
 
     private void checkAndSetDataSourceInfo(Database db, List<DataDescription> dataDescriptions) throws DdlException {
         // check data source info
-        db.readLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(db.getId(), LockType.READ);
         try {
             for (DataDescription dataDescription : dataDescriptions) {
                 BrokerFileGroup fileGroup = new BrokerFileGroup(dataDescription);
@@ -166,22 +176,14 @@ public abstract class BulkLoadJob extends LoadJob {
                 fileGroupAggInfo.addFileGroup(fileGroup);
             }
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db.getId(), LockType.READ);
         }
-    }
-
-    private AuthorizationInfo gatherAuthInfo() throws MetaNotFoundException {
-        Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
-        if (database == null) {
-            throw new MetaNotFoundException("Database " + dbId + "has been deleted");
-        }
-        return new AuthorizationInfo(database.getFullName(), getTableNames());
     }
 
     @Override
     public Set<String> getTableNamesForShow() {
         Set<String> result = Sets.newHashSet();
-        Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
         if (database == null) {
             for (long tableId : fileGroupAggInfo.getAllTableIds()) {
                 result.add(String.valueOf(tableId));
@@ -189,7 +191,7 @@ public abstract class BulkLoadJob extends LoadJob {
             return result;
         }
         for (long tableId : fileGroupAggInfo.getAllTableIds()) {
-            Table table = database.getTable(tableId);
+            Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(database.getId(), tableId);
             if (table == null) {
                 result.add(String.valueOf(tableId));
             } else {
@@ -200,18 +202,24 @@ public abstract class BulkLoadJob extends LoadJob {
     }
 
     @Override
-    public Set<String> getTableNames() throws MetaNotFoundException {
+    public Set<String> getTableNames(boolean noThrow) throws MetaNotFoundException {
         Set<String> result = Sets.newHashSet();
-        Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
+        Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
         if (database == null) {
-            throw new MetaNotFoundException("Database " + dbId + "has been deleted");
+            if (noThrow) {
+                return result;
+            } else {
+                throw new MetaNotFoundException("Database " + dbId + "has been deleted");
+            }
         }
         // The database will not be locked in here.
         // The getTable is a thread-safe method called without read lock of database
         for (long tableId : fileGroupAggInfo.getAllTableIds()) {
-            Table table = database.getTable(tableId);
+            Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(database.getId(), tableId);
             if (table == null) {
-                throw new MetaNotFoundException("Failed to find table " + tableId + " in db " + dbId);
+                if (!noThrow) {
+                    throw new MetaNotFoundException("Failed to find table " + tableId + " in db " + dbId);
+                }
             } else {
                 result.add(table.getName());
             }
@@ -220,7 +228,18 @@ public abstract class BulkLoadJob extends LoadJob {
     }
 
     @Override
+    protected List<TabletCommitInfo> getTabletCommitInfos() {
+        return commitInfos;
+    }
+
+    @Override
+    protected List<TabletFailInfo> getTabletFailInfos() {
+        return failInfos;
+    }
+
+    @Override
     public void onTaskFailed(long taskId, FailMsg failMsg) {
+        boolean timeoutFailure = false;
         writeLock();
         try {
             // check if job has been completed
@@ -231,40 +250,29 @@ public abstract class BulkLoadJob extends LoadJob {
                         .build());
                 return;
             }
-            LoadTask loadTask = idToTasks.get(taskId);
-            if (loadTask == null) {
-                return;
-            }
-            if (loadTask.getRetryTime() <= 0) {
+
+            if (!failMsg.getMsg().contains("timeout") || failMsg.getCancelType() == FailMsg.CancelType.USER_CANCEL) {
                 unprotectedExecuteCancel(failMsg, true);
                 logFinalOperation();
-                return;
             } else {
-                // retry task
-                idToTasks.remove(loadTask.getSignature());
-                if (loadTask instanceof LoadLoadingTask) {
-                    loadingStatus.getLoadStatistic().removeLoad(((LoadLoadingTask) loadTask).getLoadId());
-                }
-                loadTask.updateRetryInfo();
-                idToTasks.put(loadTask.getSignature(), loadTask);
-                // load id will be added to loadStatistic when executing this task
-                try {
-                    if (loadTask.getTaskType() == LoadTask.TaskType.PENDING) {
-                        submitTask(GlobalStateMgr.getCurrentState().getPendingLoadTaskScheduler(), loadTask);
-                    } else if (loadTask.getTaskType() == LoadTask.TaskType.LOADING) {
-                        submitTask(GlobalStateMgr.getCurrentState().getLoadingLoadTaskScheduler(), loadTask);
-                    } else {
-                        throw new LoadException(String.format("Unknown load task type: %s. task id: %d, job id, %d",
-                                loadTask.getTaskType(), loadTask.getSignature(), id));
-                    }
-                } catch (RejectedExecutionException | LoadException e) {
-                    unprotectedExecuteCancel(failMsg, true);
-                    logFinalOperation();
-                    return;
-                }
+                timeoutFailure = true;
             }
         } finally {
             writeUnlock();
+        }
+
+        // For timeout failure, should abort the transaction and retry as soon as possible
+        if (timeoutFailure) {
+            try {
+                LOG.debug("Loading task with timeout failure try to abort transaction, " +
+                                "job_id: {}, task_id: {}, txn_id: {}, task fail message: {}",
+                        id, taskId, transactionId, failMsg.getMsg());
+                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().abortTransaction(
+                        dbId, transactionId, failMsg.getMsg());
+            } catch (StarRocksException e) {
+                LOG.warn("Loading task failed to abort transaction, job_id: {}, task_id: {}, txn_id: {}, " +
+                        "task fail message: {}, abort exception:", id, taskId, transactionId, failMsg.getMsg(), e);
+            }
         }
     }
 
@@ -285,7 +293,7 @@ public abstract class BulkLoadJob extends LoadJob {
             for (DataDescription dataDescription : stmt.getDataDescriptions()) {
                 dataDescription.analyzeWithoutCheckPriv();
             }
-            Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
             if (db == null) {
                 throw new DdlException("Database[" + dbId + "] does not exist");
             }
@@ -310,55 +318,4 @@ public abstract class BulkLoadJob extends LoadJob {
         }
         unprotectReadEndOperation((LoadJobFinalOperation) txnState.getTxnCommitAttachment(), true);
     }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        brokerDesc.write(out);
-        originStmt.write(out);
-
-        out.writeInt(sessionVariables.size());
-        for (Map.Entry<String, String> entry : sessionVariables.entrySet()) {
-            Text.writeString(out, entry.getKey());
-            Text.writeString(out, entry.getValue());
-        }
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        brokerDesc = BrokerDesc.read(in);
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_61) {
-            fileGroupAggInfo.readFields(in);
-        }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_58) {
-            if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_76) {
-                String stmt = Text.readString(in);
-                originStmt = new OriginStatement(stmt, 0);
-            } else {
-                originStmt = OriginStatement.read(in);
-            }
-        } else {
-            originStmt = new OriginStatement("", 0);
-        }
-        // The origin stmt does not be analyzed in here.
-        // The reason is that it will thrown MetaNotFoundException when the tableId could not be found by tableName.
-        // The origin stmt will be analyzed after the replay is completed.
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_66) {
-            int size = in.readInt();
-            for (int i = 0; i < size; i++) {
-                String key = Text.readString(in);
-                String value = Text.readString(in);
-                sessionVariables.put(key, value);
-            }
-            if (sessionVariables.containsKey(PRIORITY_SESSION_VARIABLE_KEY)) {
-                priority = Integer.parseInt(sessionVariables.get(PRIORITY_SESSION_VARIABLE_KEY));
-            }
-        } else {
-            // old version of load does not have sqlmode, set it to default
-            sessionVariables.put(SessionVariable.SQL_MODE, String.valueOf(SqlModeHelper.MODE_DEFAULT));
-        }
-    }
-
 }

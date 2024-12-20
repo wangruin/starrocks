@@ -45,6 +45,11 @@ under the License.
             <artifactId>fe-common</artifactId>
         </dependency>
 
+        <dependency>
+            <groupId>com.starrocks</groupId>
+            <artifactId>plugin-common</artifactId>
+        </dependency>
+
         <!-- https://mvnrepository.com/artifact/commons-codec/commons-codec -->
         <dependency>
             <groupId>commons-codec</groupId>
@@ -66,8 +71,9 @@ under the License.
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.jmockit/jmockit -->
+        <!-- https://mvnrepository.com/artifact/com.github.hazendaz.jmockit/jmockit -->
         <dependency>
-            <groupId>org.jmockit</groupId>
+            <groupId>com.github.hazendaz.jmockit</groupId>
             <artifactId>jmockit</artifactId>
             <scope>test</scope>
         </dependency>
@@ -161,6 +167,7 @@ under the License.
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-slf4j-impl</artifactId>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 
@@ -178,7 +185,7 @@ under the License.
                     <!-->not reuse forked jvm, so that each unit test will run in separate jvm. to avoid singleton confict<-->
                     <reuseForks>false</reuseForks>
                     <argLine>
-                        -javaagent:${settings.localRepository}/org/jmockit/jmockit/1.48/jmockit-1.48.jar
+                        -javaagent:${settings.localRepository}/com/github/hazendaz/jmockit/jmockit/1.49.4/jmockit-1.49.4.jar
                     </argLine>
                 </configuration>
             </plugin>
@@ -288,7 +295,7 @@ under the License.
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.2.1</version>
+                <version>3.5.2</version>
                 <configuration>
                     <artifactSet>
                         <excludes>
@@ -425,7 +432,16 @@ under the License.
                         </lifecycleMappingMetadata>
                     </configuration>
                 </plugin>
-
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.8.1</version>
+                    <configuration>
+                        <source>1.8</source>
+                        <target>1.8</target>
+                        <release>8</release>
+                    </configuration>
+                </plugin>
             </plugins>
         </pluginManagement>
 

@@ -17,12 +17,18 @@
 
 package com.starrocks.common;
 
-public class DdlException extends UserException {
+public class DdlException extends StarRocksException {
     public DdlException(String msg) {
         super(msg);
     }
 
     public DdlException(String msg, Throwable e) {
         super(msg, e);
+    }
+
+    public static void requireNotNull(String name, Object obj) throws DdlException {
+        if (obj == null) {
+            throw new DdlException(name + " not exists");
+        }
     }
 }

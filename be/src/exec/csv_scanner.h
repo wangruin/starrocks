@@ -33,11 +33,13 @@ namespace starrocks {
 class CSVScanner final : public FileScanner {
 public:
     CSVScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRange& scan_range,
-               ScannerCounter* counter);
+               ScannerCounter* counter, bool schema_only = false);
 
     Status open() override;
 
     StatusOr<ChunkPtr> get_next() override;
+
+    Status get_schema(std::vector<SlotDescriptor>* schema) override;
 
     void close() override;
 
@@ -45,30 +47,42 @@ public:
     void use_v2(bool use_v2) { _use_v2 = use_v2; }
 
 private:
+    Status _get_schema(std::vector<SlotDescriptor>* schema);
+    Status _get_schema_v2(std::vector<SlotDescriptor>* schema);
+
     class ScannerCSVReader : public CSVReader {
     public:
-        ScannerCSVReader(std::shared_ptr<SequentialFile> file, const CSVParseOptions& parse_options)
+        ScannerCSVReader(std::shared_ptr<SequentialFile> file, RuntimeState* state,
+                         const CSVParseOptions& parse_options)
                 : CSVReader(parse_options) {
             _file = std::move(file);
+            _state = state;
         }
 
         void set_counter(ScannerCounter* counter) { _counter = counter; }
 
         Status _fill_buffer() override;
 
+        char* _find_line_delimiter(CSVBuffer& buffer, size_t pos) override;
+
+        const std::string& filename();
+
     private:
         std::shared_ptr<SequentialFile> _file;
         ScannerCounter* _counter = nullptr;
+        RuntimeState* _state = nullptr;
     };
 
     ChunkPtr _create_chunk(const std::vector<SlotDescriptor*>& slots);
 
+    Status _init_reader();
     Status _parse_csv(Chunk* chunk);
     Status _parse_csv_v2(Chunk* chunk);
 
     StatusOr<ChunkPtr> _materialize(ChunkPtr& src_chunk);
     void _materialize_src_chunk_adaptive_nullable_column(ChunkPtr& chunk);
-    void _report_error(const std::string& line, const std::string& err_msg);
+    void _report_error(const CSVReader::Record& record, const std::string& err_msg);
+    void _report_rejected_record(const CSVReader::Record& record, const std::string& err_msg);
 
     using ConverterPtr = std::unique_ptr<csv::Converter>;
     using CSVReaderPtr = std::unique_ptr<ScannerCSVReader>;
@@ -83,6 +97,11 @@ private:
     bool _use_v2;
     CSVReader::Fields fields;
     CSVRow row;
+
+    // An empty chunk that can be reused as the container for the result of get_next().
+    // It's mainly for optimizing the performance where get_next() returns Status::Timeout
+    // frequently by avoiding creating a chunk in each call
+    ChunkPtr _reusable_empty_chunk = nullptr;
 };
 
 } // namespace starrocks

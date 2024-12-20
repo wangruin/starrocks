@@ -36,10 +36,10 @@ package com.starrocks.load.routineload;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
-import com.starrocks.common.FeConstants;
+import com.starrocks.common.Config;
 import com.starrocks.common.MetaNotFoundException;
-import com.starrocks.common.UserException;
-import com.starrocks.common.util.LeaderDaemon;
+import com.starrocks.common.StarRocksException;
+import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.common.util.LogBuilder;
 import com.starrocks.common.util.LogKey;
 import com.starrocks.server.GlobalStateMgr;
@@ -48,20 +48,20 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
-public class RoutineLoadScheduler extends LeaderDaemon {
+public class RoutineLoadScheduler extends FrontendDaemon {
 
     private static final Logger LOG = LogManager.getLogger(RoutineLoadScheduler.class);
 
-    private RoutineLoadManager routineLoadManager;
+    private RoutineLoadMgr routineLoadManager;
 
     @VisibleForTesting
     public RoutineLoadScheduler() {
         super();
-        routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadManager();
+        routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadMgr();
     }
 
-    public RoutineLoadScheduler(RoutineLoadManager routineLoadManager) {
-        super("Routine load scheduler", FeConstants.default_scheduler_interval_millisecond);
+    public RoutineLoadScheduler(RoutineLoadMgr routineLoadManager) {
+        super("Routine load scheduler", Config.routine_load_scheduler_interval_millisecond);
         this.routineLoadManager = routineLoadManager;
     }
 
@@ -74,7 +74,7 @@ public class RoutineLoadScheduler extends LeaderDaemon {
         }
     }
 
-    private void process() throws UserException {
+    private void process() throws StarRocksException {
         // update
         routineLoadManager.updateRoutineLoadJob();
         // get need schedule routine jobs
@@ -85,7 +85,7 @@ public class RoutineLoadScheduler extends LeaderDaemon {
         }
         for (RoutineLoadJob routineLoadJob : routineLoadJobList) {
             RoutineLoadJob.JobState errorJobState = null;
-            UserException userException = null;
+            StarRocksException userException = null;
             try {
                 routineLoadJob.prepare();
                 // judge nums of tasks more than max concurrent tasks of cluster
@@ -103,11 +103,11 @@ public class RoutineLoadScheduler extends LeaderDaemon {
             } catch (MetaNotFoundException e) {
                 errorJobState = RoutineLoadJob.JobState.CANCELLED;
                 userException = e;
-                LOG.warn(userException.getMessage());
-            } catch (UserException e) {
+                LOG.warn(userException.getMessage(), userException);
+            } catch (StarRocksException e) {
                 errorJobState = RoutineLoadJob.JobState.PAUSED;
                 userException = e;
-                LOG.warn(userException.getMessage());
+                LOG.warn(userException.getMessage(), userException);
             }
 
             if (errorJobState != null) {
@@ -121,7 +121,7 @@ public class RoutineLoadScheduler extends LeaderDaemon {
                 try {
                     ErrorReason reason = new ErrorReason(userException.getErrorCode(), userException.getMessage());
                     routineLoadJob.updateState(errorJobState, reason, false);
-                } catch (UserException e) {
+                } catch (StarRocksException e) {
                     LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId())
                             .add("current_state", routineLoadJob.getState())
                             .add("desired_state", errorJobState)

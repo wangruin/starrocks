@@ -44,11 +44,7 @@ public:
 // Cache for HDFS file system
 class HdfsFsCache {
 public:
-    ~HdfsFsCache() {
-        for (size_t i = 0; i < _cur_client_idx; i++) {
-            hdfsDisconnect(_cache_clients[i]->hdfs_fs);
-        }
-    }
+    ~HdfsFsCache() = default;
     static HdfsFsCache* instance() {
         static HdfsFsCache s_instance;
         return &s_instance;
@@ -60,10 +56,8 @@ public:
 
 private:
     std::mutex _lock;
-    uint32_t _cur_client_idx{0};
-    constexpr static uint32_t _max_cache_clients = 8;
-    std::string _cache_key[_max_cache_clients];
-    std::shared_ptr<HdfsFsClient> _cache_clients[_max_cache_clients];
+    std::unordered_map<std::string, std::shared_ptr<HdfsFsClient>> _cache_clients;
+    std::vector<std::string> _cache_keys;
     Random _rand{(uint32_t)time(nullptr)};
 
     HdfsFsCache() = default;

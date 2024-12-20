@@ -34,23 +34,26 @@
 
 package com.starrocks.persist;
 
-import com.starrocks.cluster.ClusterNamespace;
-import com.starrocks.common.FeMetaVersion;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.sql.ast.AlterDatabaseQuotaStmt.QuotaType;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 public class DatabaseInfo implements Writable {
 
+    @SerializedName("db")
     private String dbName;
+    @SerializedName("ndb")
     private String newDbName;
+    @SerializedName("qt")
     private long quota;
+    @SerializedName("cn")
     private String clusterName;
+    @SerializedName("qp")
     private QuotaType quotaType;
 
     public DatabaseInfo() {
@@ -82,42 +85,9 @@ public class DatabaseInfo implements Writable {
         return quota;
     }
 
-    public static DatabaseInfo read(DataInput in) throws IOException {
-        DatabaseInfo dbInfo = new DatabaseInfo();
-        dbInfo.readFields(in);
-        return dbInfo;
-    }
-
     @Override
     public void write(DataOutput out) throws IOException {
-        // compatible with old version
-        Text.writeString(out, ClusterNamespace.getFullName(dbName));
-        if (newDbName.isEmpty()) {
-            Text.writeString(out, newDbName);
-        } else {
-            Text.writeString(out, ClusterNamespace.getFullName(newDbName));
-        }
-        out.writeLong(quota);
-        Text.writeString(out, this.clusterName);
-        // compatible with dbState
-        Text.writeString(out, "NORMAL");
-        Text.writeString(out, this.quotaType.name());
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        this.dbName = ClusterNamespace.getNameFromFullName(Text.readString(in));
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_10) {
-            newDbName = ClusterNamespace.getNameFromFullName(Text.readString(in));
-        }
-        this.quota = in.readLong();
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_30) {
-            this.clusterName = Text.readString(in);
-            // Compatible with dbState
-            Text.readString(in);
-        }
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_81) {
-            this.quotaType = QuotaType.valueOf(Text.readString(in));
-        }
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
     public String getClusterName() {

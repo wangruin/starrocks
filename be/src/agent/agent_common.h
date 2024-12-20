@@ -36,6 +36,7 @@ enum class TaskWorkerType {
     REPORT_DISK_STATE,
     REPORT_OLAP_TABLE,
     REPORT_WORKGROUP,
+    REPORT_DATACACHE_METRICS,
     UPLOAD,
     DOWNLOAD,
     MAKE_SNAPSHOT,
@@ -86,6 +87,8 @@ struct AgentTaskRequestWithoutReqBody {
     int64_t recv_time;
 };
 
+const int MIN_TRANSACTION_PUBLISH_WORKER_COUNT = 1;
+
 using CreateTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TCreateTabletReq>;
 using DropTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TDropTabletReq>;
 using PushReqAgentTaskRequest = AgentTaskRequestWithReqBody<TPushReq>;
@@ -95,6 +98,8 @@ using AlterTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TAlterTabletReqV
 using CloneAgentTaskRequest = AgentTaskRequestWithReqBody<TCloneReq>;
 using StorageMediumMigrateTaskRequest = AgentTaskRequestWithReqBody<TStorageMediumMigrateReq>;
 using CheckConsistencyTaskRequest = AgentTaskRequestWithReqBody<TCheckConsistencyReq>;
+using CompactionTaskRequest = AgentTaskRequestWithReqBody<TCompactionReq>;
+using CompactionControlTaskRequest = AgentTaskRequestWithReqBody<TCompactionControlReq>;
 using UploadAgentTaskRequest = AgentTaskRequestWithReqBody<TUploadReq>;
 using DownloadAgentTaskRequest = AgentTaskRequestWithReqBody<TDownloadReq>;
 using SnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TSnapshotRequest>;
@@ -102,5 +107,8 @@ using ReleaseSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TReleaseSnap
 using MoveDirAgentTaskRequest = AgentTaskRequestWithReqBody<TMoveDirReq>;
 using UpdateTabletMetaInfoAgentTaskRequest = AgentTaskRequestWithReqBody<TUpdateTabletMetaInfoReq>;
 using DropAutoIncrementMapAgentTaskRequest = AgentTaskRequestWithReqBody<TDropAutoIncrementMapReq>;
+using RemoteSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TRemoteSnapshotRequest>;
+using ReplicateSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TReplicateSnapshotRequest>;
+using UpdateSchemaTaskRequest = AgentTaskRequestWithReqBody<TUpdateSchemaReq>;
 
 } // namespace starrocks

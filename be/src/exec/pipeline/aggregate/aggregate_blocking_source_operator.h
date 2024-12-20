@@ -25,7 +25,8 @@ public:
     AggregateBlockingSourceOperator(AggregatorPtr aggregator, OperatorFactory* factory, int32_t id,
                                     int32_t plan_node_id, int32_t driver_sequence,
                                     const char* name = "aggregate_blocking_source")
-            : SourceOperator(factory, id, name, plan_node_id, driver_sequence), _aggregator(std::move(aggregator)) {
+            : SourceOperator(factory, id, name, plan_node_id, false, driver_sequence),
+              _aggregator(std::move(aggregator)) {
         _aggregator->ref();
     }
 
@@ -40,7 +41,7 @@ public:
 
     StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
 
-private:
+protected:
     // It is used to perform aggregation algorithms shared by
     // AggregateBlockingSinkOperator. It is
     // - prepared at SinkOperator::prepare(),

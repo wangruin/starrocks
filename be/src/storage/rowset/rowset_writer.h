@@ -46,6 +46,7 @@
 #include "runtime/global_dict/types_fwd_decl.h"
 #include "storage/column_mapping.h"
 #include "storage/compaction_utils.h"
+#include "storage/rows_mapper.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
@@ -109,9 +110,18 @@ public:
 
     virtual Status add_chunk(const Chunk& chunk) { return Status::NotSupported("RowsetWriter::add_chunk"); }
 
+    virtual Status add_chunk(const Chunk& chunk, const std::vector<uint64_t>& rssid_rowids) {
+        return Status::NotSupported("RowsetWriter::add_chunk");
+    }
+
     // Used for vertical compaction
     // |Chunk| contains partial columns data corresponding to |column_indexes|.
     virtual Status add_columns(const Chunk& chunk, const std::vector<uint32_t>& column_indexes, bool is_key) {
+        return Status::NotSupported("RowsetWriter::add_columns");
+    }
+
+    virtual Status add_columns(const Chunk& chunk, const std::vector<uint32_t>& column_indexes, bool is_key,
+                               const std::vector<uint64_t>& rssid_rowids) {
         return Status::NotSupported("RowsetWriter::add_columns");
     }
 
@@ -156,9 +166,18 @@ public:
 
     virtual RowsetId rowset_id() { return _context.rowset_id; }
 
-    virtual const DictColumnsValidMap& global_dict_columns_valid_info() const {
-        return _global_dict_columns_valid_info;
-    }
+    const DictColumnsValidMap& global_dict_columns_valid_info() const { return _global_dict_columns_valid_info; }
+
+    const GlobalDictByNameMaps* rowset_global_dicts() const { return _writer_options.global_dicts; }
+
+private:
+    Status _flush_segment(const SegmentPB& segment_pb, butil::IOBuf& data);
+
+    Status _flush_delete_file(const SegmentPB& segment_pb, butil::IOBuf& data);
+
+    Status _flush_update_file(const SegmentPB& segment_pb, butil::IOBuf& data);
+
+    Status _flush_index_files(const SegmentPB& segment_pb, butil::IOBuf& data);
 
 protected:
     RowsetWriterContext _context;
@@ -167,21 +186,28 @@ protected:
     std::unique_ptr<RowsetTxnMetaPB> _rowset_txn_meta_pb;
     SegmentWriterOptions _writer_options;
 
-    int _num_segment{0};
-    int _num_delfile{0};
+    int _num_segment = 0;
+    int _num_delfile = 0;
+    int _num_uptfile = 0;
+    int _num_indexfile = 0;
     vector<uint32> _delfile_idxes;
     vector<std::string> _tmp_segment_files;
+    std::vector<string> _segment_encryption_metas;
+    std::vector<string> _delfile_encryption_metas;
+    std::vector<string> _updatefile_encryption_metas;
     // mutex lock for vectorized add chunk and flush
     std::mutex _lock;
 
     // counters and statistics maintained during data write
-    int64_t _num_rows_written;
+    int64_t _num_rows_written = 0;
     int64_t _num_rows_flushed = 0;
     std::vector<int64_t> _num_rows_of_tmp_segment_files;
-    int64_t _num_rows_del;
-    int64_t _total_row_size;
-    int64_t _total_data_size;
-    int64_t _total_index_size;
+    int64_t _num_rows_del = 0;
+    int64_t _total_row_size = 0;
+    int64_t _total_data_size = 0;
+    int64_t _total_index_size = 0;
+    int64_t _num_rows_upt = 0;
+    int64_t _total_update_row_size = 0;
 
     bool _is_pending = false;
     bool _already_built = false;
@@ -189,6 +215,8 @@ protected:
     FlushChunkState _flush_chunk_state = FlushChunkState::UNKNOWN;
 
     DictColumnsValidMap _global_dict_columns_valid_info;
+
+    std::unique_ptr<RowsMapperBuilder> _rows_mapper_builder;
 };
 
 class VerticalRowsetWriter;
@@ -200,6 +228,8 @@ public:
     ~HorizontalRowsetWriter() override;
 
     Status add_chunk(const Chunk& chunk) override;
+
+    Status add_chunk(const Chunk& chunk, const std::vector<uint64_t>& rssid_rowids) override;
 
     Status flush_chunk(const Chunk& chunk, SegmentPB* seg_info = nullptr) override;
     Status flush_chunk_with_deletes(const Chunk& upserts, const Column& deletes, SegmentPB* seg_info) override;
@@ -236,6 +266,9 @@ public:
     ~VerticalRowsetWriter() override;
 
     Status add_columns(const Chunk& chunk, const std::vector<uint32_t>& column_indexes, bool is_key) override;
+
+    Status add_columns(const Chunk& chunk, const std::vector<uint32_t>& column_indexes, bool is_key,
+                       const std::vector<uint64_t>& rssid_rowids) override;
 
     Status flush_columns() override;
 

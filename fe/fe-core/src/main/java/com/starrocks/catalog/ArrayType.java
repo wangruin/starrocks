@@ -56,9 +56,13 @@ public class ArrayType extends Type {
     @Override
     public String toSql(int depth) {
         if (depth >= MAX_NESTING_DEPTH) {
-            return "ARRAY<...>";
+            return "array<...>";
         }
-        return String.format("ARRAY<%s>", itemType.toSql(depth + 1));
+        if (itemType.isDecimalOfAnyVersion()) {
+            return String.format("array<%s>", itemType);
+        } else {
+            return String.format("array<%s>", itemType.toSql(depth + 1));
+        }
     }
 
     @Override
@@ -82,6 +86,20 @@ public class ArrayType extends Type {
         Preconditions.checkNotNull(itemType);
         node.setType(TTypeNodeType.ARRAY);
         itemType.toThrift(container);
+    }
+
+    @Override
+    public boolean isFullyCompatible(Type other) {
+        if (!other.isArrayType()) {
+            return false;
+        }
+
+        if (equals(other)) {
+            return true;
+        }
+
+        ArrayType t = (ArrayType) other;
+        return itemType.isFullyCompatible(t.getItemType());
     }
 
     @Override
@@ -142,6 +160,28 @@ public class ArrayType extends Type {
 
     public boolean isNullTypeItem() {
         return itemType.isNull();
+    }
+
+    public String toMysqlDataTypeString() {
+        return "array";
+    }
+
+    // This implementation is the same as BE schema_columns_scanner.cpp type_to_string
+    public String toMysqlColumnTypeString() {
+        return toSql();
+    }
+
+    @Override
+    protected String toTypeString(int depth) {
+        if (depth >= MAX_NESTING_DEPTH) {
+            return "array<...>";
+        }
+        return String.format("array<%s>", itemType.toTypeString(depth + 1));
+    }
+
+    @Override
+    public int getMaxUniqueId() {
+        return itemType.getMaxUniqueId();
     }
 }
 

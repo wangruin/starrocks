@@ -18,8 +18,8 @@ package com.starrocks.connector.hive.events;
 import com.google.common.collect.Lists;
 import com.starrocks.common.Config;
 import com.starrocks.common.ThreadPoolManager;
-import com.starrocks.common.util.LeaderDaemon;
-import com.starrocks.connector.hive.CacheUpdateProcessor;
+import com.starrocks.common.util.FrontendDaemon;
+import com.starrocks.connector.hive.HiveCacheUpdateProcessor;
 import com.starrocks.server.CatalogMgr;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
@@ -55,7 +55,7 @@ import javax.annotation.Nullable;
  * iteration so the next batch can be requested appropriately. The current batch size is
  * constant and set to {@link Config#hms_events_batch_size_per_rpc}.
  */
-public class MetastoreEventsProcessor extends LeaderDaemon {
+public class MetastoreEventsProcessor extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(MetastoreEventsProcessor.class);
     public static final String HMS_ADD_THRIFT_OBJECTS_IN_EVENTS_CONFIG_KEY =
             "hive.metastore.notifications.add.thrift.objects";
@@ -71,7 +71,7 @@ public class MetastoreEventsProcessor extends LeaderDaemon {
     // event factory which is used to get or create MetastoreEvents
     private final MetastoreEventFactory metastoreEventFactory;
 
-    private final Map<String, CacheUpdateProcessor> cacheUpdateProcessors = new ConcurrentHashMap<>();
+    private final Map<String, HiveCacheUpdateProcessor> cacheUpdateProcessors = new ConcurrentHashMap<>();
 
     // [catalogName.dbName.tableName] for hive table with resource
     private final List<String> externalTables = Lists.newArrayList();
@@ -81,7 +81,7 @@ public class MetastoreEventsProcessor extends LeaderDaemon {
         this.metastoreEventFactory = new MetastoreEventFactory(externalTables);
     }
 
-    public void registerCacheUpdateProcessor(String catalogName, CacheUpdateProcessor cache) {
+    public void registerCacheUpdateProcessor(String catalogName, HiveCacheUpdateProcessor cache) {
         LOG.info("Start to synchronize hive metadata cache on catalog {}", catalogName);
         cacheUpdateProcessors.put(catalogName, cache);
     }
@@ -122,7 +122,7 @@ public class MetastoreEventsProcessor extends LeaderDaemon {
                                                      final boolean getAllEvents,
                                                      @Nullable final IMetaStoreClient.NotificationFilter filter) {
         LOG.info("Start to pull events on catalog [{}]", catalogName);
-        CacheUpdateProcessor updateProcessor = cacheUpdateProcessors.get(catalogName);
+        HiveCacheUpdateProcessor updateProcessor = cacheUpdateProcessors.get(catalogName);
         if (updateProcessor == null) {
             LOG.error("Failed to get cacheUpdateProcessor by catalog {}.", catalogName);
             return Collections.emptyList();
@@ -171,7 +171,7 @@ public class MetastoreEventsProcessor extends LeaderDaemon {
         }
     }
 
-    private void doExecute(List<MetastoreEvent> events, CacheUpdateProcessor cacheProcessor) {
+    private void doExecute(List<MetastoreEvent> events, HiveCacheUpdateProcessor cacheProcessor) {
         for (MetastoreEvent event : events) {
             try {
                 event.process();
@@ -190,7 +190,7 @@ public class MetastoreEventsProcessor extends LeaderDaemon {
      * Process the given list of notification events. Useful for tests which provide a list of events
      */
     private void processEvents(List<NotificationEvent> events, String catalogName) {
-        CacheUpdateProcessor cacheProcessor = cacheUpdateProcessors.get(catalogName);
+        HiveCacheUpdateProcessor cacheProcessor = cacheUpdateProcessors.get(catalogName);
         List<MetastoreEvent> filteredEvents = metastoreEventFactory.getFilteredEvents(events, cacheProcessor, catalogName);
 
         if (filteredEvents.isEmpty()) {

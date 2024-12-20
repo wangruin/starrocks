@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rewrite.scalar;
 
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
@@ -30,16 +31,37 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
+import java.util.Optional;
 
 public class FoldConstantsRule extends BottomUpScalarOperatorRewriteRule {
     private static final Logger LOG = LogManager.getLogger(FoldConstantsRule.class);
 
+    private final boolean needMonotonicFunc;
+
+    public FoldConstantsRule() {
+        this(false);
+    }
+
+    public FoldConstantsRule(boolean needMonotonicFunc) {
+        this.needMonotonicFunc = needMonotonicFunc;
+    }
+
     @Override
     public ScalarOperator visitCall(CallOperator call, ScalarOperatorRewriteContext context) {
-        if (call.isAggregate() || notAllConstant(call.getChildren())) {
+        if (call.isAggregate()) {
             return call;
         }
-        return ScalarOperatorEvaluator.INSTANCE.evaluation(call);
+
+        if (notAllConstant(call.getChildren())) {
+            if (call.getFunction() != null && call.getFunction().isMetaFunction()) {
+                String errMsg = String.format("Meta function %s does not support non-constant arguments",
+                        call.getFunction().getFunctionName());
+                throw new SemanticException(errMsg);
+            }
+            return call;
+        }
+
+        return ScalarOperatorEvaluator.INSTANCE.evaluation(call, needMonotonicFunc);
     }
 
     @Override
@@ -126,11 +148,14 @@ public class FoldConstantsRule extends BottomUpScalarOperatorRewriteRule {
 
         ConstantOperator child = (ConstantOperator) operator.getChild(0);
 
-        try {
-            return child.castTo(operator.getType());
-        } catch (Exception e) {
-            LOG.debug("Fold cast constant error: " + operator + ", " + child.toString());
+        Optional<ConstantOperator> result = child.castTo(operator.getType());
+        if (!result.isPresent()) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Fold cast constant error: " + operator + ", " + child.toString());
+            }
             return operator;
+        } else {
+            return result.get();
         }
     }
 
@@ -156,7 +181,7 @@ public class FoldConstantsRule extends BottomUpScalarOperatorRewriteRule {
     @Override
     public ScalarOperator visitBinaryPredicate(BinaryPredicateOperator predicate,
                                                ScalarOperatorRewriteContext context) {
-        if (!BinaryPredicateOperator.BinaryType.EQ_FOR_NULL.equals(predicate.getBinaryType())
+        if (!BinaryType.EQ_FOR_NULL.equals(predicate.getBinaryType())
                 && hasNull(predicate.getChildren())) {
             return ConstantOperator.createNull(Type.BOOLEAN);
         }

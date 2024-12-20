@@ -45,7 +45,7 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.MysqlTable;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TMySQLScanNode;
 import com.starrocks.thrift.TPlanNode;
@@ -69,7 +69,7 @@ public class MysqlScanNode extends ScanNode {
      */
     public MysqlScanNode(PlanNodeId id, TupleDescriptor desc, MysqlTable tbl) {
         super(id, desc, "SCAN MYSQL");
-        tblName = "`" + tbl.getMysqlTableName() + "`";
+        tblName = "`" + tbl.getCatalogTableName() + "`";
     }
 
     public void setTemporalClause(String temporalClause) {
@@ -87,7 +87,7 @@ public class MysqlScanNode extends ScanNode {
     }
 
     @Override
-    public void finalizeStats(Analyzer analyzer) throws UserException {
+    public void finalizeStats(Analyzer analyzer) throws StarRocksException {
         computeColumnsAndFilters();
     }
 
@@ -175,25 +175,14 @@ public class MysqlScanNode extends ScanNode {
         return null;
     }
 
-    @Override
-    public int getNumInstances() {
-        return 1;
-    }
 
     @Override
     public void computeStats(Analyzer analyzer) {
         super.computeStats(analyzer);
-        // even if current node scan has no data,at least on backend will be assigned when the fragment actually execute
-        numNodes = numNodes <= 0 ? 1 : numNodes;
         // this is just to avoid mysql scan node's cardinality being -1. So that we can calculate the join cost
         // normally.
         // We assume that the data volume of all mysql tables is very small, so set cardinality directly to 1.
         cardinality = cardinality == -1 ? 1 : cardinality;
-    }
-
-    @Override
-    public boolean canUsePipeLine() {
-        return true;
     }
 
     @Override

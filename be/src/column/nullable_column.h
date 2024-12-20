@@ -33,6 +33,8 @@ class NullableColumn : public ColumnFactory<Column, NullableColumn> {
     friend class ColumnFactory<Column, NullableColumn>;
 
 public:
+    using ValueType = void;
+
     inline static ColumnPtr wrap_if_necessary(ColumnPtr column) {
         if (column->is_nullable()) {
             return column;
@@ -81,13 +83,14 @@ public:
     void update_has_null();
 
     bool is_nullable() const override { return true; }
+    bool is_json() const override { return _data_column->is_json(); }
+    bool is_array() const override { return _data_column->is_array(); }
+    bool is_array_view() const override { return _data_column->is_array_view(); }
 
     bool is_null(size_t index) const override {
         DCHECK_EQ(_null_column->size(), _data_column->size());
         return _has_null && immutable_null_column_data()[index];
     }
-
-    bool low_cardinality() const override { return false; }
 
     const uint8_t* raw_data() const override { return _data_column->raw_data(); }
 
@@ -106,7 +109,7 @@ public:
 
     size_t byte_size(size_t from, size_t size) const override {
         DCHECK_LE(from + size, this->size()) << "Range error";
-        return _data_column->byte_size(from, size) + _null_column->Column::byte_size(from, size);
+        return _data_column->byte_size(from, size) + _null_column->byte_size(from, size);
     }
 
     size_t byte_size(size_t idx) const override { return _data_column->byte_size(idx) + sizeof(bool); }
@@ -131,10 +134,7 @@ public:
         _null_column->assign(n, idx);
     }
 
-    void remove_first_n_values(size_t count) override {
-        _data_column->remove_first_n_values(count);
-        _null_column->remove_first_n_values(count);
-    }
+    void remove_first_n_values(size_t count) override;
 
     void append_datum(const Datum& datum) override;
 
@@ -152,11 +152,11 @@ public:
 
     bool has_large_column() const override { return _data_column->has_large_column(); }
 
-    bool append_strings(const Buffer<Slice>& strs) override;
+    bool append_strings(const Slice* data, size_t size) override;
 
-    bool append_strings_overflow(const Buffer<Slice>& strs, size_t max_length) override;
+    bool append_strings_overflow(const Slice* data, size_t size, size_t max_length) override;
 
-    bool append_continuous_strings(const Buffer<Slice>& strs) override;
+    bool append_continuous_strings(const Slice* data, size_t size) override;
 
     bool append_continuous_fixed_length_strings(const char* data, size_t size, int fixed_length) override;
 
@@ -173,7 +173,7 @@ public:
 
     void append_default(size_t count) override { append_nulls(count); }
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t max_one_element_serialize_size() const override {
         return sizeof(bool) + _data_column->max_one_element_serialize_size();
@@ -208,13 +208,15 @@ public:
 
     int compare_at(size_t left, size_t right, const Column& rhs, int nan_direction_hint) const override;
 
+    int equals(size_t left, const Column& rhs, size_t right, bool safe_eq = true) const override;
+
     void fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
 
     void crc32_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
 
     int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
-    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override;
+    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol = false) const override;
 
     std::string get_name() const override { return "nullable-" + _data_column->get_name(); }
 
@@ -250,7 +252,7 @@ public:
         _has_null = true;
         return true;
     }
-    ColumnPtr replicate(const std::vector<uint32_t>& offsets) override;
+    ColumnPtr replicate(const Buffer<uint32_t>& offsets) override;
 
     size_t memory_usage() const override {
         return _data_column->memory_usage() + _null_column->memory_usage() + sizeof(bool);
@@ -271,6 +273,13 @@ public:
         _null_column->swap_column(*r._null_column);
         std::swap(_delete_state, r._delete_state);
         std::swap(_has_null, r._has_null);
+    }
+
+    void swap_by_data_column(ColumnPtr& src) {
+        reset_column();
+        _data_column.swap(src);
+        null_column_data().insert(null_column_data().end(), _data_column->size(), 0);
+        update_has_null();
     }
 
     void reset_column() override {
@@ -306,8 +315,9 @@ public:
         return ss.str();
     }
 
-    bool capacity_limit_reached(std::string* msg = nullptr) const override {
-        return _data_column->capacity_limit_reached(msg) || _null_column->capacity_limit_reached(msg);
+    Status capacity_limit_reached() const override {
+        RETURN_IF_ERROR(_data_column->capacity_limit_reached());
+        return _null_column->capacity_limit_reached();
     }
 
     void check_or_die() const override;

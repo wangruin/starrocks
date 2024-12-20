@@ -30,7 +30,7 @@ public:
                    const std::vector<std::vector<SlotId>>& null_slot_ids, uint64_t repeat_times_required,
                    uint64_t repeat_times_last, const std::vector<std::vector<int64_t>>& grouping_list,
                    const TupleDescriptor* tuple_desc, const std::vector<ExprContext*>& conjunct_ctxs)
-            : Operator(factory, id, "repeat", plan_node_id, driver_sequence),
+            : Operator(factory, id, "repeat", plan_node_id, false, driver_sequence),
               _null_slot_ids(null_slot_ids),
               _repeat_times_required(repeat_times_required),
               _repeat_times_last(repeat_times_last),
@@ -61,6 +61,24 @@ private:
         auto column = RunTimeColumnType<TYPE_BIGINT>::create();
         column->append_datum(Datum(value));
         return ConstColumn::create(column, num_rows);
+    }
+
+    /**
+     * @brief Generate const null column with the input column's type.
+     * @param cur_column : input associated column.
+     * @param num_rows : const column's rows number.
+     * @return ColumnPtr : a constant column with the input column's type.
+     */
+    static ColumnPtr generate_null_column(ColumnPtr& cur_column, int64_t num_rows) {
+        auto clone_column = cur_column->clone_empty();
+        if (clone_column->is_nullable()) {
+            clone_column->append_nulls(1);
+            return ConstColumn::create(ColumnPtr(clone_column.release()), num_rows);
+        } else {
+            auto nullable_column = NullableColumn::create(ColumnPtr(clone_column.release()), NullColumn::create());
+            nullable_column->append_nulls(1);
+            return ConstColumn::create(nullable_column, num_rows);
+        }
     }
 
     void extend_and_update_columns(ChunkPtr* curr_chunk);

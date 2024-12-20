@@ -15,6 +15,7 @@
 #include "aggregate_distinct_blocking_sink_operator.h"
 
 #include "runtime/current_thread.h"
+#include "util/race_detect.h"
 
 namespace starrocks::pipeline {
 
@@ -32,7 +33,18 @@ void AggregateDistinctBlockingSinkOperator::close(RuntimeState* state) {
 }
 
 Status AggregateDistinctBlockingSinkOperator::set_finishing(RuntimeState* state) {
-    _is_finished = true;
+    if (_is_finished) return Status::OK();
+    ONCE_DETECT(_set_finishing_once);
+    auto defer = DeferOp([this]() {
+        COUNTER_UPDATE(_aggregator->input_row_count(), _aggregator->num_input_rows());
+        _aggregator->sink_complete();
+        _is_finished = true;
+    });
+
+    // skip processing if cancelled
+    if (state->is_cancelled()) {
+        return Status::OK();
+    }
 
     COUNTER_SET(_aggregator->hash_table_size(), (int64_t)_aggregator->hash_set_variant().size());
 
@@ -44,9 +56,6 @@ Status AggregateDistinctBlockingSinkOperator::set_finishing(RuntimeState* state)
     _aggregator->hash_set_variant().visit(
             [&](auto& hash_set_with_key) { _aggregator->it_hash() = hash_set_with_key->hash_set.begin(); });
 
-    COUNTER_SET(_aggregator->input_row_count(), _aggregator->num_input_rows());
-
-    _aggregator->sink_complete();
     return Status::OK();
 }
 
@@ -56,21 +65,25 @@ StatusOr<ChunkPtr> AggregateDistinctBlockingSinkOperator::pull_chunk(RuntimeStat
 
 Status AggregateDistinctBlockingSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
     DCHECK_LE(chunk->num_rows(), state->chunk_size());
-    RETURN_IF_ERROR(_aggregator->evaluate_groupby_exprs(chunk.get()));
-
     {
         SCOPED_TIMER(_aggregator->agg_compute_timer());
         bool limit_with_no_agg = _aggregator->limit() != -1;
+        auto size = _aggregator->hash_set_variant().size();
+        if (limit_with_no_agg) {
+            if (size >= _aggregator->limit() || (_aggregator->params()->enable_pipeline_share_limit &&
+                                                 _shared_limit_countdown.load(std::memory_order_relaxed) <= 0)) {
+                (void)set_finishing(state);
+                return Status::OK();
+            }
+        }
+        RETURN_IF_ERROR(_aggregator->evaluate_groupby_exprs(chunk.get()));
         TRY_CATCH_BAD_ALLOC(_aggregator->build_hash_set(chunk->num_rows()));
+        if (limit_with_no_agg && _aggregator->params()->enable_pipeline_share_limit) {
+            _shared_limit_countdown.fetch_sub(_aggregator->hash_set_variant().size() - size, std::memory_order_relaxed);
+        }
         TRY_CATCH_BAD_ALLOC(_aggregator->try_convert_to_two_level_set());
 
         _aggregator->update_num_input_rows(chunk->num_rows());
-        if (limit_with_no_agg) {
-            auto size = _aggregator->hash_set_variant().size();
-            if (size >= _aggregator->limit()) {
-                // TODO(hcf) do something
-            }
-        }
     }
 
     return Status::OK();
@@ -78,6 +91,7 @@ Status AggregateDistinctBlockingSinkOperator::push_chunk(RuntimeState* state, co
 Status AggregateDistinctBlockingSinkOperator::reset_state(RuntimeState* state,
                                                           const std::vector<ChunkPtr>& refill_chunks) {
     _is_finished = false;
+    ONCE_RESET(_set_finishing_once);
     return _aggregator->reset_state(state, refill_chunks, this);
 }
 } // namespace starrocks::pipeline

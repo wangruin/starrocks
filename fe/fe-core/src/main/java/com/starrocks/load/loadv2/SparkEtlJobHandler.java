@@ -45,7 +45,7 @@ import com.starrocks.catalog.SparkResource;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.LoadException;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.BrokerUtil;
 import com.starrocks.common.util.CommandResult;
 import com.starrocks.common.util.Util;
@@ -94,7 +94,8 @@ public class SparkEtlJobHandler {
     private static final String YARN_KILL_CMD = "%s --config %s application -kill %s";
 
     public void submitEtlJob(long loadJobId, String loadLabel, EtlJobConfig etlJobConfig, SparkResource resource,
-                             BrokerDesc brokerDesc, SparkLoadAppHandle handle, SparkPendingTaskAttachment attachment)
+                             BrokerDesc brokerDesc, SparkLoadAppHandle handle, SparkPendingTaskAttachment attachment,
+                             Long sparkLoadSubmitTimeout)
             throws LoadException {
         // delete outputPath
         deleteEtlOutputPath(etlJobConfig.outputPath, brokerDesc);
@@ -140,7 +141,7 @@ public class SparkEtlJobHandler {
             } else {
                 HdfsUtil.writeFile(configData, jobConfigHdfsPath, brokerDesc);
             }
-        } catch (UserException e) {
+        } catch (StarRocksException e) {
             throw new LoadException(e.getMessage());
         }
 
@@ -173,7 +174,7 @@ public class SparkEtlJobHandler {
             handle.setProcess(process);
             if (!FeConstants.runningUnitTest) {
                 SparkLauncherMonitor.LogMonitor logMonitor = SparkLauncherMonitor.createLogMonitor(handle);
-                logMonitor.setSubmitTimeoutMs(GET_APPID_TIMEOUT_MS);
+                logMonitor.setSubmitTimeoutMs(sparkLoadSubmitTimeout);
                 logMonitor.setRedirectLogPath(logFilePath);
                 logMonitor.start();
                 try {
@@ -192,6 +193,13 @@ public class SparkEtlJobHandler {
         }
 
         if (fromSparkState(state) == TEtlState.CANCELLED) {
+            if (state == State.KILLED) {
+                try {
+                    killYarnApplication(appId, loadJobId, resource);
+                } catch (StarRocksException e) {
+                    LOG.warn(errMsg, e);
+                }
+            }
             throw new LoadException(
                     errMsg + "spark app state: " + state.toString() + ", loadJobId:" + loadJobId + ", logPath:" +
                             logPath);
@@ -207,8 +215,34 @@ public class SparkEtlJobHandler {
         attachment.setHandle(handle);
     }
 
+    public void killYarnApplication(String appId, long loadJobId, SparkResource resource)
+            throws StarRocksException {
+        if (!resource.isYarnMaster()) {
+            return;
+        }
+        if (Strings.isNullOrEmpty(appId)) {
+            LOG.warn("app id is null, kill yarn application fail");
+            return;
+        }
+        // prepare yarn config
+        String configDir = resource.prepareYarnConfig();
+        // yarn client path
+        String yarnClient = resource.getYarnClientPath();
+        // command: yarn --config configDir application -kill appId
+        String yarnKillCmd = String.format(YARN_KILL_CMD, yarnClient, configDir, appId);
+        LOG.info(yarnKillCmd);
+        String[] envp = {"LC_ALL=" + Config.locale, "JAVA_HOME=" + System.getProperty("java.home")};
+        CommandResult result = Util.executeCommand(yarnKillCmd, envp, EXEC_CMD_TIMEOUT_MS);
+        LOG.info("yarn application -kill {}, output: {}", appId, result.getStdout());
+        if (result.getReturnCode() != 0) {
+            String stderr = result.getStderr();
+            LOG.warn("yarn application kill failed. app id: {}, load job id: {}, msg: {}", appId, loadJobId,
+                    stderr);
+        }
+    }
+
     public EtlStatus getEtlJobStatus(SparkLoadAppHandle handle, String appId, long loadJobId, String etlOutputPath,
-                                     SparkResource resource, BrokerDesc brokerDesc) throws UserException {
+                                     SparkResource resource, BrokerDesc brokerDesc) throws StarRocksException {
         EtlStatus status = new EtlStatus();
 
         Preconditions.checkState(appId != null && !appId.isEmpty());
@@ -287,7 +321,7 @@ public class SparkEtlJobHandler {
                         status.setFailMsg(dppResult.failedReason);
                     }
                 }
-            } catch (UserException | JsonSyntaxException e) {
+            } catch (StarRocksException | JsonSyntaxException e) {
                 LOG.warn("read broker file failed. path: {}", dppResultFilePath, e);
             }
         }
@@ -296,7 +330,7 @@ public class SparkEtlJobHandler {
     }
 
     public void killEtlJob(SparkLoadAppHandle handle, String appId, long loadJobId, SparkResource resource)
-            throws UserException {
+            throws StarRocksException {
         if (resource.isYarnMaster()) {
             // The appId may be empty when the load job is in PENDING phase. This is because the appId is
             // parsed from the spark launcher process's output (spark launcher process submit job and then
@@ -309,21 +343,7 @@ public class SparkEtlJobHandler {
                     return;
                 }
             }
-            // prepare yarn config
-            String configDir = resource.prepareYarnConfig();
-            // yarn client path
-            String yarnClient = resource.getYarnClientPath();
-            // command: yarn --config configDir application -kill appId
-            String yarnKillCmd = String.format(YARN_KILL_CMD, yarnClient, configDir, appId);
-            LOG.info(yarnKillCmd);
-            String[] envp = {"LC_ALL=" + Config.locale, "JAVA_HOME=" + System.getProperty("java.home")};
-            CommandResult result = Util.executeCommand(yarnKillCmd, envp, EXEC_CMD_TIMEOUT_MS);
-            LOG.info("yarn application -kill {}, output: {}", appId, result.getStdout());
-            if (result.getReturnCode() != 0) {
-                String stderr = result.getStderr();
-                LOG.warn("yarn application kill failed. app id: {}, load job id: {}, msg: {}", appId, loadJobId,
-                        stderr);
-            }
+            killYarnApplication(appId, loadJobId, resource);
         } else {
             if (handle != null) {
                 handle.stop();
@@ -342,7 +362,7 @@ public class SparkEtlJobHandler {
             } else {
                 HdfsUtil.parseFile(etlFilePaths, brokerDesc, fileStatuses);
             }
-        } catch (UserException e) {
+        } catch (StarRocksException e) {
             throw new Exception(e);
         }
 
@@ -373,7 +393,7 @@ public class SparkEtlJobHandler {
                 HdfsUtil.deletePath(outputPath, brokerDesc);
             }
             LOG.info("delete path success. path: {}", outputPath);
-        } catch (UserException e) {
+        } catch (StarRocksException e) {
             LOG.warn("delete path failed. path: {}", outputPath, e);
         }
     }

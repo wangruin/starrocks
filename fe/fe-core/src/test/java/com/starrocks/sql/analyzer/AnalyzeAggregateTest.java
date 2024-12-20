@@ -40,13 +40,15 @@ public class AnalyzeAggregateTest {
         analyzeFail("select sum(v1) from t0 order by sum(abs(max(v2) over ()))",
                 "Unsupported nest window function inside aggregation.");
         analyzeFail("select sum(v1) from t0 order by sum(max(v2))",
-                "Unsupported nest window function inside aggregation.");
+                "Unsupported nest aggregation function inside aggregation.");
         analyzeFail("select sum(v1) from t0 order by sum(abs(max(v2)))",
-                "Unsupported nest window function inside aggregation.");
+                "Unsupported nest aggregation function inside aggregation.");
         analyzeFail("select sum(max(v2)) from t0",
-                "Unsupported nest window function inside aggregation.");
+                "Unsupported nest aggregation function inside aggregation.");
         analyzeFail("select sum(1 + max(v2)) from t0",
-                "Unsupported nest window function inside aggregation.");
+                "Unsupported nest aggregation function inside aggregation.");
+        analyzeFail("select min(v1) col from t0 order by min(col) + 1,  min(col)",
+                "Column 'col' cannot be resolved");
 
         analyzeFail("select v1 from t0 group by v1,cast(v2 as int) having cast(v2 as boolean)",
                 "must be an aggregate expression or appear in GROUP BY clause");
@@ -100,9 +102,9 @@ public class AnalyzeAggregateTest {
         analyzeFail("select grouping(v1) from t0 group by v1",
                 "cannot use GROUPING functions without [grouping sets|rollup|cube] clause");
 
-        //grouping functions only support column.
+        //The arguments of GROUPING must be expressions referenced by GROUP BY
         analyzeFail("select v1, grouping(v1+1) from t0 group by grouping sets((v1))",
-                "grouping functions only support column.");
+                "The arguments of GROUPING must be expressions referenced by GROUP BY.");
 
         //cannot contain grouping
         analyzeFail("select v1 from t0 inner join t1 on grouping(v1)= v4", "JOIN clause cannot contain grouping");
@@ -131,7 +133,15 @@ public class AnalyzeAggregateTest {
         analyzeFail("select distinct v1 from t0 order by v2",
                 "must be an aggregate expression or appear in GROUP BY clause");
         analyzeFail("select distinct v1 as v from t0 order by v2",
-                "must be an aggregate expression or appear in GROUP BY clause");
+                " must be an aggregate expression or appear in GROUP BY clause");
+        analyzeFail("select * from t0 order by max(v2)",
+                "column must appear in the GROUP BY clause or be used in an aggregate function.");
+        analyzeFail("select distinct max(v1) from t0",
+                "cannot combine SELECT DISTINCT with aggregate functions or GROUP BY");
+        analyzeFail("select distinct abs(v1) from t0 order by max(v1)",
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list");
+        analyzeFail("select distinct abs(v1) from t0 order by max(v2)",
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list");
 
         analyzeSuccess("select distinct v1 as v from t0 having v = 1");
         analyzeFail("select distinct v1 as v from t0 having v2 = 2",
@@ -153,12 +163,40 @@ public class AnalyzeAggregateTest {
         analyzeFail("select distinct v1,v2 from t0 order by v3");
         analyzeFail("select distinct v1 from t0 order by sum(v2)");
 
-        analyzeFail("select count(distinct v1), count(distinct v3) from tarray",
-                "No matching function with signature: multi_distinct_count(ARRAY)");
+        analyzeSuccess("select count(distinct v1), count(distinct v3) from tarray");
 
         analyzeFail("select abs(distinct v1) from t0");
         analyzeFail("SELECT VAR_SAMP ( DISTINCT v2 ) FROM v0");
         analyzeFail("select distinct v1 from t0 having sum(v1) > 2");
+    }
+    @Test
+    public void testDistinctAggOnComplexTypes() {
+        analyzeSuccess("select count(distinct va) from ttypes group by v1");
+        analyzeSuccess("select count(*) from ttypes group by va");
+
+        // more than one count distinct
+        analyzeSuccess("select count(distinct va), count(distinct va1) from ttypes group by v1");
+        analyzeSuccess("select count(distinct va), count(distinct va1) from ttypes");
+        analyzeSuccess("select count(distinct vm), count(distinct vm1) from ttypes group by v1");
+        analyzeSuccess("select count(distinct vm), count(distinct vm1) from ttypes");
+        analyzeSuccess("select count(distinct vs), count(distinct vs1) from ttypes group by v1");
+        analyzeSuccess("select count(distinct vs), count(distinct vs1) from ttypes");
+        analyzeFail("select count(distinct vj), count(distinct vj1) from ttypes group by v1");
+        analyzeFail("select count(distinct vj), count(distinct vj1) from ttypes");
+
+        // single count distinct
+        analyzeSuccess("select count(distinct vm) from ttypes");
+        analyzeSuccess("select count(distinct vs) from ttypes");
+        analyzeFail("select count(distinct vj) from ttypes");
+        analyzeSuccess("select count(distinct vm) from ttypes group by v1");
+        analyzeSuccess("select count(distinct vs) from ttypes group by v1");
+        analyzeFail("select count(distinct vj) from ttypes group by v1");
+        analyzeSuccess("select count(distinct va),count(distinct vm) from ttypes group by v1");
+
+        // group by complex types
+        analyzeSuccess("select count(*) from ttypes group by vm");
+        analyzeSuccess("select count(*) from ttypes group by vs");
+        analyzeFail("select count(*) from ttypes group by vj");
     }
 
     @Test
@@ -223,8 +261,50 @@ public class AnalyzeAggregateTest {
     }
 
     @Test
-    public void testPercentileDiscFunction() {
+    public void testPercentileFunction() {
+        analyzeFail("select percentile_approx(0.5) from tall group by tb");
+        analyzeFail("select percentile_approx('c',0.5) from tall group by tb");
+        analyzeFail("select percentile_approx(1,'c') from tall group by tb");
+        analyzeFail("select percentile_approx(1,1,'c') from tall group by tb");
+        analyzeFail("select percentile_approx(1,1,0.5,tc) from tall group by tb");
+        analyzeSuccess("select percentile_approx(1,1,tc) from tall group by tb");
+        analyzeSuccess("select percentile_approx(1,5) from tall group by tb");
+        analyzeSuccess("select percentile_approx(1,0.5,1047) from tall group by tb");
         analyzeSuccess("select percentile_disc(tj,0.5) from tall group by tb");
     }
 
+    @Test
+    public void testWindowFunnelFunction() {
+        // For the argument `window_size`.
+        analyzeFail("SELECT window_funnel(-1, ti, 0, [ta='a', ta='b']) FROM tall",
+                "window argument must >= 0");
+        analyzeFail("SELECT window_funnel('VARCHAR', ti, 0, [ta='a', ta='b']) FROM tall",
+                "window argument must be numerical type");
+        analyzeFail("SELECT window_funnel(tc, ti, 0, [ta='a', ta='b']) FROM tall",
+                "window argument must be numerical type");
+
+        // For the argument `mode`.
+        analyzeFail("SELECT window_funnel(1, ti, -1, [ta='a', ta='b']) FROM tall",
+                "mode argument's range must be [0-7]");
+        analyzeFail("SELECT window_funnel(1, ti, 8, [ta='a', ta='b']) FROM tall",
+                "mode argument's range must be [0-7]");
+        analyzeFail("SELECT window_funnel(1, ti, 'VARCHAR', [ta='a', ta='b']) FROM tall",
+                "mode argument must be numerical type");
+        analyzeFail("SELECT window_funnel(1, ti, ta, [ta='a', ta='b']) FROM tall",
+                "mode argument must be numerical type");
+
+        // For the argument `time`.
+        analyzeFail("SELECT window_funnel(1, '2022-01-01', 0, [ta='a', ta='b']) FROM tall",
+                "time arg must be column");
+
+        // For the argument `condition`.
+        analyzeFail("SELECT window_funnel(1, ti, 0, ti) FROM tall",
+                "No matching function with signature");
+
+        // Successful statements.
+        analyzeSuccess("SELECT window_funnel(0, ti, 0, [ta='a', ta='b']) FROM tall");
+        analyzeSuccess("SELECT window_funnel(1, ti, 0, [ta='a', ta='b']) FROM tall");
+        analyzeSuccess("SELECT window_funnel(1, ta, 0, [ta='a', ta='b']) FROM tall");
+        analyzeSuccess("SELECT window_funnel(1, ta, 0, [true, true, false]) FROM tall");
+    }
 }

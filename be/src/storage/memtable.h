@@ -30,6 +30,46 @@ class TabletSchema;
 
 class MemTableSink;
 
+struct MemtableStats {
+    // The number of insert operation
+    int32_t insert_count = 0;
+    // Accumulated time to insert
+    int64_t insert_time_ns = 0;
+    // Time to finalize
+    int64_t finalize_time_ns = 0;
+    // The number of sort operation
+    int32_t sort_count = 0;
+    // Accumulated time to sort
+    int64_t sort_time_ns = 0;
+    // The number of agg operation
+    int32_t agg_count = 0;
+    // Accumulated time to aggregate
+    int64_t agg_time_ns = 0;
+    // Time to flush the memtable
+    int64_t flush_time_ns = 0;
+    // IO time for flush
+    int64_t io_time_ns = 0;
+    // Memory size to flush
+    int64_t flush_memory_size = 0;
+    // Disk size to flush
+    int64_t flush_disk_size = 0;
+
+    MemtableStats& operator+=(const MemtableStats& other) {
+        insert_count += other.insert_count;
+        insert_time_ns += other.insert_time_ns;
+        finalize_time_ns += other.finalize_time_ns;
+        sort_count += other.sort_count;
+        sort_time_ns += other.sort_time_ns;
+        agg_count += other.agg_count;
+        agg_time_ns += other.agg_time_ns;
+        flush_time_ns += other.flush_time_ns;
+        io_time_ns += other.io_time_ns;
+        flush_memory_size += other.flush_memory_size;
+        flush_disk_size += other.flush_disk_size;
+        return *this;
+    }
+};
+
 class MemTable {
 public:
     MemTable(int64_t tablet_id, const Schema* schema, const std::vector<SlotDescriptor*>* slot_descs,
@@ -54,7 +94,7 @@ public:
     size_t write_buffer_rows() const;
 
     // return true suggests caller should flush this memory table
-    bool insert(const Chunk& chunk, const uint32_t* indexes, uint32_t from, uint32_t size);
+    StatusOr<bool> insert(const Chunk& chunk, const uint32_t* indexes, uint32_t from, uint32_t size);
 
     Status flush(SegmentPB* seg_info = nullptr);
 
@@ -64,17 +104,20 @@ public:
 
     void set_write_buffer_row(size_t max_buffer_row) { _max_buffer_row = max_buffer_row; }
 
-    static Schema convert_schema(const TabletSchema* tablet_schema, const std::vector<SlotDescriptor*>* slot_descs);
-
-    void set_abort_delete(bool abort) { _abort_delete = abort; }
+    static Schema convert_schema(const TabletSchemaCSPtr& tablet_schema,
+                                 const std::vector<SlotDescriptor*>* slot_descs);
 
     ChunkPtr get_result_chunk() { return _result_chunk; }
 
-private:
-    void _merge();
+    bool check_supported_column_partial_update(const Chunk& chunk);
 
-    void _sort(bool is_final, bool by_sort_key = false);
-    void _sort_column_inc(bool by_sort_key = false);
+    const MemtableStats& get_stat() const { return _stats; }
+
+private:
+    Status _merge();
+
+    Status _sort(bool is_final, bool by_sort_key = false);
+    Status _sort_column_inc(bool by_sort_key = false);
     void _append_to_sorted_chunk(Chunk* src, Chunk* dest, bool is_final);
 
     void _init_aggregator_if_needed();
@@ -110,7 +153,7 @@ private:
 
     int64_t _max_buffer_size = config::write_buffer_size;
     // initial value is max size
-    size_t _max_buffer_row = -1;
+    size_t _max_buffer_row = std::numeric_limits<size_t>::max();
     size_t _total_rows = 0;
     size_t _merged_rows = 0;
 
@@ -123,7 +166,7 @@ private:
     size_t _aggregator_memory_usage = 0;
     size_t _aggregator_bytes_usage = 0;
 
-    bool _abort_delete = false;
+    MemtableStats _stats;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const MemTable& table) {

@@ -48,9 +48,9 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "gutil/strings/substitute.h"
-#include "gutil/sysinfo.h"
 #include "runtime/exec_env.h"
 #include "storage/snapshot_manager.h"
+#include "testutil/sync_point.h"
 #include "util/phmap/phmap.h"
 #include "util/threadpool.h"
 
@@ -59,6 +59,7 @@ namespace starrocks {
 namespace {
 constexpr size_t DEFAULT_DYNAMIC_THREAD_POOL_QUEUE_SIZE = 2048;
 constexpr size_t MIN_CLONE_TASK_THREADS_IN_POOL = 2;
+constexpr int32_t REPLICATION_CPU_CORES_MULTIPLIER = 4;
 } // namespace
 
 using TTaskTypeHash = std::hash<std::underlying_type<TTaskType::type>::type>;
@@ -68,6 +69,26 @@ const uint32_t REPORT_DISK_STATE_WORKER_COUNT = 1;
 const uint32_t REPORT_OLAP_TABLE_WORKER_COUNT = 1;
 const uint32_t REPORT_WORKGROUP_WORKER_COUNT = 1;
 const uint32_t REPORT_RESOURCE_USAGE_WORKER_COUNT = 1;
+const uint32_t REPORT_DATACACHE_METRICS_WORKER_COUNT = 1;
+
+/* calculate real num threads
+ * if num_threads > 0, return num_threads
+ * if num_threads < 0, return -num_threads * cpu_cores
+ * if num_threads == 0, return cpu_cores_multiplier * cpu_cores
+*/
+static int32_t calc_real_num_threads(int32_t num_threads, int32_t cpu_cores_multiplier = 1) {
+    if (num_threads == 0) {
+        num_threads = -cpu_cores_multiplier;
+    }
+    if (num_threads < 0) {
+        num_threads = -num_threads;
+        num_threads *= CpuInfo::num_cores();
+    }
+    if (num_threads < 1) {
+        num_threads = 1;
+    }
+    return num_threads;
+}
 
 class AgentServer::Impl {
 public:
@@ -87,7 +108,11 @@ public:
 
     void publish_cluster_state(TAgentResult& agent_result, const TAgentPublishRequest& request);
 
+    void update_max_thread_by_type(int type, int new_val);
+
     ThreadPool* get_thread_pool(int type) const;
+
+    void stop_task_worker_pool(TaskWorkerType type) const;
 
     DISALLOW_COPY_AND_MOVE(Impl);
 
@@ -102,6 +127,9 @@ private:
     std::unique_ptr<ThreadPool> _thread_pool_clear_transaction;
     std::unique_ptr<ThreadPool> _thread_pool_storage_medium_migrate;
     std::unique_ptr<ThreadPool> _thread_pool_check_consistency;
+    std::unique_ptr<ThreadPool> _thread_pool_compaction;
+    std::unique_ptr<ThreadPool> _thread_pool_compaction_control;
+    std::unique_ptr<ThreadPool> _thread_pool_update_schema;
 
     std::unique_ptr<ThreadPool> _thread_pool_upload;
     std::unique_ptr<ThreadPool> _thread_pool_download;
@@ -110,6 +138,8 @@ private:
     std::unique_ptr<ThreadPool> _thread_pool_move_dir;
     std::unique_ptr<ThreadPool> _thread_pool_update_tablet_meta_info;
     std::unique_ptr<ThreadPool> _thread_pool_drop_auto_increment_map;
+    std::unique_ptr<ThreadPool> _thread_pool_remote_snapshot;
+    std::unique_ptr<ThreadPool> _thread_pool_replicate_snapshot;
 
     std::unique_ptr<PushTaskWorkerPool> _push_workers;
     std::unique_ptr<PublishVersionTaskWorkerPool> _publish_version_workers;
@@ -122,8 +152,9 @@ private:
     std::unique_ptr<ReportOlapTableTaskWorkerPool> _report_tablet_workers;
     std::unique_ptr<ReportWorkgroupTaskWorkerPool> _report_workgroup_workers;
     std::unique_ptr<ReportResourceUsageTaskWorkerPool> _report_resource_usage_workers;
+    std::unique_ptr<ReportDataCacheMetricsTaskWorkerPool> _report_datacache_metrics_workers;
 
-    // Compute node only need _report_resource_usage_workers.
+    // Compute node only need _report_resource_usage_workers and _report_task_workers
     const bool _is_compute_node;
 };
 
@@ -143,67 +174,82 @@ void AgentServer::Impl::init_or_die() {
 
 #define BUILD_DYNAMIC_TASK_THREAD_POOL(name, min_threads, max_threads, queue_size, pool) \
     do {                                                                                 \
-        auto st = ThreadPoolBuilder(name)                                                \
+        auto st = ThreadPoolBuilder(#name)                                               \
                           .set_min_threads(min_threads)                                  \
                           .set_max_threads(max_threads)                                  \
                           .set_max_queue_size(queue_size)                                \
                           .build(&(pool));                                               \
         CHECK(st.ok()) << st;                                                            \
+        REGISTER_THREAD_POOL_METRICS(name, pool);                                        \
     } while (false)
 
-        // The ideal queue size of threadpool should be larger than the maximum number of tablet of a partition.
-        // But it seems that there's no limit for the number of tablets of a partition.
-        // Since a large queue size brings a little overhead, a big one is chosen here.
-        BUILD_DYNAMIC_TASK_THREAD_POOL("publish_version", config::transaction_publish_version_worker_count,
-                                       config::transaction_publish_version_worker_count,
-                                       DEFAULT_DYNAMIC_THREAD_POOL_QUEUE_SIZE, _thread_pool_publish_version);
+// The ideal queue size of threadpool should be larger than the maximum number of tablet of a partition.
+// But it seems that there's no limit for the number of tablets of a partition.
+// Since a large queue size brings a little overhead, a big one is chosen here.
+#ifdef BE_TEST
+        BUILD_DYNAMIC_TASK_THREAD_POOL(publish_version, 1, 3, DEFAULT_DYNAMIC_THREAD_POOL_QUEUE_SIZE,
+                                       _thread_pool_publish_version);
+#else
+        int max_publish_version_worker_count = calc_real_num_threads(config::transaction_publish_version_worker_count);
+        max_publish_version_worker_count =
+                std::max(max_publish_version_worker_count, MIN_TRANSACTION_PUBLISH_WORKER_COUNT);
+        int min_publish_version_worker_count =
+                std::max(config::transaction_publish_version_thread_pool_num_min, MIN_TRANSACTION_PUBLISH_WORKER_COUNT);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(publish_version, min_publish_version_worker_count,
+                                       max_publish_version_worker_count, std::numeric_limits<int>::max(),
+                                       _thread_pool_publish_version);
+#endif
+        int real_drop_tablet_worker_count = (config::drop_tablet_worker_count > 0)
+                                                    ? config::drop_tablet_worker_count
+                                                    : std::max((int)(CpuInfo::num_cores() / 2), (int)1);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(drop, 1, real_drop_tablet_worker_count, std::numeric_limits<int>::max(),
+                                       _thread_pool_drop);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("drop", config::drop_tablet_worker_count, config::drop_tablet_worker_count,
-                                       std::numeric_limits<int>::max(), _thread_pool_drop);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(create_tablet, 1, config::create_tablet_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_create_tablet);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("create_tablet", config::create_tablet_worker_count,
-                                       config::create_tablet_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_create_tablet);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(alter_tablet, 0, config::alter_tablet_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_alter_tablet);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("alter_tablet", config::alter_tablet_worker_count,
-                                       config::alter_tablet_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_alter_tablet);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(clear_transaction, 0, config::clear_transaction_task_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_clear_transaction);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("clear_transaction", config::clear_transaction_task_worker_count,
-                                       config::clear_transaction_task_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_clear_transaction);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(storage_medium_migrate, 0, config::storage_medium_migrate_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_storage_medium_migrate);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("storage_medium_migrate", config::storage_medium_migrate_count,
-                                       config::storage_medium_migrate_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_storage_medium_migrate);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(check_consistency, 0, config::check_consistency_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_check_consistency);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("check_consistency", config::check_consistency_worker_count,
-                                       config::check_consistency_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_check_consistency);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(manual_compaction, 0, 1, std::numeric_limits<int>::max(),
+                                       _thread_pool_compaction);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("upload", config::upload_worker_count, config::upload_worker_count,
+        BUILD_DYNAMIC_TASK_THREAD_POOL(compaction_control, 0, 1, std::numeric_limits<int>::max(),
+                                       _thread_pool_compaction_control);
+
+        BUILD_DYNAMIC_TASK_THREAD_POOL(update_schema, 0, config::update_schema_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_update_schema);
+
+        BUILD_DYNAMIC_TASK_THREAD_POOL(upload, 0, calc_real_num_threads(config::upload_worker_count),
                                        std::numeric_limits<int>::max(), _thread_pool_upload);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("download", config::download_worker_count, config::download_worker_count,
+        BUILD_DYNAMIC_TASK_THREAD_POOL(download, 0, calc_real_num_threads(config::download_worker_count),
                                        std::numeric_limits<int>::max(), _thread_pool_download);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("make_snapshot", config::make_snapshot_worker_count,
-                                       config::make_snapshot_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_make_snapshot);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(make_snapshot, 0, config::make_snapshot_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_make_snapshot);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("release_snapshot", config::release_snapshot_worker_count,
-                                       config::release_snapshot_worker_count, std::numeric_limits<int>::max(),
-                                       _thread_pool_release_snapshot);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(release_snapshot, 0, config::release_snapshot_worker_count,
+                                       std::numeric_limits<int>::max(), _thread_pool_release_snapshot);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("move_dir", 1, 1, std::numeric_limits<int>::max(), _thread_pool_move_dir);
+        BUILD_DYNAMIC_TASK_THREAD_POOL(move_dir, 0, calc_real_num_threads(config::download_worker_count),
+                                       std::numeric_limits<int>::max(), _thread_pool_move_dir);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("update_tablet_meta_info", 1, 1, std::numeric_limits<int>::max(),
+        BUILD_DYNAMIC_TASK_THREAD_POOL(update_tablet_meta_info, 0, 1, std::numeric_limits<int>::max(),
                                        _thread_pool_update_tablet_meta_info);
 
-        BUILD_DYNAMIC_TASK_THREAD_POOL("drop_auto_increment_map_dir", 1, 1, std::numeric_limits<int>::max(),
+        BUILD_DYNAMIC_TASK_THREAD_POOL(drop_auto_increment_map_dir, 0, 1, std::numeric_limits<int>::max(),
                                        _thread_pool_drop_auto_increment_map);
 
-#ifndef BE_TEST
         // Currently FE can have at most num_of_storage_path * schedule_slot_num_per_path(default 2) clone tasks
         // scheduled simultaneously, but previously we have only 3 clone worker threads by default,
         // so this is to keep the dop of clone task handling in sync with FE.
@@ -213,10 +259,20 @@ void AgentServer::Impl::init_or_die() {
         // need to modify many interfaces. So for now we still use TaskThreadPool to submit clone tasks, but with
         // only a single worker thread, then we use dynamic thread pool to handle the task concurrently in clone task
         // callback, so that we can match the dop of FE clone task scheduling.
-        BUILD_DYNAMIC_TASK_THREAD_POOL("clone", MIN_CLONE_TASK_THREADS_IN_POOL,
-                                       _exec_env->store_paths().size() * config::parallel_clone_task_per_path,
+        BUILD_DYNAMIC_TASK_THREAD_POOL(clone, 0,
+                                       std::max(_exec_env->store_paths().size() * config::parallel_clone_task_per_path,
+                                                MIN_CLONE_TASK_THREADS_IN_POOL),
                                        DEFAULT_DYNAMIC_THREAD_POOL_QUEUE_SIZE, _thread_pool_clone);
-#endif
+
+        BUILD_DYNAMIC_TASK_THREAD_POOL(
+                remote_snapshot, 0,
+                calc_real_num_threads(config::replication_threads, REPLICATION_CPU_CORES_MULTIPLIER),
+                std::numeric_limits<int>::max(), _thread_pool_remote_snapshot);
+
+        BUILD_DYNAMIC_TASK_THREAD_POOL(
+                replicate_snapshot, 0,
+                calc_real_num_threads(config::replication_threads, REPLICATION_CPU_CORES_MULTIPLIER),
+                std::numeric_limits<int>::max(), _thread_pool_replicate_snapshot);
 
         // It is the same code to create workers of each type, so we use a macro
         // to make code to be more readable.
@@ -228,19 +284,21 @@ void AgentServer::Impl::init_or_die() {
 #define CREATE_AND_START_POOL(pool_name, CLASS_NAME, worker_num)
 #endif // BE_TEST
 
-        CREATE_AND_START_POOL(_publish_version_workers, PublishVersionTaskWorkerPool, base::NumCPUs())
+        CREATE_AND_START_POOL(_publish_version_workers, PublishVersionTaskWorkerPool, CpuInfo::num_cores())
         // Both PUSH and REALTIME_PUSH type use _push_workers
         CREATE_AND_START_POOL(_push_workers, PushTaskWorkerPool,
                               config::push_worker_count_high_priority + config::push_worker_count_normal_priority)
         CREATE_AND_START_POOL(_delete_workers, DeleteTaskWorkerPool,
                               config::delete_worker_count_normal_priority + config::delete_worker_count_high_priority)
-        CREATE_AND_START_POOL(_report_task_workers, ReportTaskWorkerPool, REPORT_TASK_WORKER_COUNT)
         CREATE_AND_START_POOL(_report_disk_state_workers, ReportDiskStateTaskWorkerPool, REPORT_DISK_STATE_WORKER_COUNT)
         CREATE_AND_START_POOL(_report_tablet_workers, ReportOlapTableTaskWorkerPool, REPORT_OLAP_TABLE_WORKER_COUNT)
         CREATE_AND_START_POOL(_report_workgroup_workers, ReportWorkgroupTaskWorkerPool, REPORT_WORKGROUP_WORKER_COUNT)
     }
     CREATE_AND_START_POOL(_report_resource_usage_workers, ReportResourceUsageTaskWorkerPool,
                           REPORT_RESOURCE_USAGE_WORKER_COUNT)
+    CREATE_AND_START_POOL(_report_datacache_metrics_workers, ReportDataCacheMetricsTaskWorkerPool,
+                          REPORT_DATACACHE_METRICS_WORKER_COUNT)
+    CREATE_AND_START_POOL(_report_task_workers, ReportTaskWorkerPool, REPORT_TASK_WORKER_COUNT)
 #undef CREATE_AND_START_POOL
 }
 
@@ -253,6 +311,9 @@ void AgentServer::Impl::stop() {
         _thread_pool_clear_transaction->shutdown();
         _thread_pool_storage_medium_migrate->shutdown();
         _thread_pool_check_consistency->shutdown();
+        _thread_pool_compaction->shutdown();
+        _thread_pool_compaction_control->shutdown();
+        _thread_pool_update_schema->shutdown();
         _thread_pool_upload->shutdown();
         _thread_pool_download->shutdown();
         _thread_pool_make_snapshot->shutdown();
@@ -263,6 +324,8 @@ void AgentServer::Impl::stop() {
 
 #ifndef BE_TEST
         _thread_pool_clone->shutdown();
+        _thread_pool_remote_snapshot->shutdown();
+        _thread_pool_replicate_snapshot->shutdown();
 #define STOP_POOL(type, pool_name) pool_name->stop();
 #else
 #define STOP_POOL(type, pool_name)
@@ -271,16 +334,17 @@ void AgentServer::Impl::stop() {
         // Both PUSH and REALTIME_PUSH type use _push_workers
         STOP_POOL(PUSH, _push_workers);
         STOP_POOL(DELETE, _delete_workers);
-        STOP_POOL(REPORT_TASK, _report_task_workers);
         STOP_POOL(REPORT_DISK_STATE, _report_disk_state_workers);
         STOP_POOL(REPORT_OLAP_TABLE, _report_tablet_workers);
         STOP_POOL(REPORT_WORKGROUP, _report_workgroup_workers);
     }
     STOP_POOL(REPORT_WORKGROUP, _report_resource_usage_workers);
+    STOP_POOL(REPORT_DATACACHE_METRICS, _report_datacache_metrics_workers);
+    STOP_POOL(REPORT_TASK, _report_task_workers);
 #undef STOP_POOL
 }
 
-AgentServer::Impl::~Impl() {}
+AgentServer::Impl::~Impl() = default;
 
 // TODO(lingbin): each task in the batch may have it own status or FE must check and
 // resend request when something is wrong(BE may need some logic to guarantee idempotence.
@@ -320,13 +384,18 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
             HANDLE_TYPE(TTaskType::CLONE, clone_req);
             HANDLE_TYPE(TTaskType::STORAGE_MEDIUM_MIGRATE, storage_medium_migrate_req);
             HANDLE_TYPE(TTaskType::CHECK_CONSISTENCY, check_consistency_req);
+            HANDLE_TYPE(TTaskType::COMPACTION, compaction_req);
+            HANDLE_TYPE(TTaskType::COMPACTION_CONTROL, compaction_control_req);
             HANDLE_TYPE(TTaskType::UPLOAD, upload_req);
+            HANDLE_TYPE(TTaskType::UPDATE_SCHEMA, update_schema_req);
             HANDLE_TYPE(TTaskType::DOWNLOAD, download_req);
             HANDLE_TYPE(TTaskType::MAKE_SNAPSHOT, snapshot_req);
             HANDLE_TYPE(TTaskType::RELEASE_SNAPSHOT, release_snapshot_req);
             HANDLE_TYPE(TTaskType::MOVE, move_dir_req);
             HANDLE_TYPE(TTaskType::UPDATE_TABLET_META_INFO, update_tablet_meta_info_req);
             HANDLE_TYPE(TTaskType::DROP_AUTO_INCREMENT_MAP, drop_auto_increment_map_req);
+            HANDLE_TYPE(TTaskType::REMOTE_SNAPSHOT, remote_snapshot_req);
+            HANDLE_TYPE(TTaskType::REPLICATE_SNAPSHOT, replicate_snapshot_req);
 
         case TTaskType::REALTIME_PUSH:
             if (!task.__isset.push_req) {
@@ -359,7 +428,7 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
 #undef HANDLE_TYPE
 
         if (!ret_st.ok()) {
-            LOG(WARNING) << "fail to submit task. reason: " << ret_st.get_error_msg() << ", task: " << task;
+            LOG(WARNING) << "fail to submit task. reason: " << ret_st.message() << ", task: " << task;
             // For now, all tasks in the batch share one status, so if any task
             // was failed to submit, we can only return error to FE(even when some
             // tasks have already been successfully submitted).
@@ -377,10 +446,15 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
     for (auto* task : all_tasks) {                                                                                 \
         auto pool = get_thread_pool(t_task_type);                                                                  \
         auto signature = task->signature;                                                                          \
-        if (register_task_info(task_type, signature)) {                                                            \
-            LOG(INFO) << "Submit task success. type=" << t_task_type << ", signature=" << signature;               \
+        std::pair<bool, size_t> register_pair = register_task_info(task_type, signature);                          \
+        if (register_pair.first) {                                                                                 \
+            LOG(INFO) << "Submit task success. type=" << t_task_type << ", signature=" << signature                \
+                      << ", task_count_in_queue=" << register_pair.second;                                         \
             ret_st = pool->submit_func(                                                                            \
                     std::bind(do_func, std::make_shared<AGENT_REQ>(*task, task->request, time(nullptr)), env));    \
+            if (!ret_st.ok()) {                                                                                    \
+                LOG(WARNING) << "fail to submit task. reason: " << ret_st.message() << ", task: " << task;         \
+            }                                                                                                      \
         } else {                                                                                                   \
             LOG(INFO) << "Submit task failed, already exists type=" << t_task_type << ", signature=" << signature; \
         }                                                                                                          \
@@ -420,6 +494,18 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
             HANDLE_TASK(TTaskType::CHECK_CONSISTENCY, all_tasks, run_check_consistency_task,
                         CheckConsistencyTaskRequest, check_consistency_req, _exec_env);
             break;
+        case TTaskType::COMPACTION:
+            HANDLE_TASK(TTaskType::COMPACTION, all_tasks, run_compaction_task, CompactionTaskRequest, compaction_req,
+                        _exec_env);
+            break;
+        case TTaskType::COMPACTION_CONTROL:
+            HANDLE_TASK(TTaskType::COMPACTION_CONTROL, all_tasks, run_compaction_control_task,
+                        CompactionControlTaskRequest, compaction_control_req, _exec_env);
+            break;
+        case TTaskType::UPDATE_SCHEMA:
+            HANDLE_TASK(TTaskType::UPDATE_SCHEMA, all_tasks, run_update_schema_task, UpdateSchemaTaskRequest,
+                        update_schema_req, _exec_env);
+            break;
         case TTaskType::UPLOAD:
             HANDLE_TASK(TTaskType::UPLOAD, all_tasks, run_upload_task, UploadAgentTaskRequest, upload_req, _exec_env);
             break;
@@ -447,6 +533,14 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
             HANDLE_TASK(TTaskType::DROP_AUTO_INCREMENT_MAP, all_tasks, run_drop_auto_increment_map_task,
                         DropAutoIncrementMapAgentTaskRequest, drop_auto_increment_map_req, _exec_env);
             break;
+        case TTaskType::REMOTE_SNAPSHOT:
+            HANDLE_TASK(TTaskType::REMOTE_SNAPSHOT, all_tasks, run_remote_snapshot_task, RemoteSnapshotAgentTaskRequest,
+                        remote_snapshot_req, _exec_env);
+            break;
+        case TTaskType::REPLICATE_SNAPSHOT:
+            HANDLE_TASK(TTaskType::REPLICATE_SNAPSHOT, all_tasks, run_replicate_snapshot_task,
+                        ReplicateSnapshotAgentTaskRequest, replicate_snapshot_req, _exec_env);
+            break;
         case TTaskType::REALTIME_PUSH:
         case TTaskType::PUSH: {
             // should not run here
@@ -458,7 +552,7 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
             break;
         default:
             ret_st = Status::InvalidArgument(strings::Substitute("tasks(type=$0) has wrong task type", task_type));
-            LOG(WARNING) << "fail to batch submit task. reason: " << ret_st.get_error_msg();
+            LOG(WARNING) << "fail to batch submit task. reason: " << ret_st.message();
         }
     }
 
@@ -479,7 +573,7 @@ void AgentServer::Impl::submit_tasks(TAgentResult& agent_result, const std::vect
             default:
                 ret_st = Status::InvalidArgument(strings::Substitute("tasks(type=$0, push_type=$1) has wrong task type",
                                                                      TTaskType::PUSH, push_type));
-                LOG(WARNING) << "fail to batch submit push task. reason: " << ret_st.get_error_msg();
+                LOG(WARNING) << "fail to batch submit push task. reason: " << ret_st.message();
             }
         }
     }
@@ -517,39 +611,141 @@ void AgentServer::Impl::publish_cluster_state(TAgentResult& t_agent_result, cons
     status.to_thrift(&t_agent_result.status);
 }
 
+void AgentServer::Impl::update_max_thread_by_type(int type, int new_val) {
+    Status st;
+    switch (type) {
+    case TTaskType::UPLOAD:
+        st = _thread_pool_upload->update_max_threads(calc_real_num_threads(new_val));
+        break;
+    case TTaskType::DOWNLOAD:
+        st = _thread_pool_download->update_max_threads(calc_real_num_threads(new_val));
+        break;
+    case TTaskType::MOVE:
+        st = _thread_pool_move_dir->update_max_threads(calc_real_num_threads(new_val));
+        break;
+    case TTaskType::REMOTE_SNAPSHOT:
+        st = _thread_pool_remote_snapshot->update_max_threads(
+                calc_real_num_threads(new_val, REPLICATION_CPU_CORES_MULTIPLIER));
+        break;
+    case TTaskType::REPLICATE_SNAPSHOT:
+        st = _thread_pool_replicate_snapshot->update_max_threads(
+                calc_real_num_threads(new_val, REPLICATION_CPU_CORES_MULTIPLIER));
+        break;
+    default: {
+        ThreadPool* thread_pool = get_thread_pool(type);
+        if (thread_pool) {
+            st = thread_pool->update_max_threads(new_val);
+        } else {
+            LOG(WARNING) << "Failed to update max thread, cannot get thread pool by task type: "
+                         << to_string((TTaskType::type)type);
+        }
+        break;
+    }
+    }
+    LOG_IF(ERROR, !st.ok()) << st;
+}
+
+#define STOP_IF_NOT_NULL(worker_pool) \
+    if (worker_pool != nullptr) {     \
+        worker_pool->stop();          \
+    }
+
+void AgentServer::Impl::stop_task_worker_pool(TaskWorkerType type) const {
+    switch (type) {
+    case TaskWorkerType::PUSH:
+        STOP_IF_NOT_NULL(_push_workers);
+        break;
+    case TaskWorkerType::PUBLISH_VERSION:
+        STOP_IF_NOT_NULL(_publish_version_workers);
+        break;
+    case TaskWorkerType::DELETE:
+        STOP_IF_NOT_NULL(_delete_workers);
+        break;
+    case TaskWorkerType::REPORT_TASK:
+        STOP_IF_NOT_NULL(_report_task_workers);
+        break;
+    case TaskWorkerType::REPORT_DISK_STATE:
+        STOP_IF_NOT_NULL(_report_disk_state_workers);
+        break;
+    case TaskWorkerType::REPORT_OLAP_TABLE:
+        STOP_IF_NOT_NULL(_report_tablet_workers);
+        break;
+    case TaskWorkerType::REPORT_WORKGROUP:
+        STOP_IF_NOT_NULL(_report_workgroup_workers);
+        STOP_IF_NOT_NULL(_report_resource_usage_workers);
+        break;
+    case TaskWorkerType::REPORT_DATACACHE_METRICS:
+        STOP_IF_NOT_NULL(_report_datacache_metrics_workers);
+        break;
+    default:
+        break;
+    }
+}
+
 ThreadPool* AgentServer::Impl::get_thread_pool(int type) const {
     // TODO: more thread pools.
+    ThreadPool* ret = nullptr;
     switch (type) {
     case TTaskType::PUBLISH_VERSION:
-        return _thread_pool_publish_version.get();
+        ret = _thread_pool_publish_version.get();
+        break;
     case TTaskType::CLONE:
-        return _thread_pool_clone.get();
+        ret = _thread_pool_clone.get();
+        break;
     case TTaskType::DROP:
-        return _thread_pool_drop.get();
+        ret = _thread_pool_drop.get();
+        break;
     case TTaskType::CREATE:
-        return _thread_pool_create_tablet.get();
+        ret = _thread_pool_create_tablet.get();
+        break;
     case TTaskType::STORAGE_MEDIUM_MIGRATE:
-        return _thread_pool_storage_medium_migrate.get();
+        ret = _thread_pool_storage_medium_migrate.get();
+        break;
     case TTaskType::MAKE_SNAPSHOT:
-        return _thread_pool_make_snapshot.get();
+        ret = _thread_pool_make_snapshot.get();
+        break;
     case TTaskType::RELEASE_SNAPSHOT:
-        return _thread_pool_release_snapshot.get();
+        ret = _thread_pool_release_snapshot.get();
+        break;
     case TTaskType::CHECK_CONSISTENCY:
-        return _thread_pool_check_consistency.get();
+        ret = _thread_pool_check_consistency.get();
+        break;
+    case TTaskType::COMPACTION:
+        ret = _thread_pool_compaction.get();
+        break;
+    case TTaskType::COMPACTION_CONTROL:
+        ret = _thread_pool_compaction_control.get();
+        break;
+    case TTaskType::UPDATE_SCHEMA:
+        ret = _thread_pool_update_schema.get();
+        break;
     case TTaskType::UPLOAD:
-        return _thread_pool_upload.get();
+        ret = _thread_pool_upload.get();
+        break;
     case TTaskType::DOWNLOAD:
-        return _thread_pool_download.get();
+        ret = _thread_pool_download.get();
+        break;
     case TTaskType::MOVE:
-        return _thread_pool_move_dir.get();
+        ret = _thread_pool_move_dir.get();
+        break;
     case TTaskType::UPDATE_TABLET_META_INFO:
-        return _thread_pool_update_tablet_meta_info.get();
+        ret = _thread_pool_update_tablet_meta_info.get();
+        break;
     case TTaskType::ALTER:
-        return _thread_pool_alter_tablet.get();
+        ret = _thread_pool_alter_tablet.get();
+        break;
     case TTaskType::CLEAR_TRANSACTION_TASK:
-        return _thread_pool_clear_transaction.get();
+        ret = _thread_pool_clear_transaction.get();
+        break;
     case TTaskType::DROP_AUTO_INCREMENT_MAP:
-        return _thread_pool_drop_auto_increment_map.get();
+        ret = _thread_pool_drop_auto_increment_map.get();
+        break;
+    case TTaskType::REMOTE_SNAPSHOT:
+        ret = _thread_pool_remote_snapshot.get();
+        break;
+    case TTaskType::REPLICATE_SNAPSHOT:
+        ret = _thread_pool_replicate_snapshot.get();
+        break;
     case TTaskType::PUSH:
     case TTaskType::REALTIME_PUSH:
     case TTaskType::ROLLUP:
@@ -559,14 +755,13 @@ ThreadPool* AgentServer::Impl::get_thread_pool(int type) const {
     case TTaskType::CLEAR_ALTER_TASK:
     case TTaskType::RECOVER_TABLET:
     case TTaskType::STREAM_LOAD:
-
     case TTaskType::INSTALL_PLUGIN:
     case TTaskType::UNINSTALL_PLUGIN:
     case TTaskType::NUM_TASK_TYPE:
-    default:
         break;
     }
-    return nullptr;
+    TEST_SYNC_POINT_CALLBACK("AgentServer::Impl::get_thread_pool:1", &ret);
+    return ret;
 }
 
 AgentServer::AgentServer(ExecEnv* exec_env, bool is_compute_node)
@@ -590,8 +785,16 @@ void AgentServer::publish_cluster_state(TAgentResult& agent_result, const TAgent
     _impl->publish_cluster_state(agent_result, request);
 }
 
+void AgentServer::update_max_thread_by_type(int type, int new_val) {
+    _impl->update_max_thread_by_type(type, new_val);
+}
+
 ThreadPool* AgentServer::get_thread_pool(int type) const {
     return _impl->get_thread_pool(type);
+}
+
+void AgentServer::stop_task_worker_pool(TaskWorkerType type) const {
+    return _impl->stop_task_worker_pool(type);
 }
 
 void AgentServer::init_or_die() {

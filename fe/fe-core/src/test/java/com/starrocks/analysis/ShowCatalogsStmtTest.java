@@ -16,10 +16,10 @@
 package com.starrocks.analysis;
 
 import com.google.common.collect.Sets;
+import com.starrocks.authorization.PrivilegeBuiltinConstants;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.privilege.PrivilegeBuiltinConstants;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.qe.ShowExecutor;
@@ -68,15 +68,14 @@ public class ShowCatalogsStmtTest {
     @Test
     public void testShowCatalogsNormal() throws AnalysisException, DdlException {
         ShowCatalogsStmt stmt = new ShowCatalogsStmt();
-        ShowExecutor executor = new ShowExecutor(ctx, stmt);
-        ShowResultSet resultSet = executor.execute();
+        ShowResultSet resultSet = ShowExecutor.execute(stmt, ctx);
         ShowResultSetMetaData metaData = resultSet.getMetaData();
         Assert.assertEquals("Catalog", metaData.getColumn(0).getName());
         Assert.assertEquals("Type", metaData.getColumn(1).getName());
         Assert.assertEquals("Comment", metaData.getColumn(2).getName());
         Assert.assertEquals("[default_catalog, Internal, An internal catalog contains this cluster's self-managed tables.]",
                 resultSet.getResultRows().get(0).toString());
-        Assert.assertEquals("[hive_catalog_1, hive, hive_catalog]", resultSet.getResultRows().get(1).toString());
+        Assert.assertEquals("[hive_catalog_1, Hive, hive_catalog]", resultSet.getResultRows().get(1).toString());
     }
 
     @Test

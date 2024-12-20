@@ -15,37 +15,66 @@
 
 package com.starrocks.sql.ast;
 
+import com.google.common.collect.Maps;
+import com.starrocks.analysis.TaskName;
+import com.starrocks.scheduler.persist.TaskSchedule;
 import com.starrocks.sql.parser.NodePosition;
 
 import java.util.Map;
 
 public class SubmitTaskStmt extends DdlStmt {
+    private String catalogName;
 
     private String dbName;
 
     private String taskName;
 
-    private Map<String, String> properties;
+    private Map<String, String> properties = Maps.newHashMap();
 
     private int sqlBeginIndex;
 
     private String sqlText;
+    private TaskSchedule schedule;
 
     private CreateTableAsSelectStmt createTableAsSelectStmt;
+    private DataCacheSelectStatement dataCacheSelectStmt;
+    private InsertStmt insertStmt;
 
-    public SubmitTaskStmt(String dbName, String taskName, Map<String, String> properties, int sqlBeginIndex,
-                          CreateTableAsSelectStmt createTableAsSelectStmt) {
-        this(dbName, taskName, properties, sqlBeginIndex, createTableAsSelectStmt, NodePosition.ZERO);
-    }
-
-    public SubmitTaskStmt(String dbName, String taskName, Map<String, String> properties, int sqlBeginIndex,
-                          CreateTableAsSelectStmt createTableAsSelectStmt, NodePosition pos) {
+    public SubmitTaskStmt(TaskName taskName, int sqlBeginIndex, CreateTableAsSelectStmt createTableAsSelectStmt,
+                          NodePosition pos) {
         super(pos);
-        this.dbName = dbName;
-        this.taskName = taskName;
-        this.properties = properties;
+        this.dbName = taskName.getDbName();
+        this.taskName = taskName.getName();
         this.sqlBeginIndex = sqlBeginIndex;
         this.createTableAsSelectStmt = createTableAsSelectStmt;
+    }
+
+    public SubmitTaskStmt(TaskName taskName, int sqlBeginIndex, DataCacheSelectStatement dataCacheSelectStatement,
+                          NodePosition pos) {
+        super(pos);
+        this.dbName = taskName.getDbName();
+        this.taskName = taskName.getName();
+        this.sqlBeginIndex = sqlBeginIndex;
+        this.dataCacheSelectStmt = dataCacheSelectStatement;
+        if (this.dataCacheSelectStmt.getProperties() != null) {
+            this.properties.putAll(this.dataCacheSelectStmt.getProperties());
+        }
+    }
+
+    public SubmitTaskStmt(TaskName taskName, int sqlBeginIndex, InsertStmt insertStmt, NodePosition pos) {
+        super(pos);
+        this.dbName = taskName.getDbName();
+        this.taskName = taskName.getName();
+        this.sqlBeginIndex = sqlBeginIndex;
+        this.insertStmt = insertStmt;
+    }
+
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public void setCatalogName(String catalogName) {
+        this.catalogName = catalogName;
     }
 
     public String getDbName() {
@@ -88,12 +117,32 @@ public class SubmitTaskStmt extends DdlStmt {
         this.sqlText = sqlText;
     }
 
+    public void setSchedule(TaskSchedule schedule) {
+        this.schedule = schedule;
+    }
+
+    public TaskSchedule getSchedule() {
+        return schedule;
+    }
+
     public CreateTableAsSelectStmt getCreateTableAsSelectStmt() {
         return createTableAsSelectStmt;
     }
 
     public void setCreateTableAsSelectStmt(CreateTableAsSelectStmt createTableAsSelectStmt) {
         this.createTableAsSelectStmt = createTableAsSelectStmt;
+    }
+
+    public InsertStmt getInsertStmt() {
+        return insertStmt;
+    }
+
+    public DataCacheSelectStatement getDataCacheSelectStmt() {
+        return dataCacheSelectStmt;
+    }
+
+    public void setInsertStmt(InsertStmt insertStmt) {
+        this.insertStmt = insertStmt;
     }
 
     @Override

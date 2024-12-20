@@ -35,25 +35,32 @@
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.ColocateTableIndex.GroupId;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.io.Writable;
+import com.starrocks.sql.common.MetaUtils;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /*
  * This class saves the schema of a colocation group
  */
 public class ColocateGroupSchema implements Writable {
+    @SerializedName("gi")
     private GroupId groupId;
+    @SerializedName("ct")
     private List<Type> distributionColTypes = Lists.newArrayList();
+    @SerializedName("bn")
     private int bucketsNum;
+    @SerializedName("rn")
     private short replicationNum;
 
     private ColocateGroupSchema() {
@@ -84,28 +91,32 @@ public class ColocateGroupSchema implements Writable {
     }
 
     public void checkColocateSchema(OlapTable tbl) throws DdlException {
-        checkDistribution(tbl.getDefaultDistributionInfo());
+        checkDistribution(tbl.getIdToColumn(), tbl.getDefaultDistributionInfo());
         checkReplicationNum(tbl.getPartitionInfo());
     }
 
-    public void checkDistribution(DistributionInfo distributionInfo) throws DdlException {
+    public void checkDistribution(Map<ColumnId, Column> idToColumn, DistributionInfo distributionInfo)
+            throws DdlException {
         if (distributionInfo instanceof HashDistributionInfo) {
             HashDistributionInfo info = (HashDistributionInfo) distributionInfo;
             // buckets num
             if (info.getBucketNum() != bucketsNum) {
-                ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_BUCKET_NUM, bucketsNum);
+                ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_BUCKET_NUM, bucketsNum,
+                        groupId.toString(), info.toString());
             }
             // distribution col size
             if (info.getDistributionColumns().size() != distributionColTypes.size()) {
                 ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_DISTRIBUTION_COLUMN_SIZE,
-                        distributionColTypes.size());
+                        distributionColTypes.size(), groupId.toString(), info.toString());
             }
             // distribution col type
+            List<Column> distributionColumns = MetaUtils.getColumnsByColumnIds(
+                    idToColumn, distributionInfo.getDistributionColumns());
             for (int i = 0; i < distributionColTypes.size(); i++) {
                 Type targetColType = distributionColTypes.get(i);
-                if (!targetColType.equals(info.getDistributionColumns().get(i).getType())) {
+                if (!targetColType.equals(distributionColumns.get(i).getType())) {
                     ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_DISTRIBUTION_COLUMN_TYPE,
-                            info.getDistributionColumns().get(i).getName(), targetColType);
+                            groupId.toString(), distributionColumns.get(i).getName(), targetColType, info.toString());
                 }
             }
         }
@@ -115,14 +126,16 @@ public class ColocateGroupSchema implements Writable {
         for (Short repNum : partitionInfo.idToReplicationNum.values()) {
             if (repNum != replicationNum) {
                 ErrorReport
-                        .reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_REPLICATION_NUM, replicationNum);
+                        .reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_REPLICATION_NUM,
+                                replicationNum, groupId.toString(), partitionInfo.toString());
             }
         }
     }
 
     public void checkReplicationNum(short repNum) throws DdlException {
         if (repNum != replicationNum) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_REPLICATION_NUM, replicationNum);
+            ErrorReport.reportDdlException(ErrorCode.ERR_COLOCATE_TABLE_MUST_HAS_SAME_REPLICATION_NUM,
+                    replicationNum, groupId.toString(), String.valueOf(repNum));
         }
     }
 

@@ -164,6 +164,18 @@ public:
      */
     DEFINE_VECTORIZED_FN(tanh);
 
+    template <LogicalType TYPE, bool isNorm>
+    DEFINE_VECTORIZED_FN(cosine_similarity);
+
+    template <LogicalType TYPE, bool isNorm>
+    DEFINE_VECTORIZED_FN(cosine_similarity2);
+
+    template <LogicalType TYPE>
+    DEFINE_VECTORIZED_FN(l2_distance);
+
+    template <LogicalType TYPE>
+    DEFINE_VECTORIZED_FN(l2_distance2);
+
     /**
     * @param columns: [DoubleColumn]
     * @return BigIntColumn
@@ -256,6 +268,11 @@ public:
     * @return: DoubleColumn
     */
     DEFINE_VECTORIZED_FN(sqrt);
+    /**
+    * @param: [DoubleColumn]
+    * @return: DoubleColumn
+    */
+    DEFINE_VECTORIZED_FN(cbrt);
     /**
     * @param: [DoubleColumn base, DoubleColumn exp]
     * @return: DoubleColumn
@@ -370,8 +387,13 @@ public:
         } else if constexpr (lt_is_decimal<Type>) {
             // TODO(by satanson):
             //  FunctionContext carry decimal_overflow_check flag to control overflow checking.
-            using VectorizedDiv = VectorizedUnstrictDecimalBinaryFunction<Type, ModOp, false>;
-            return VectorizedDiv::template evaluate<Type>(l, r);
+            if (context != nullptr && context->error_if_overflow()) {
+                using VectorizedDiv = VectorizedUnstrictDecimalBinaryFunction<Type, ModOp, OverflowMode::REPORT_ERROR>;
+                return VectorizedDiv::template evaluate<Type>(l, r);
+            } else {
+                using VectorizedDiv = VectorizedUnstrictDecimalBinaryFunction<Type, ModOp, OverflowMode::OUTPUT_NULL>;
+                return VectorizedDiv::template evaluate<Type>(l, r);
+            }
         } else {
             return VectorizedUnstrictBinaryFunction<RValueCheckZeroImpl, modImpl>::evaluate<Type>(l, r);
         }

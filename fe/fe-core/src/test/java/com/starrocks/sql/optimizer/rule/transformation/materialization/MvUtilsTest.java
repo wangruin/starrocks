@@ -15,15 +15,22 @@
 
 package com.starrocks.sql.optimizer.rule.transformation.materialization;
 
+import com.google.common.collect.Range;
+import com.starrocks.analysis.BinaryType;
+import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.FeConstants;
+import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
+import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
@@ -38,7 +45,10 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.util.List;
+import java.util.Set;
+
+import static com.starrocks.sql.optimizer.operator.OpRuleBit.OP_PARTITION_PRUNED;
+import static com.starrocks.sql.optimizer.rule.transformation.materialization.MvPartitionCompensator.convertToDateRange;
 
 public class MvUtilsTest {
     private static ConnectContext connectContext;
@@ -46,7 +56,7 @@ public class MvUtilsTest {
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        FeConstants.default_scheduler_interval_millisecond = 1;
+        Config.alter_scheduler_interval_millisecond = 1;
         UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
@@ -67,8 +77,7 @@ public class MvUtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t1` (\n" +
@@ -80,8 +89,7 @@ public class MvUtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
     }
 
@@ -92,24 +100,24 @@ public class MvUtilsTest {
         ColumnRefOperator columnRef2 = columnRefFactory.create("col2", Type.INT, false);
         ColumnRefOperator columnRef3 = columnRefFactory.create("col3", Type.INT, false);
         BinaryPredicateOperator binaryPredicate = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.EQ, columnRef1, columnRef2);
+                BinaryType.EQ, columnRef1, columnRef2);
 
-        Database db = starRocksAssert.getCtx().getGlobalStateMgr().getDb("test");
-        Table table1 = db.getTable("t0");
+        Database db = starRocksAssert.getCtx().getGlobalStateMgr().getLocalMetastore().getDb("test");
+        Table table1 = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "t0");
         LogicalScanOperator scanOperator1 = new LogicalOlapScanOperator(table1);
         BinaryPredicateOperator binaryPredicate2 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.GE, columnRef1, ConstantOperator.createInt(1));
+                BinaryType.GE, columnRef1, ConstantOperator.createInt(1));
         scanOperator1.setPredicate(binaryPredicate2);
         OptExpression scanExpr = OptExpression.create(scanOperator1);
-        Table table2 = db.getTable("t1");
+        Table table2 = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "t1");
         LogicalScanOperator scanOperator2 = new LogicalOlapScanOperator(table2);
         BinaryPredicateOperator binaryPredicate3 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.GE, columnRef2, ConstantOperator.createInt(1));
+                BinaryType.GE, columnRef2, ConstantOperator.createInt(1));
         scanOperator2.setPredicate(binaryPredicate3);
         OptExpression scanExpr2 = OptExpression.create(scanOperator2);
         LogicalJoinOperator joinOperator = new LogicalJoinOperator(JoinOperator.INNER_JOIN, binaryPredicate);
         OptExpression joinExpr = OptExpression.create(joinOperator, scanExpr, scanExpr2);
-        List<ScalarOperator> predicates = MvUtils.getAllPredicates(joinExpr);
+        Set<ScalarOperator> predicates = MvUtils.getAllValidPredicates(joinExpr);
         Assert.assertEquals(3, predicates.size());
         Assert.assertTrue(MvUtils.isAllEqualInnerOrCrossJoin(joinExpr));
         LogicalJoinOperator joinOperator2 = new LogicalJoinOperator(JoinOperator.LEFT_OUTER_JOIN, binaryPredicate);
@@ -124,7 +132,7 @@ public class MvUtilsTest {
         Assert.assertFalse(MvUtils.isAllEqualInnerOrCrossJoin(joinExpr4));
 
         BinaryPredicateOperator binaryPredicate4 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.EQ, columnRef1, columnRef3);
+                BinaryType.EQ, columnRef1, columnRef3);
         LogicalJoinOperator joinOperator4 = new LogicalJoinOperator(JoinOperator.INNER_JOIN,
                 Utils.compoundAnd(binaryPredicate, binaryPredicate4));
         OptExpression joinExpr5 = OptExpression.create(joinOperator4, scanExpr, scanExpr2);
@@ -149,42 +157,68 @@ public class MvUtilsTest {
     }
 
     @Test
-    public void testCanonizePredicate() {
-        ColumnRefFactory columnRefFactory = new ColumnRefFactory();
-        ColumnRefOperator columnRef1 = columnRefFactory.create("col1", Type.INT, false);
-        ColumnRefOperator columnRef2 = columnRefFactory.create("col2", Type.INT, false);
-        BinaryPredicateOperator binaryPredicate = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.GT, columnRef1, ConstantOperator.createInt(1));
-        BinaryPredicateOperator binaryPredicate2 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.GE, columnRef1, ConstantOperator.createInt(2));
-        ScalarOperator canonizedPredicate = MvUtils.canonizePredicateForRewrite(binaryPredicate);
-        Assert.assertEquals(binaryPredicate2, canonizedPredicate);
-        BinaryPredicateOperator binaryPredicate3 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.LT, columnRef2, ConstantOperator.createInt(1));
-        ScalarOperator canonizedPredicate2 = MvUtils.canonizePredicateForRewrite(binaryPredicate3);
-        BinaryPredicateOperator binaryPredicate4 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.LE, columnRef2, ConstantOperator.createInt(0));
-        Assert.assertEquals(binaryPredicate4, canonizedPredicate2);
+    public void testConvertToDateRange() throws AnalysisException {
+        {
+            PartitionKey upper = PartitionKey.ofString("20231010");
+            Range<PartitionKey> upRange = Range.atMost(upper);
+            Range<PartitionKey> upResult = convertToDateRange(upRange);
+            Assert.assertTrue(upResult.hasUpperBound());
+            Assert.assertTrue(upResult.upperEndpoint().getTypes().get(0).isDateType());
+            Assert.assertTrue(upResult.upperEndpoint().getKeys().get(0) instanceof DateLiteral);
+            DateLiteral date = (DateLiteral) upResult.upperEndpoint().getKeys().get(0);
+            Assert.assertEquals(2023, date.getYear());
+            Assert.assertEquals(10, date.getMonth());
+            Assert.assertEquals(10, date.getDay());
+            Assert.assertEquals(0, date.getHour());
+        }
+        {
+            PartitionKey lower = PartitionKey.ofString("20231010");
+            Range<PartitionKey> lowRange = Range.atLeast(lower);
+            Range<PartitionKey> lowResult = convertToDateRange(lowRange);
+            Assert.assertTrue(lowResult.hasLowerBound());
+            Assert.assertTrue(lowResult.lowerEndpoint().getTypes().get(0).isDateType());
+            Assert.assertTrue(lowResult.lowerEndpoint().getKeys().get(0) instanceof DateLiteral);
+            DateLiteral date = (DateLiteral) lowResult.lowerEndpoint().getKeys().get(0);
+            Assert.assertEquals(2023, date.getYear());
+            Assert.assertEquals(10, date.getMonth());
+            Assert.assertEquals(10, date.getDay());
+            Assert.assertEquals(0, date.getHour());
+        }
+        {
+            PartitionKey lower = PartitionKey.ofString("20231010");
+            Range<PartitionKey> range = Range.atLeast(lower);
+            range = range.intersection(Range.atMost(PartitionKey.ofString("20231020")));
+            Range<PartitionKey> result = convertToDateRange(range);
+            Assert.assertTrue(result.hasLowerBound());
+            Assert.assertTrue(result.lowerEndpoint().getTypes().get(0).isDateType());
+            Assert.assertTrue(result.lowerEndpoint().getKeys().get(0) instanceof DateLiteral);
+            DateLiteral date = (DateLiteral) result.lowerEndpoint().getKeys().get(0);
+            Assert.assertEquals(2023, date.getYear());
+            Assert.assertEquals(10, date.getMonth());
+            Assert.assertEquals(10, date.getDay());
+            Assert.assertEquals(0, date.getHour());
 
-        CompoundPredicateOperator compound1 = new CompoundPredicateOperator(
-                CompoundPredicateOperator.CompoundType.AND, binaryPredicate, binaryPredicate3);
-        CompoundPredicateOperator compound2 = new CompoundPredicateOperator(
-                CompoundPredicateOperator.CompoundType.AND, binaryPredicate2, binaryPredicate4);
-        ScalarOperator canonizedPredicate3 = MvUtils.canonizePredicateForRewrite(compound1);
-        Assert.assertEquals(compound2, canonizedPredicate3);
+            Assert.assertTrue(result.hasUpperBound());
+            Assert.assertTrue(result.upperEndpoint().getTypes().get(0).isDateType());
+            Assert.assertTrue(result.upperEndpoint().getKeys().get(0) instanceof DateLiteral);
+            DateLiteral upperDate = (DateLiteral) result.upperEndpoint().getKeys().get(0);
+            Assert.assertEquals(2023, upperDate.getYear());
+            Assert.assertEquals(10, upperDate.getMonth());
+            Assert.assertEquals(20, upperDate.getDay());
+            Assert.assertEquals(0, upperDate.getHour());
+        }
+    }
 
-        CompoundPredicateOperator compound3 = new CompoundPredicateOperator(
-                CompoundPredicateOperator.CompoundType.OR, binaryPredicate, binaryPredicate3);
-        CompoundPredicateOperator compound4 = new CompoundPredicateOperator(
-                CompoundPredicateOperator.CompoundType.OR, binaryPredicate2, binaryPredicate4);
-        ScalarOperator canonizedPredicate4 = MvUtils.canonizePredicateForRewrite(compound3);
-        Assert.assertEquals(compound4, canonizedPredicate4);
-
-        CompoundPredicateOperator compound5 = new CompoundPredicateOperator(
-                CompoundPredicateOperator.CompoundType.NOT, binaryPredicate);
-        ScalarOperator canonizedPredicate5 = MvUtils.canonizePredicateForRewrite(compound5);
-        BinaryPredicateOperator binaryPredicate5 = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.LE, columnRef1, ConstantOperator.createInt(1));
-        Assert.assertEquals(binaryPredicate5, canonizedPredicate5);
+    @Test
+    public void testResetOpAppliedRule() {
+        LogicalScanOperator.Builder builder = new LogicalOlapScanOperator.Builder();
+        Operator op = builder.build();
+        Assert.assertFalse(op.isOpRuleBitSet(OP_PARTITION_PRUNED));
+        // set
+        op.setOpRuleBit(OP_PARTITION_PRUNED);
+        Assert.assertTrue(op.isOpRuleBitSet(OP_PARTITION_PRUNED));
+        // reset
+        op.resetOpRuleBit(OP_PARTITION_PRUNED);
+        Assert.assertFalse(op.isOpRuleBitSet(OP_PARTITION_PRUNED));
     }
 }

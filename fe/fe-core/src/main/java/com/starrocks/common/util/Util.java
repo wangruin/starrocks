@@ -41,10 +41,15 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.TimeoutException;
+import com.starrocks.http.WebUtils;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.SemanticException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -61,6 +66,7 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 import java.util.zip.Adler32;
+import java.util.zip.DeflaterOutputStream;
 
 public class Util {
     private static final Logger LOG = LogManager.getLogger(Util.class);
@@ -268,6 +274,10 @@ public class Util {
         for (Column column : columns) {
             adler32.update(column.getName().getBytes(StandardCharsets.UTF_8));
             String typeString = columnHashString(column);
+            if (typeString == null) {
+                throw new SemanticException("Type:%s of column:%s does not support",
+                        column.getType().toString(), column.getName());
+            }
             adler32.update(typeString.getBytes(StandardCharsets.UTF_8));
 
             String columnName = column.getName();
@@ -304,21 +314,6 @@ public class Util {
         return Math.abs(ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE));
     }
 
-    public static String dumpThread(Thread t, int lineNum) {
-        StringBuilder sb = new StringBuilder();
-        StackTraceElement[] elements = t.getStackTrace();
-        sb.append("dump thread: ").append(t.getName()).append(", id: ").append(t.getId()).append("\n");
-        int count = lineNum;
-        for (StackTraceElement element : elements) {
-            if (count == 0) {
-                break;
-            }
-            sb.append("    ").append(element.toString()).append("\n");
-            --count;
-        }
-        return sb.toString();
-    }
-
     // get response body as a string from the given url.
     // "encodedAuthInfo", the base64 encoded auth info. like:
     //      Base64.encodeBase64String("user:passwd".getBytes());
@@ -327,8 +322,10 @@ public class Util {
                                          int readTimeoutMs) {
         StringBuilder sb = new StringBuilder();
         InputStream stream = null;
+        String safeUrl = urlStr;
         try {
             URL url = new URL(urlStr);
+            safeUrl = WebUtils.sanitizeHttpReqUri(urlStr);
             URLConnection conn = url.openConnection();
             if (encodedAuthInfo != null) {
                 conn.setRequestProperty("Authorization", "Basic " + encodedAuthInfo);
@@ -344,14 +341,14 @@ public class Util {
                 sb.append(line);
             }
         } catch (Exception e) {
-            LOG.warn("failed to get result from url: {}. {}", urlStr, e.getMessage());
+            LOG.warn("failed to get result from url: {}. {}", safeUrl, e.getMessage());
             return null;
         } finally {
             if (stream != null) {
                 try {
                     stream.close();
                 } catch (IOException e) {
-                    LOG.warn("failed to close stream when get result from url: {}", urlStr, e);
+                    LOG.warn("failed to close stream when get result from url: {}", safeUrl, e);
                 }
             }
         }
@@ -450,5 +447,22 @@ public class Util {
 
     public static String deriveAliasFromOrdinal(int ordinal) {
         return AUTO_GENERATED_EXPR_ALIAS_PREFIX + ordinal;
+    }
+
+    public static byte[] compress(byte[] input) throws IOException {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        try (DeflaterOutputStream dos = new DeflaterOutputStream(outputStream)) {
+            dos.write(input);
+        }
+        return outputStream.toByteArray();
+    }
+
+    public static ConnectContext getOrCreateConnectContext() {
+        if (ConnectContext.get() != null) {
+            return ConnectContext.get();
+        }
+        ConnectContext ctx = new ConnectContext();
+        ctx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
+        return ctx;
     }
 }

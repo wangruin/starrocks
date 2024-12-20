@@ -17,8 +17,10 @@ package com.starrocks.sql.optimizer.rewrite;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
@@ -66,7 +68,7 @@ public class ScalarEquivalenceExtractor {
         searchResult.remove(columnRef);
         Set<ScalarOperator> result = Sets.newLinkedHashSet();
         for (ScalarOperator s : searchResult) {
-            result.add(new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, columnRef, s));
+            result.add(new BinaryPredicateOperator(BinaryType.EQ, columnRef, s));
         }
 
         result.addAll(valueResult);
@@ -211,7 +213,7 @@ public class ScalarEquivalenceExtractor {
                 }
 
                 child1 = (ColumnRefOperator) predicate.getChild(0);
-                if (BinaryPredicateOperator.BinaryType.EQ.equals(predicate.getBinaryType()) &&
+                if (BinaryType.EQ.equals(predicate.getBinaryType()) &&
                         predicate.getChild(1).isConstantRef()) {
                     if (!columnRefEquivalenceMap.containsKey(child1)) {
                         columnRefEquivalenceMap.put(child1, Sets.newLinkedHashSet());
@@ -223,7 +225,7 @@ public class ScalarEquivalenceExtractor {
             }
 
             // column equivalence only support EQ
-            if (!BinaryPredicateOperator.BinaryType.EQ.equals(predicate.getBinaryType())) {
+            if (!BinaryType.EQ.equals(predicate.getBinaryType())) {
                 return null;
             }
 
@@ -268,6 +270,21 @@ public class ScalarEquivalenceExtractor {
         public Void visitLikePredicateOperator(LikePredicateOperator predicate, Void context) {
             return buildEquivalenceValue(predicate);
         }
+
+        @Override
+        public Void visitCall(CallOperator call, Void context) {
+            if (!call.getType().isBoolean()) {
+                return null;
+            }
+            List<ColumnRefOperator> child1Lists = call.getColumnRefs();
+            if (Sets.newHashSet(child1Lists).size() != 1) {
+                return null;
+            }
+            ColumnRefOperator child1 = child1Lists.get(0);
+            columnValuesMap.computeIfAbsent(child1, k -> Sets.newLinkedHashSet()).add(call);
+            return null;
+        }
+
 
         private Void buildEquivalenceValue(PredicateOperator predicate) {
             List<ColumnRefOperator> child1Lists = Utils.extractColumnRef(predicate.getChild(0));

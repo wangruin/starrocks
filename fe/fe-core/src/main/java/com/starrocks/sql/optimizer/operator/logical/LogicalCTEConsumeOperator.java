@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.google.common.collect.Lists;
@@ -26,6 +25,8 @@ import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.sql.optimizer.property.DomainProperty;
+import org.apache.commons.collections4.CollectionUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -39,14 +40,18 @@ import java.util.Objects;
  * referring to the same CTEProducer.
  * */
 public class LogicalCTEConsumeOperator extends LogicalOperator {
-    private final int cteId;
+    private int cteId;
 
-    private final Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap;
+    private Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap;
 
     public LogicalCTEConsumeOperator(int cteId, Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap) {
         super(OperatorType.LOGICAL_CTE_CONSUME, Operator.DEFAULT_LIMIT, null, null);
         this.cteId = cteId;
         this.cteOutputColumnRefMap = cteOutputColumnRefMap;
+    }
+
+    private LogicalCTEConsumeOperator() {
+        super(OperatorType.LOGICAL_CTE_CONSUME);
     }
 
     public Map<ColumnRefOperator, ColumnRefOperator> getCteOutputColumnRefMap() {
@@ -69,6 +74,14 @@ public class LogicalCTEConsumeOperator extends LogicalOperator {
             entryList.add(new ColumnOutputInfo(entry.getKey(), entry.getValue()));
         }
         return new RowOutputInfo(entryList);
+    }
+
+    @Override
+    public DomainProperty deriveDomainProperty(List<OptExpression> inputs) {
+        if (CollectionUtils.isEmpty(inputs)) {
+            return new DomainProperty(Map.of());
+        }
+        return inputs.get(0).getDomainProperty();
     }
 
     public int getCteId() {
@@ -110,33 +123,29 @@ public class LogicalCTEConsumeOperator extends LogicalOperator {
 
     public static class Builder
             extends LogicalOperator.Builder<LogicalCTEConsumeOperator, LogicalCTEConsumeOperator.Builder> {
-        private int cteId;
-
-        private Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap;
 
         @Override
-        public LogicalCTEConsumeOperator build() {
-            return new LogicalCTEConsumeOperator(this);
+        protected LogicalCTEConsumeOperator newInstance() {
+            return new LogicalCTEConsumeOperator();
         }
 
         @Override
         public LogicalCTEConsumeOperator.Builder withOperator(LogicalCTEConsumeOperator operator) {
             super.withOperator(operator);
-            this.cteId = operator.cteId;
-            this.cteOutputColumnRefMap = operator.cteOutputColumnRefMap;
+            builder.cteId = operator.cteId;
+            builder.cteOutputColumnRefMap = operator.cteOutputColumnRefMap;
+            return this;
+        }
+
+        public LogicalCTEConsumeOperator.Builder setCteId(int cteId) {
+            builder.cteId = cteId;
             return this;
         }
 
         public Builder setCteOutputColumnRefMap(Map<ColumnRefOperator, ColumnRefOperator> cteOutputColumnRefMap) {
-            this.cteOutputColumnRefMap = cteOutputColumnRefMap;
+            builder.cteOutputColumnRefMap = cteOutputColumnRefMap;
             return this;
         }
-    }
-
-    private LogicalCTEConsumeOperator(LogicalCTEConsumeOperator.Builder builder) {
-        super(OperatorType.LOGICAL_CTE_CONSUME, builder.getLimit(), builder.getPredicate(), builder.getProjection());
-        this.cteId = builder.cteId;
-        this.cteOutputColumnRefMap = builder.cteOutputColumnRefMap;
     }
 
     @Override

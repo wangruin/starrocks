@@ -14,20 +14,22 @@
 
 package com.starrocks.sql.optimizer.operator.logical;
 
+import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.RowOutputInfo;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.operator.ColumnOutputInfo;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.sql.optimizer.property.DomainProperty;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 public abstract class LogicalSetOperator extends LogicalOperator {
     protected List<ColumnRefOperator> outputColumnRefOp;
@@ -42,6 +44,9 @@ public abstract class LogicalSetOperator extends LogicalOperator {
         this.childOutputColumns = childOutputColumns;
     }
 
+    public LogicalSetOperator(OperatorType opType) {
+        super(opType);
+    }
     public List<ColumnRefOperator> getOutputColumnRefOp() {
         return outputColumnRefOp;
     }
@@ -61,8 +66,14 @@ public abstract class LogicalSetOperator extends LogicalOperator {
 
     @Override
     public RowOutputInfo deriveRowOutputInfo(List<OptExpression> inputs) {
-        return new RowOutputInfo(outputColumnRefOp.stream()
-                .collect(Collectors.toMap(Function.identity(), Function.identity())));
+        List<ColumnOutputInfo> columnOutputInfoList = Lists.newArrayList();
+        outputColumnRefOp.stream().forEach(e -> columnOutputInfoList.add(new ColumnOutputInfo(e, e)));
+        return new RowOutputInfo(columnOutputInfoList, outputColumnRefOp);
+    }
+
+    @Override
+    public DomainProperty deriveDomainProperty(List<OptExpression> inputs) {
+        return new DomainProperty(Map.of());
     }
 
     @Override
@@ -86,25 +97,21 @@ public abstract class LogicalSetOperator extends LogicalOperator {
 
     public abstract static class Builder<O extends LogicalSetOperator, B extends LogicalSetOperator.Builder>
             extends Operator.Builder<O, B> {
-        protected List<ColumnRefOperator> outputColumnRefOp;
-        protected List<List<ColumnRefOperator>> childOutputColumns;
-
         @Override
         public B withOperator(O setOperator) {
             super.withOperator(setOperator);
-            this.outputColumnRefOp = setOperator.outputColumnRefOp;
-            this.childOutputColumns = setOperator.childOutputColumns;
+            builder.outputColumnRefOp = setOperator.outputColumnRefOp;
+            builder.childOutputColumns = setOperator.childOutputColumns;
             return (B) this;
         }
 
-        public B setOutputColumnRefOp(
-                List<ColumnRefOperator> outputColumnRefOp) {
-            this.outputColumnRefOp = outputColumnRefOp;
+        public B setOutputColumnRefOp(List<ColumnRefOperator> outputColumnRefOp) {
+            builder.outputColumnRefOp = outputColumnRefOp;
             return (B) this;
         }
 
         public B setChildOutputColumns(List<List<ColumnRefOperator>> childOutputColumns) {
-            this.childOutputColumns = childOutputColumns;
+            builder.childOutputColumns = childOutputColumns;
             return (B) this;
         }
     }

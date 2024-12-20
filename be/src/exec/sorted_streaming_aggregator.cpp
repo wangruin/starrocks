@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "column/array_column.h"
 #include "column/column_visitor_adapter.h"
 #include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
@@ -50,10 +51,9 @@ public:
         ColumnSelfComparator comparator(ptr, _cmp_vector, column.immutable_null_column_data());
         RETURN_IF_ERROR(column.data_column()->accept(&comparator));
 
-        const auto& data_column = column.data_column();
         // NOTE
         if (!_first_column->empty()) {
-            _cmp_vector[0] |= _first_column->compare_at(0, 0, *data_column, 1) != 0;
+            _cmp_vector[0] |= _first_column->compare_at(0, 0, column, 1) != 0;
         } else {
             _cmp_vector[0] |= 1;
         }
@@ -63,7 +63,29 @@ public:
         return Status::NotSupported("Unsupported const column in column wise comparator");
     }
     Status do_visit(const ArrayColumn& column) {
-        return Status::NotSupported("Unsupported array column in column wise comparator");
+        size_t num_rows = column.size();
+        if (!_first_column->empty()) {
+            _cmp_vector[0] |= _first_column->compare_at(0, 0, column, 1) != 0;
+        } else {
+            _cmp_vector[0] |= 1;
+        }
+
+        if (!_null_masks.empty()) {
+            DCHECK_EQ(_null_masks.size(), num_rows);
+            for (size_t i = 1; i < num_rows; ++i) {
+                if (_null_masks[i - 1] == 0 && _null_masks[i] == 0) {
+                    _cmp_vector[i] |= column.compare_at(i - 1, i, column, true) != 0;
+                } else {
+                    _cmp_vector[i] |= _null_masks[i - 1] != _null_masks[i];
+                }
+            }
+        } else {
+            for (size_t i = 1; i < num_rows; ++i) {
+                _cmp_vector[i] |= column.compare_at(i - 1, i, column, true) != 0;
+            }
+        }
+
+        return Status::OK();
     }
     Status do_visit(const LargeBinaryColumn& column) {
         return Status::NotSupported("Unsupported large binary column in column wise comparator");
@@ -143,7 +165,8 @@ private:
 //
 class AppendWithMask : public ColumnVisitorMutableAdapter<AppendWithMask> {
 public:
-    using SelMask = std::vector<uint8_t>;
+    using SelMask = Filter;
+
     AppendWithMask(Column* column, SelMask sel_mask, size_t selected_size)
             : ColumnVisitorMutableAdapter(this),
               _column(column),
@@ -165,7 +188,15 @@ public:
     }
 
     Status do_visit(ArrayColumn* column) {
-        return Status::NotSupported("Unsupported array column in column wise comparator");
+        auto col = down_cast<ArrayColumn*>(_column);
+
+        for (size_t i = 0; i < _sel_mask.size(); ++i) {
+            if (_sel_mask[i] == 0) {
+                column->append(*col, i, 1);
+            }
+        }
+
+        return Status::OK();
     }
 
     Status do_visit(LargeBinaryColumn* column) {
@@ -184,7 +215,7 @@ public:
         }
         DCHECK_EQ(_selected_size, offsets);
         datas.resize(_selected_size);
-        column->append_strings(datas);
+        column->append_strings(datas.data(), datas.size());
         return Status::OK();
     }
 
@@ -269,10 +300,10 @@ SortedStreamingAggregator::~SortedStreamingAggregator() {
     }
 }
 
-Status SortedStreamingAggregator::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* runtime_profile) {
-    RETURN_IF_ERROR(Aggregator::prepare(state, pool, runtime_profile));
+Status SortedStreamingAggregator::open(RuntimeState* state) {
+    RETURN_IF_ERROR(Aggregator::open(state));
     _streaming_state_allocator =
-            std::make_shared<StateAllocator>(_mem_pool.get(), _state->chunk_size(), _agg_states_total_size);
+            std::make_shared<StateAllocator>(_mem_pool.get(), state->chunk_size(), _agg_states_total_size);
     return Status::OK();
 }
 
@@ -296,17 +327,8 @@ StatusOr<ChunkPtr> SortedStreamingAggregator::streaming_compute_agg_state(size_t
     RETURN_IF_ERROR(_update_states(chunk_size, is_update_phase));
 
     // selector[i] == 0 means selected
-    std::vector<uint8_t> selector(chunk_size);
-    size_t selected_size = 0;
-    {
-        SCOPED_TIMER(_agg_stat->agg_compute_timer);
-        for (size_t i = 1; i < _cmp_vector.size(); ++i) {
-            selector[i - 1] = _cmp_vector[i] == 0;
-            selected_size += !selector[i - 1];
-        }
-        // we will never select the last rows
-        selector[chunk_size - 1] = 1;
-    }
+    Filter selector(chunk_size);
+    size_t selected_size = _init_selector(selector, chunk_size);
 
     // finalize state
     // group[i] != group[i - 1] means we have add a new state for group[i], then we need call finalize for group[i - 1]
@@ -338,12 +360,57 @@ StatusOr<ChunkPtr> SortedStreamingAggregator::streaming_compute_agg_state(size_t
     return result_chunk;
 }
 
+StatusOr<ChunkPtr> SortedStreamingAggregator::streaming_compute_distinct(size_t chunk_size) {
+    if (chunk_size == 0) {
+        return std::make_shared<Chunk>();
+    }
+    _cmp_vector.resize(chunk_size);
+    if (_last_columns.empty()) {
+        _last_columns.resize(_group_by_columns.size());
+        for (int i = 0; i < _last_columns.size(); ++i) {
+            _last_columns[i] = _group_by_columns[i]->clone_empty();
+        }
+    }
+
+    RETURN_IF_ERROR(_compute_group_by(chunk_size));
+    // selector[i] == 0 means selected
+    Filter selector(chunk_size);
+    size_t selected_size = _init_selector(selector, chunk_size);
+    auto res_group_by_columns = _create_group_by_columns(chunk_size);
+    RETURN_IF_ERROR(_build_group_by_columns(chunk_size, selected_size, selector, res_group_by_columns));
+    auto result_chunk = _build_output_chunk(res_group_by_columns, {}, false);
+
+    // prepare for next
+    for (size_t i = 0; i < _last_columns.size(); ++i) {
+        // last column should never be the same column with new input column
+        DCHECK_NE(_last_columns[i].get(), _group_by_columns[i].get());
+        _last_columns[i]->reset_column();
+        _last_columns[i]->append(*_group_by_columns[i], chunk_size - 1, 1);
+    }
+
+    return result_chunk;
+}
+
+size_t SortedStreamingAggregator::_init_selector(Filter& selector, size_t chunk_size) {
+    size_t selected_size = 0;
+    {
+        SCOPED_TIMER(_agg_stat->agg_compute_timer);
+        for (size_t i = 1; i < _cmp_vector.size(); ++i) {
+            selector[i - 1] = _cmp_vector[i] == 0;
+            selected_size += !selector[i - 1];
+        }
+        // we will never select the last rows
+        selector[chunk_size - 1] = 1;
+    }
+    return selected_size;
+}
+
 Status SortedStreamingAggregator::_compute_group_by(size_t chunk_size) {
     // compare stage
     // _cmp_vector[i] = group[i - 1].equals(group[i])
     // _cmp_vector[i] == 0 means group[i - 1].equals(group[i])
     _cmp_vector.assign(chunk_size, 0);
-    const std::vector<uint8_t> dummy;
+    const Buffer<uint8_t> dummy;
     SCOPED_TIMER(_agg_stat->agg_compute_timer);
     for (size_t i = 0; i < _group_by_columns.size(); ++i) {
         ColumnSelfComparator cmp(_last_columns[i], _cmp_vector, dummy);
@@ -372,7 +439,7 @@ Status SortedStreamingAggregator::_update_states(size_t chunk_size, bool is_upda
         }
 
         // only create the state when selector == 0
-        std::vector<uint8_t> create_selector(chunk_size);
+        Filter create_selector(chunk_size);
         for (size_t i = 0; i < _cmp_vector.size(); ++i) {
             create_selector[i] = _cmp_vector[i] == 0;
         }
@@ -403,22 +470,35 @@ Status SortedStreamingAggregator::_update_states(size_t chunk_size, bool is_upda
     return Status::OK();
 }
 
-Status SortedStreamingAggregator::_get_agg_result_columns(size_t chunk_size, const std::vector<uint8_t>& selector,
+Status SortedStreamingAggregator::_get_agg_result_columns(size_t chunk_size, const Buffer<uint8_t>& selector,
                                                           Columns& agg_result_columns) {
+    TRY_CATCH_ALLOC_SCOPE_START()
+    auto use_intermediate = _use_intermediate_as_output();
     SCOPED_TIMER(_agg_stat->get_results_timer);
     if (_cmp_vector[0] != 0 && _last_state) {
-        TRY_CATCH_BAD_ALLOC(_finalize_to_chunk(_last_state, agg_result_columns));
+        if (use_intermediate) {
+            _serialize_to_chunk(_last_state, agg_result_columns);
+        } else {
+            _finalize_to_chunk(_last_state, agg_result_columns);
+        }
     }
 
     for (size_t i = 0; i < _agg_fn_ctxs.size(); i++) {
-        TRY_CATCH_BAD_ALLOC(_agg_functions[i]->batch_finalize_with_selection(_agg_fn_ctxs[i], chunk_size,
-                                                                             _tmp_agg_states, _agg_states_offsets[i],
-                                                                             agg_result_columns[i].get(), selector));
+        if (use_intermediate) {
+            _agg_functions[i]->batch_serialize_with_selection(_agg_fn_ctxs[i], chunk_size, _tmp_agg_states,
+                                                              _agg_states_offsets[i], agg_result_columns[i].get(),
+                                                              selector);
+        } else {
+            _agg_functions[i]->batch_finalize_with_selection(_agg_fn_ctxs[i], chunk_size, _tmp_agg_states,
+                                                             _agg_states_offsets[i], agg_result_columns[i].get(),
+                                                             selector);
+        }
     }
+    TRY_CATCH_ALLOC_SCOPE_END();
     return Status::OK();
 }
 
-void SortedStreamingAggregator::_close_group_by(size_t chunk_size, const std::vector<uint8_t>& selector) {
+void SortedStreamingAggregator::_close_group_by(size_t chunk_size, const Filter& selector) {
     // close stage
     SCOPED_TIMER(_agg_stat->state_destroy_timer);
     if (_cmp_vector[0] != 0 && _last_state) {
@@ -432,10 +512,9 @@ void SortedStreamingAggregator::_close_group_by(size_t chunk_size, const std::ve
 }
 
 Status SortedStreamingAggregator::_build_group_by_columns(size_t chunk_size, size_t selected_size,
-                                                          const std::vector<uint8_t>& selector,
-                                                          Columns& agg_group_by_columns) {
+                                                          const Filter& selector, Columns& agg_group_by_columns) {
     SCOPED_TIMER(_agg_stat->agg_append_timer);
-    if (_cmp_vector[0] != 0 && _last_state) {
+    if (_cmp_vector[0] != 0 && !_last_columns.empty() && !_last_columns.back()->empty()) {
         for (size_t i = 0; i < agg_group_by_columns.size(); ++i) {
             agg_group_by_columns[i]->append(*_last_columns[i], 0, 1);
         }
@@ -449,14 +528,17 @@ Status SortedStreamingAggregator::_build_group_by_columns(size_t chunk_size, siz
 }
 
 StatusOr<ChunkPtr> SortedStreamingAggregator::pull_eos_chunk() {
-    if (_last_state == nullptr) {
+    if (_last_state == nullptr && _last_columns.empty()) {
         return nullptr;
     }
     bool use_intermediate = _use_intermediate_as_output();
     auto agg_result_columns = _create_agg_result_columns(1, use_intermediate);
     auto group_by_columns = _last_columns;
-
-    TRY_CATCH_BAD_ALLOC(_finalize_to_chunk(_last_state, agg_result_columns));
+    if (use_intermediate) {
+        TRY_CATCH_BAD_ALLOC(_serialize_to_chunk(_last_state, agg_result_columns));
+    } else {
+        TRY_CATCH_BAD_ALLOC(_finalize_to_chunk(_last_state, agg_result_columns));
+    }
     _destroy_state(_last_state);
     _last_state = nullptr;
     _last_columns.clear();

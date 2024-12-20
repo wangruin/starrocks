@@ -16,6 +16,7 @@ package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 
 import java.util.List;
@@ -44,7 +45,7 @@ public class BinaryPredicateOperator extends PredicateOperator {
                     .put(BinaryType.GT, BinaryType.LE)
                     .build();
 
-    private final BinaryType type;
+    private BinaryType type;
 
     public BinaryPredicateOperator(BinaryType type, ScalarOperator... arguments) {
         super(OperatorType.BINARY, arguments);
@@ -56,6 +57,10 @@ public class BinaryPredicateOperator extends PredicateOperator {
         super(OperatorType.BINARY, arguments);
         this.type = type;
         Preconditions.checkState(arguments.size() == 2);
+    }
+
+    public void setBinaryType(BinaryType type) {
+        this.type = type;
     }
 
     public BinaryType getBinaryType() {
@@ -74,58 +79,6 @@ public class BinaryPredicateOperator extends PredicateOperator {
         return visitor.visitBinaryPredicate(this, context);
     }
 
-    public enum BinaryType {
-        EQ("="),
-        NE("!="),
-        LE("<="),
-        GE(">="),
-        LT("<"),
-        GT(">"),
-        EQ_FOR_NULL("<=>");
-
-        private final String type;
-
-        BinaryType(String type) {
-            this.type = type;
-        }
-
-        @Override
-        public String toString() {
-            return type;
-        }
-
-        public boolean isEqual() {
-            return type.equals(EQ.type);
-        }
-
-        public boolean isNotEqual() {
-            return type.equals(NE.type);
-        }
-
-        public boolean isEquivalence() {
-            return this == EQ || this == EQ_FOR_NULL;
-        }
-
-        public boolean isUnequivalence() {
-            return this == NE;
-        }
-
-        public boolean isNotRangeComparison() {
-            return isEquivalence() || isUnequivalence();
-        }
-
-        public boolean isRange() {
-            return type.equals(LT.type)
-                    || type.equals(LE.type)
-                    || type.equals(GT.type)
-                    || type.equals(GE.type);
-        }
-
-        public boolean isRangeOrNe() {
-            return isRange() || type.equals(NE.type);
-        }
-    }
-
     public BinaryPredicateOperator commutative() {
         return new BinaryPredicateOperator(BINARY_COMMUTATIVE_MAP.get(this.getBinaryType()),
                 this.getChild(1),
@@ -138,6 +91,25 @@ public class BinaryPredicateOperator extends PredicateOperator {
         } else {
             return null;
         }
+    }
+
+    /**
+     * For Non-Strict Monotonic function, we need to convert
+     * 1. > to >=, and < to <=
+     * 2. !=, not supported
+     */
+    public BinaryPredicateOperator normalizeNonStrictMonotonic() {
+        if (getBinaryType() == BinaryType.NE) {
+            return null;
+        }
+        BinaryPredicateOperator result = (BinaryPredicateOperator) clone();
+        if (getBinaryType() == BinaryType.LT) {
+            result.setBinaryType(BinaryType.LE);
+        }
+        if (getBinaryType() == BinaryType.GT) {
+            result.setBinaryType(BinaryType.GE);
+        }
+        return result;
     }
 
     @Override

@@ -15,104 +15,39 @@
 
 package com.starrocks.persist.metablock;
 
-import com.starrocks.common.io.Text;
-import com.starrocks.persist.gson.GsonUtils;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.lang.reflect.Type;
-import java.util.zip.CRC32;
-import java.util.zip.CheckedInputStream;
 
-/**
- * Load object from input stream as the following format.
- *
- * +------------------+
- * |     header       | {"numJson": 10, "name": "AuthenticationManager"}
- * +------------------+
- * |     Json 1       |
- * +------------------+
- * |     Json 2       |
- * +------------------+
- * |      ...         |
- * +------------------+
- * |     Json 10      |
- * +------------------+
- * |      footer      | {"checksum": xxx}
- * +------------------+
- *
- * Usage see com.starrocks.persist.metablock.SRMetaBlockTest#testSimple()
- */
-public class SRMetaBlockReader {
-    private static final Logger LOG = LogManager.getLogger(SRMetaBlockReader.class);
-    private CheckedInputStream checkedInputStream;
-    private SRMetaBlockHeader header;
-    private String name;
-    private int numJsonRead;
-    // For backward compatibility reason
-    private final String oldManagerClassName = "com.starrocks.privilege.PrivilegeManager";
+public interface SRMetaBlockReader {
 
-    public SRMetaBlockReader(DataInputStream dis, String name) {
-        this.checkedInputStream = new CheckedInputStream(dis, new CRC32());
-        this.name = name;
-        this.header = null;
-        this.numJsonRead = 0;
-    }
+    SRMetaBlockHeader getHeader();
 
-    private String readJsonText() throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
-        if (numJsonRead == 0) {
-            // read header and check for name
-            String s = Text.readStringWithChecksum(checkedInputStream);
-            header = GsonUtils.GSON.fromJson(s, SRMetaBlockHeader.class);
-            if (!header.getName().equals(name) && !header.getName().equals(oldManagerClassName)) {
-                throw new SRMetaBlockException(
-                        "Invalid meta block header, expect " + header.getName() + " actual " + name);
-            }
-        } else if (numJsonRead >= header.getNumJson()) {
-            throw new SRMetaBlockEOFException(String.format(
-                    "Read json more than expect: %d >= %d", numJsonRead, header.getNumJson()));
-        }
-        String s = Text.readStringWithChecksum(checkedInputStream);
-        numJsonRead += 1;
-        return s;
-    }
+    int readInt() throws IOException, SRMetaBlockEOFException;
 
-    public Object readJson(Class<?> returnClass) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
-        return GsonUtils.GSON.fromJson(readJsonText(), returnClass);
-    }
+    long readLong() throws IOException, SRMetaBlockEOFException;
 
-    public Object readJson(Type returnType) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
-        return GsonUtils.GSON.fromJson(readJsonText(), returnType);
-    }
+    byte readByte() throws IOException, SRMetaBlockEOFException;
 
-    public void close() throws IOException, SRMetaBlockException {
-        if (header == null) {
-            LOG.warn("do nothing and quit.");
-            return;
-        }
-        if (numJsonRead < header.getNumJson()) {
-            // discard the rest of data for compatibility
-            // normally it's because this FE has just rollbacked from a higher version that would produce more metadata
-            int rest = header.getNumJson() - numJsonRead;
-            LOG.warn("Meta block for {} read {} json < total {} json, will skip the rest {} json",
-                    header.getName(), numJsonRead, header.getNumJson(), rest);
-            for (int i = 0; i != rest; ++ i) {
-                LOG.warn("skip {} json: {}", i, Text.readStringWithChecksum(checkedInputStream));
-            }
-        }
+    short readShort() throws IOException, SRMetaBlockEOFException;
 
-        // 1. calculate checksum
-        // 2. read footer
-        // 3. compare checksum
-        // step 1 must before step 2 as the writer goes
-        long checksum = checkedInputStream.getChecksum().getValue();
-        String s = Text.readStringWithChecksum(checkedInputStream);
-        SRMetaBlockFooter footer = GsonUtils.GSON.fromJson(s, SRMetaBlockFooter.class);
-        if (checksum != footer.getChecksum()) {
-            throw new SRMetaBlockException(String.format(
-                    "Invalid meta block, checksum mismatch! expect %d actual %d", footer.getChecksum(), checksum));
-        }
-    }
+    double readDouble() throws IOException, SRMetaBlockEOFException;
+
+    float readFloat() throws IOException, SRMetaBlockEOFException;
+
+    char readChar() throws IOException, SRMetaBlockEOFException;
+
+    boolean readBoolean() throws IOException, SRMetaBlockEOFException;
+
+    String readString() throws IOException, SRMetaBlockEOFException;
+
+    <T> T readJson(Type returnType) throws IOException, SRMetaBlockEOFException;
+
+    <T> T readJson(Class<T> classType) throws IOException, SRMetaBlockEOFException;
+
+    <T> void readCollection(Class<T> classType, CollectionConsumer<? super T> action) throws IOException, SRMetaBlockEOFException;
+
+    <K, V> void readMap(Type keyType, Type valueType, MapEntryConsumer<? super K, ? super V> action)
+            throws IOException, SRMetaBlockEOFException;
+
+    void close() throws IOException, SRMetaBlockException;
 }

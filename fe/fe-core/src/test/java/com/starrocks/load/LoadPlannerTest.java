@@ -18,7 +18,6 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.BrokerDesc;
-import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionName;
 import com.starrocks.analysis.StringLiteral;
@@ -33,19 +32,21 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.Config;
-import com.starrocks.common.UserException;
+import com.starrocks.common.DdlException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.common.util.TimeUtils;
-import com.starrocks.load.BrokerFileGroup;
-import com.starrocks.load.Load;
 import com.starrocks.planner.FileScanNode;
 import com.starrocks.planner.OlapTableSink;
 import com.starrocks.planner.PlanFragment;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.LoadPlanner;
+import com.starrocks.sql.ast.ColumnDef;
 import com.starrocks.sql.ast.DataDescription;
 import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.sql.parser.AstBuilder;
+import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TBrokerFileStatus;
@@ -54,6 +55,7 @@ import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TOpType;
+import com.starrocks.thrift.TPartialUpdateMode;
 import com.starrocks.thrift.TPlanFragment;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
@@ -82,7 +84,6 @@ public class LoadPlannerTest {
 
     // config
     private int loadParallelInstanceNum;
-    private int maxBrokerConcurrency;
 
     // backends
     private ImmutableMap<Long, Backend> idToBackend;
@@ -97,7 +98,6 @@ public class LoadPlannerTest {
     private long loadMemLimit = 1000000;
     private long execMemLimit = 1000000;
 
-
     @Mocked
     Partition partition;
     @Mocked
@@ -111,7 +111,7 @@ public class LoadPlannerTest {
         brokerDesc = new BrokerDesc("broker0", null);
 
         loadParallelInstanceNum = Config.load_parallel_instance_num;
-        maxBrokerConcurrency = Config.max_broker_concurrency;
+        Config.eliminate_shuffle_load_by_replicated_storage = false;
 
         // backends
         Map<Long, Backend> idToBackendTmp = Maps.newHashMap();
@@ -128,12 +128,12 @@ public class LoadPlannerTest {
     @After
     public void tearDown() {
         Config.load_parallel_instance_num = loadParallelInstanceNum;
-        Config.max_broker_concurrency = maxBrokerConcurrency;
+        Config.eliminate_shuffle_load_by_replicated_storage = true;
     }
 
     @Test
     public void testParallelInstance(@Mocked GlobalStateMgr globalStateMgr, @Mocked SystemInfoService systemInfoService,
-                                     @Injectable Database db, @Injectable OlapTable table) throws UserException {
+                                     @Injectable Database db, @Injectable OlapTable table) throws StarRocksException {
         // table schema
         List<Column> columns = Lists.newArrayList();
         Column c1 = new Column("c1", Type.BIGINT, true);
@@ -144,7 +144,7 @@ public class LoadPlannerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -205,26 +205,10 @@ public class LoadPlannerTest {
         locationsList = scanNode.getScanRangeLocations(0);
         Assert.assertEquals(4, locationsList.size());
 
-        // load_parallel_instance_num: 2, max_broker_concurrency: 3, non pipeline
-        Config.enable_pipeline_load = false;
-        ctx.getSessionVariable().setEnablePipelineEngine(false);
-        Config.load_parallel_instance_num = 2;
-        Config.max_broker_concurrency = 3;
-        planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
-                timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
-                brokerDesc, fileGroups, fileStatusesList, 2);
-        planner.plan();
-        scanNode = (FileScanNode) planner.getScanNodes().get(0);
-        locationsList = scanNode.getScanRangeLocations(0);
-        Assert.assertEquals(3, locationsList.size());
-        Assert.assertEquals(1, planner.getFragments().get(0).getPipelineDop());
-        Assert.assertEquals(2, planner.getFragments().get(0).getParallelExecNum());
-
-        // load_parallel_instance_num: 2, max_broker_concurrency: 3, pipeline
+        // load_parallel_instance_num: 2, pipeline
         ctx.getSessionVariable().setEnablePipelineEngine(true);
         Config.enable_pipeline_load = true;
         Config.load_parallel_instance_num = 2;
-        Config.max_broker_concurrency = 3;
         planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
                 timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
                 brokerDesc, fileGroups, fileStatusesList, 2);
@@ -232,9 +216,11 @@ public class LoadPlannerTest {
         planner.plan();
         scanNode = (FileScanNode) planner.getScanNodes().get(0);
         locationsList = scanNode.getScanRangeLocations(0);
-        Assert.assertEquals(3, locationsList.size());
+        Assert.assertEquals(4, locationsList.size());
         Assert.assertEquals(2, planner.getFragments().get(0).getPipelineDop());
         Assert.assertEquals(1, planner.getFragments().get(0).getParallelExecNum());
+
+        Assert.assertNotNull(planner.getExecPlan());
     }
 
     @Test
@@ -253,7 +239,7 @@ public class LoadPlannerTest {
                 Type.INT, true);
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -279,6 +265,9 @@ public class LoadPlannerTest {
                 result = null;
                 globalStateMgr.getFunction((Function) any, (Function.CompareMode) any);
                 returns(f1, f1, f2);
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -385,7 +374,7 @@ public class LoadPlannerTest {
                 Type.INT, true);
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -417,6 +406,9 @@ public class LoadPlannerTest {
                 table.getColumn(Load.LOAD_OP_COLUMN);
                 minTimes = 0;
                 result = null;
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -467,6 +459,65 @@ public class LoadPlannerTest {
     }
 
     @Test
+    public void testColumnWithRowPartialUpdate(@Mocked GlobalStateMgr globalStateMgr,
+                                               @Mocked SystemInfoService systemInfoService,
+                                               @Injectable Database db, @Injectable OlapTable table) throws Exception {
+        new Expectations() {
+            {
+                table.getKeysType();
+                minTimes = 0;
+                result = KeysType.PRIMARY_KEYS;
+                table.hasRowStorageType();
+                result = true;
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
+            }
+        };
+
+        // column mappings
+        String sql = "LOAD LABEL label0 (DATA INFILE('path/k2=1/file1') INTO TABLE t2 FORMAT AS 'orc' (k1,k33,v) " +
+                "COLUMNS FROM PATH AS (k2) set (k3 = substr(k33,1,5))) WITH BROKER 'broker0'";
+        LoadStmt loadStmt = (LoadStmt) com.starrocks.sql.parser.SqlParser.parse(
+                sql, ctx.getSessionVariable().getSqlMode()).get(0);
+        List<Expr> columnMappingList = Deencapsulation.getField(loadStmt.getDataDescriptions().get(0),
+                "columnMappingList");
+
+        // file groups
+        List<BrokerFileGroup> fileGroups = Lists.newArrayList();
+        List<String> files = Lists.newArrayList("path/k2=1/file1");
+        List<String> columnNames = Lists.newArrayList("k1", "k33", "v");
+        DataDescription desc = new DataDescription("t2", null, files, columnNames,
+                null, null, "ORC", Lists.newArrayList("k2"),
+                false, columnMappingList, null, null);
+        Deencapsulation.invoke(desc, "analyzeColumns");
+        BrokerFileGroup brokerFileGroup = new BrokerFileGroup(desc);
+        Deencapsulation.setField(brokerFileGroup, "columnSeparator", "\t");
+        Deencapsulation.setField(brokerFileGroup, "rowDelimiter", "\n");
+        Deencapsulation.setField(brokerFileGroup, "fileFormat", "ORC");
+        brokerFileGroup.parse(db, desc);
+        fileGroups.add(brokerFileGroup);
+
+        // file status
+        List<List<TBrokerFileStatus>> fileStatusesList = Lists.newArrayList();
+        List<TBrokerFileStatus> fileStatusList = Lists.newArrayList();
+        fileStatusList.add(new TBrokerFileStatus("path/k2=1/file1", false, 268435456, true));
+        fileStatusesList.add(fileStatusList);
+
+        // plan
+        LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                timezone, timeoutS, startTime, true, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                brokerDesc, fileGroups, fileStatusesList, 1);
+        planner.setPartialUpdateMode(TPartialUpdateMode.AUTO_MODE);
+        try {
+            planner.plan();
+            Assert.fail("No exception throws");
+        } catch (DdlException e) {
+            Assert.assertEquals("column with row table only support row mode partial update", e.getMessage());
+        }
+    }
+
+    @Test
     public void testLoadWithOpColumnDefault(@Mocked GlobalStateMgr globalStateMgr,
                                             @Mocked SystemInfoService systemInfoService,
                                             @Injectable Database db, @Injectable OlapTable table) throws Exception {
@@ -478,7 +529,7 @@ public class LoadPlannerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -502,6 +553,9 @@ public class LoadPlannerTest {
                 result = columns.get(2);
                 table.getColumn(Load.LOAD_OP_COLUMN);
                 result = null;
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -565,7 +619,7 @@ public class LoadPlannerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -589,6 +643,9 @@ public class LoadPlannerTest {
                 result = columns.get(2);
                 table.getColumn(Load.LOAD_OP_COLUMN);
                 result = null;
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -661,7 +718,7 @@ public class LoadPlannerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -696,6 +753,9 @@ public class LoadPlannerTest {
                 result = null;
                 globalStateMgr.getFunction((Function) any, (Function.CompareMode) any);
                 returns(f1, f2, f3);
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -771,7 +831,7 @@ public class LoadPlannerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -793,6 +853,9 @@ public class LoadPlannerTest {
                 table.getColumn(Load.LOAD_OP_COLUMN);
                 result = null;
                 returns(f1, f2, f3);
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -824,7 +887,6 @@ public class LoadPlannerTest {
         List<TBrokerFileStatus> fileStatusList = Lists.newArrayList();
         fileStatusList.add(new TBrokerFileStatus("/path/file1", false, 128000000, true));
         fileStatusesList.add(fileStatusList);
-
 
         // plan
         LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
@@ -866,7 +928,7 @@ public class LoadPlannerTest {
                 Type.INT, true);
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -900,6 +962,9 @@ public class LoadPlannerTest {
                 result = null;
                 globalStateMgr.getFunction((Function) any, (Function.CompareMode) any);
                 returns(f1, f1, f2);
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
@@ -931,15 +996,29 @@ public class LoadPlannerTest {
         fileStatusList.add(new TBrokerFileStatus("path/k2=1/file1", false, 268435456, true));
         fileStatusesList.add(fileStatusList);
 
-        // plan
-        LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
-                timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
-                brokerDesc, fileGroups, fileStatusesList, 1);
-        planner.plan();
+        {
+            // plan
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.plan();
 
-        // check fragment
-        List<PlanFragment> fragments = planner.getFragments();
-        Assert.assertEquals(2, fragments.size());
+            // check fragment
+            List<PlanFragment> fragments = planner.getFragments();
+            Assert.assertEquals(2, fragments.size());
+        }
+        {
+            Config.eliminate_shuffle_load_by_replicated_storage = true;
+            // plan
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.plan();
+
+            // check fragment
+            List<PlanFragment> fragments = planner.getFragments();
+            Assert.assertEquals(1, fragments.size());
+        }
     }
 
     @Test
@@ -966,7 +1045,7 @@ public class LoadPlannerTest {
                 Type.INT, true);
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -1002,12 +1081,16 @@ public class LoadPlannerTest {
                 result = null;
                 globalStateMgr.getFunction((Function) any, (Function.CompareMode) any);
                 returns(f1, f1, f2);
+
+                globalStateMgr.getSqlParser();
+                result = new SqlParser(AstBuilder.getInstance());
             }
         };
 
         // column mappings
         String sql = "LOAD LABEL label0 (DATA INFILE('path/k2=1/file1') INTO TABLE t2 FORMAT AS 'orc' (k1,k33,v) " +
                 "COLUMNS FROM PATH AS (k2) set (k3 = substr(k33,1,5))) WITH BROKER 'broker0'";
+
         LoadStmt loadStmt = (LoadStmt) com.starrocks.sql.parser.SqlParser.parse(sql,
                 ctx.getSessionVariable().getSqlMode()).get(0);
         List<Expr> columnMappingList = Deencapsulation.getField(loadStmt.getDataDescriptions().get(0),
@@ -1033,14 +1116,147 @@ public class LoadPlannerTest {
         fileStatusList.add(new TBrokerFileStatus("path/k2=1/file1", false, 268435456, true));
         fileStatusesList.add(fileStatusList);
 
-        // plan
+        {
+            // plan
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.plan();
+
+            // check fragment
+            List<PlanFragment> fragments = planner.getFragments();
+            Assert.assertEquals(2, fragments.size());
+        }
+        {
+            Config.eliminate_shuffle_load_by_replicated_storage = true;
+            // plan
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.plan();
+
+            // check fragment
+            List<PlanFragment> fragments = planner.getFragments();
+            Assert.assertEquals(1, fragments.size());
+        }
+        {
+            // set partial update mode
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.setPartialUpdateMode(TPartialUpdateMode.COLUMN_UPSERT_MODE);
+            planner.plan();
+        }
+        {
+            // set condition update
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.setMergeConditionStr("v");
+            planner.plan();
+        }
+        {
+            // complete table sink
+            LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                    timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                    brokerDesc, fileGroups, fileStatusesList, 1);
+            planner.setPartialUpdateMode(TPartialUpdateMode.COLUMN_UPSERT_MODE);
+            planner.plan();
+            planner.completeTableSink(100);
+        }
+    }
+
+    @Test
+    public void testLoadLocalFile(@Mocked GlobalStateMgr globalStateMgr, @Mocked SystemInfoService systemInfoService,
+                                  @Injectable Database db, @Injectable OlapTable table) throws StarRocksException {
+        // table schema
+        List<Column> columns = Lists.newArrayList();
+        Column c1 = new Column("c1", Type.BIGINT, true);
+        columns.add(c1);
+        Column c2 = new Column("c2", Type.BIGINT, true);
+        columns.add(c2);
+        List<String> columnNames = Lists.newArrayList("c1", "c2");
+
+        new Expectations() {
+            {
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
+                result = systemInfoService;
+                systemInfoService.getIdToBackend();
+                result = idToBackend;
+                table.getBaseSchema();
+                result = columns;
+                table.getFullSchema();
+                result = columns;
+                table.getPartitions();
+                minTimes = 0;
+                result = Arrays.asList(partition);
+                partition.getId();
+                minTimes = 0;
+                result = 0;
+                table.getColumn("c1");
+                result = columns.get(0);
+                table.getColumn("c2");
+                result = columns.get(1);
+            }
+        };
+
+        // file groups
+        List<BrokerFileGroup> fileGroups = Lists.newArrayList();
+        List<String> files = Lists.newArrayList("file:///file1", "file:///file2");
+        DataDescription desc =
+                new DataDescription("testTable", null, files, columnNames, null, null, null, false, null);
+        BrokerFileGroup brokerFileGroup = new BrokerFileGroup(desc);
+        Deencapsulation.setField(brokerFileGroup, "columnSeparator", "\t");
+        Deencapsulation.setField(brokerFileGroup, "rowDelimiter", "\n");
+        brokerFileGroup.setFilePaths(files);
+        fileGroups.add(brokerFileGroup);
+
+        // file status
+        List<List<TBrokerFileStatus>> fileStatusesList = Lists.newArrayList();
+        List<TBrokerFileStatus> fileStatusList = Lists.newArrayList();
+        fileStatusList.add(new TBrokerFileStatus("file:///file1", false, 268435456, true));
+        fileStatusList.add(new TBrokerFileStatus("file:///file2", false, 268435456, true));
+        fileStatusesList.add(fileStatusList);
+
+        // load_parallel_instance_num: 1
+        Config.load_parallel_instance_num = 1;
+        long startTime = System.currentTimeMillis();
         LoadPlanner planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
                 timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
-                brokerDesc, fileGroups, fileStatusesList, 1);
-        planner.plan();
+                brokerDesc, fileGroups, fileStatusesList, 2);
 
-        // check fragment
-        List<PlanFragment> fragments = planner.getFragments();
-        Assert.assertEquals(2, fragments.size());
+        planner.plan();
+        Assert.assertEquals(1, planner.getScanNodes().size());
+        FileScanNode scanNode = (FileScanNode) planner.getScanNodes().get(0);
+        List<TScanRangeLocations> locationsList = scanNode.getScanRangeLocations(0);
+        Assert.assertEquals(1, planner.getFragments().get(0).getPipelineDop());
+        Assert.assertEquals(1, planner.getFragments().get(0).getParallelExecNum());
+
+        // load_parallel_instance_num: 2
+        Config.load_parallel_instance_num = 2;
+        planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                brokerDesc, fileGroups, fileStatusesList, 2);
+        planner.plan();
+        scanNode = (FileScanNode) planner.getScanNodes().get(0);
+        locationsList = scanNode.getScanRangeLocations(0);
+        Assert.assertEquals(1, planner.getFragments().get(0).getPipelineDop());
+        Assert.assertEquals(1, planner.getFragments().get(0).getParallelExecNum());
+
+        // load_parallel_instance_num: 2, pipeline
+        ctx.getSessionVariable().setEnablePipelineEngine(true);
+        Config.enable_pipeline_load = true;
+        Config.load_parallel_instance_num = 2;
+        planner = new LoadPlanner(jobId, loadId, txnId, db.getId(), table, strictMode,
+                timezone, timeoutS, startTime, partialUpdate, ctx, sessionVariables, loadMemLimit, execMemLimit,
+                brokerDesc, fileGroups, fileStatusesList, 2);
+
+        planner.plan();
+        scanNode = (FileScanNode) planner.getScanNodes().get(0);
+        locationsList = scanNode.getScanRangeLocations(0);
+        Assert.assertEquals(1, planner.getFragments().get(0).getPipelineDop());
+        Assert.assertEquals(1, planner.getFragments().get(0).getParallelExecNum());
+
+        Assert.assertNotNull(planner.getExecPlan());
     }
 }

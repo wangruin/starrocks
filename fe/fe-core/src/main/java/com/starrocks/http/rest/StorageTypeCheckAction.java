@@ -35,17 +35,19 @@
 package com.starrocks.http.rest;
 
 import com.google.common.base.Strings;
+import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.UserIdentity;
@@ -67,28 +69,25 @@ public class StorageTypeCheckAction extends RestBaseAction {
     }
 
     @Override
-    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException {
+    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException, AccessDeniedException {
         UserIdentity currentUser = ConnectContext.get().getCurrentUserIdentity();
-        if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-            checkUserOwnsAdminRole(currentUser);
-        } else {
-            checkGlobalAuth(currentUser, PrivPredicate.ADMIN);
-        }
+        checkUserOwnsAdminRole(currentUser);
 
         String dbName = request.getSingleParameter(DB_KEY);
         if (Strings.isNullOrEmpty(dbName)) {
             throw new DdlException("Parameter db is missing");
         }
 
-        Database db = globalStateMgr.getDb(dbName);
+        Database db = globalStateMgr.getLocalMetastore().getDb(dbName);
         if (db == null) {
             throw new DdlException("Database " + dbName + " does not exist");
         }
 
         JSONObject root = new JSONObject();
-        db.readLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(db.getId(), LockType.READ);
         try {
-            List<Table> tbls = db.getTables();
+            List<Table> tbls = GlobalStateMgr.getCurrentState().getLocalMetastore().getTables(db.getId());
             for (Table tbl : tbls) {
                 if (tbl.getType() != TableType.OLAP) {
                     continue;
@@ -105,7 +104,7 @@ public class StorageTypeCheckAction extends RestBaseAction {
                 root.put(tbl.getName(), indexObj);
             }
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db.getId(), LockType.READ);
         }
 
         // to json response

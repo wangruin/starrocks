@@ -14,26 +14,26 @@
 
 package com.starrocks.sql.optimizer.operator.logical;
 
-import com.google.common.collect.Maps;
+import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.RowOutputInfo;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.operator.ColumnOutputInfo;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
-import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 
 public class LogicalRepeatOperator extends LogicalOperator {
-    private final List<ColumnRefOperator> outputGrouping;
-    private final List<List<ColumnRefOperator>> repeatColumnRefList;
-    private final List<List<Long>> groupingIds;
+    private List<ColumnRefOperator> outputGrouping;
+    private List<List<ColumnRefOperator>> repeatColumnRefList;
+    private List<List<Long>> groupingIds;
+    private boolean hasPushDown;
 
     public LogicalRepeatOperator(List<ColumnRefOperator> outputGrouping,
                                  List<List<ColumnRefOperator>> repeatColumnRefList,
@@ -42,13 +42,11 @@ public class LogicalRepeatOperator extends LogicalOperator {
         this.outputGrouping = outputGrouping;
         this.repeatColumnRefList = repeatColumnRefList;
         this.groupingIds = groupingIds;
+        this.hasPushDown = false;
     }
 
-    private LogicalRepeatOperator(LogicalRepeatOperator.Builder builder) {
-        super(OperatorType.LOGICAL_REPEAT, builder.getLimit(), builder.getPredicate(), builder.getProjection());
-        this.outputGrouping = builder.outputGrouping;
-        this.repeatColumnRefList = builder.repeatColumnRefList;
-        this.groupingIds = builder.groupingIds;
+    private LogicalRepeatOperator() {
+        super(OperatorType.LOGICAL_REPEAT);
     }
 
     public List<ColumnRefOperator> getOutputGrouping() {
@@ -63,6 +61,10 @@ public class LogicalRepeatOperator extends LogicalOperator {
         return groupingIds;
     }
 
+    public boolean hasPushDown() {
+        return hasPushDown;
+    }
+
     @Override
     public ColumnRefSet getOutputColumns(ExpressionContext expressionContext) {
         ColumnRefSet outputColumns = new ColumnRefSet(outputGrouping);
@@ -75,12 +77,12 @@ public class LogicalRepeatOperator extends LogicalOperator {
 
     @Override
     public RowOutputInfo deriveRowOutputInfo(List<OptExpression> inputs) {
-        Map<ColumnRefOperator, ScalarOperator> map = Maps.newHashMap();
-        outputGrouping.stream().forEach(e -> map.put(e, e));
-        for (List<ColumnRefOperator> refSets : repeatColumnRefList) {
-            refSets.stream().forEach(e -> map.put(e, e));
+        List<ColumnOutputInfo> columnOutputInfoList = Lists.newArrayList();
+        outputGrouping.forEach(e -> columnOutputInfoList.add(new ColumnOutputInfo(e, e)));
+        for (ColumnOutputInfo columnOutputInfo : inputs.get(0).getRowOutputInfo().getColumnOutputInfo()) {
+            columnOutputInfoList.add(new ColumnOutputInfo(columnOutputInfo.getColumnRef(), columnOutputInfo.getColumnRef()));
         }
-        return new RowOutputInfo(map);
+        return new RowOutputInfo(columnOutputInfoList, outputGrouping);
     }
 
     @Override
@@ -106,31 +108,52 @@ public class LogicalRepeatOperator extends LogicalOperator {
         LogicalRepeatOperator that = (LogicalRepeatOperator) o;
         return Objects.equals(outputGrouping, that.outputGrouping) &&
                 Objects.equals(repeatColumnRefList, that.repeatColumnRefList) &&
-                Objects.equals(groupingIds, that.groupingIds);
+                Objects.equals(groupingIds, that.groupingIds) &&
+                Objects.equals(hasPushDown, that.hasPushDown);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), outputGrouping, repeatColumnRefList);
+        return Objects.hash(super.hashCode(), outputGrouping, repeatColumnRefList, hasPushDown);
     }
 
+    public static Builder builder() {
+        return new Builder();
+    }
     public static class Builder
             extends LogicalOperator.Builder<LogicalRepeatOperator, LogicalRepeatOperator.Builder> {
-        private List<ColumnRefOperator> outputGrouping;
-        private List<List<ColumnRefOperator>> repeatColumnRefList;
-        private List<List<Long>> groupingIds;
 
         @Override
-        public LogicalRepeatOperator build() {
-            return new LogicalRepeatOperator(this);
+        protected LogicalRepeatOperator newInstance() {
+            return new LogicalRepeatOperator();
+        }
+
+        public LogicalRepeatOperator.Builder setHasPushDown(boolean hasPushDown) {
+            builder.hasPushDown = hasPushDown;
+            return this;
+        }
+
+        public LogicalRepeatOperator.Builder setOutputGrouping(List<ColumnRefOperator> outputGrouping) {
+            builder.outputGrouping = outputGrouping;
+            return this;
+        }
+
+        public LogicalRepeatOperator.Builder setGroupingIds(List<List<Long>> groupingIds) {
+            builder.groupingIds = groupingIds;
+            return this;
+        }
+
+        public LogicalRepeatOperator.Builder setRepeatColumnRefList(List<List<ColumnRefOperator>> repeatColumnRefList) {
+            builder.repeatColumnRefList = repeatColumnRefList;
+            return this;
         }
 
         @Override
         public LogicalRepeatOperator.Builder withOperator(LogicalRepeatOperator operator) {
             super.withOperator(operator);
-            this.outputGrouping = operator.outputGrouping;
-            this.repeatColumnRefList = operator.repeatColumnRefList;
-            this.groupingIds = operator.groupingIds;
+            builder.outputGrouping = operator.outputGrouping;
+            builder.repeatColumnRefList = operator.repeatColumnRefList;
+            builder.groupingIds = operator.groupingIds;
             return this;
         }
     }

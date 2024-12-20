@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rule.tree;
 
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
@@ -35,7 +35,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorVisitor;
 
 import java.util.List;
 
-import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator.BinaryType.EQ_FOR_NULL;
+import static com.starrocks.analysis.BinaryType.EQ_FOR_NULL;
 
 // Rewrite ScalarOperator as DictMappingOperator
 // if a ScalarOperator support dictionary optimization, we will rewrite it to DictMappingOperator
@@ -77,7 +77,11 @@ public class DictMappingRewriter {
     // rewrite scalar operator as dict mapping operator
     ScalarOperator rewriteAsDictMapping(ScalarOperator scalarOperator, Type type) {
         final ColumnRefSet usedColumns = scalarOperator.getUsedColumns();
-        Preconditions.checkState(usedColumns.cardinality() == 1);
+        ColumnRefSet usedCols = scalarOperator.getUsedColumns();
+        if (usedCols.cardinality() != 1) {
+            throw new StarRocksPlannerException(ErrorType.INTERNAL_ERROR,
+                    "%s used more than one column when DictExpr rewriting", scalarOperator);
+        }
         final Integer dictColumnId = decodeContext.stringColumnIdToDictColumnIds.get(usedColumns.getFirstId());
         ColumnRefOperator dictColumn = decodeContext.columnRefFactory.getColumnRef(dictColumnId);
         scalarOperator = new DictMappingOperator(dictColumn, scalarOperator.clone(), type);
@@ -106,9 +110,9 @@ public class DictMappingRewriter {
                     hasApplied = hasApplied || context.hasAppliedOperator;
                     disableApplied = disableApplied || context.hasUnsupportedOperator;
                 }
-                Preconditions.checkState(hasApplied);
-                if (!disableApplied) {
-                    context.hasAppliedOperator = true;
+                if (!disableApplied || !hasApplied) {
+                    context.hasAppliedOperator = hasApplied;
+                    context.hasUnsupportedOperator = disableApplied;
                     return operator;
                 } else {
                     context.hasAppliedOperator = false;
@@ -154,7 +158,7 @@ public class DictMappingRewriter {
 
         @Override
         public ScalarOperator visitCall(CallOperator call, RewriterContext context) {
-            if (!call.getFunction().isCouldApplyDictOptimize()) {
+            if (call.getFunction() == null || !call.getFunction().isCouldApplyDictOptimize()) {
                 context.hasAppliedOperator = false;
                 context.hasUnsupportedOperator = true;
                 return visit(call, context);
@@ -221,8 +225,7 @@ public class DictMappingRewriter {
 
         @Override
         public ScalarOperator visitLikePredicateOperator(LikePredicateOperator operator, RewriterContext context) {
-            operator.setChild(0, operator.getChild(0).accept(this, context));
-            return operator;
+            return rewriteForScalarOperator(operator, context);
         }
 
         @Override

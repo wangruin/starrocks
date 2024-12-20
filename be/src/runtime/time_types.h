@@ -18,6 +18,8 @@
 #include <string>
 
 #include "common/compiler_util.h"
+#include "util/raw_container.h"
+
 namespace starrocks {
 
 // Date: Julian Date -2000-01-01 ~ 9999-01-01
@@ -35,6 +37,7 @@ static const Timestamp TIMESTAMP_BITS_TIME{UINT64_MAX >> 24};
 // TimeUnit
 enum TimeUnit {
     MICROSECOND,
+    MILLISECOND,
     SECOND,
     MINUTE,
     HOUR,
@@ -64,11 +67,15 @@ static const int32_t SECS_PER_MINUTE = 60;
 static const int32_t MINS_PER_HOUR = 60;
 static const int32_t HOURS_PER_DAY = 24;
 
+static const int64_t USECS_PER_YEAR = 31536000000000;
+static const int64_t USECS_PER_QUARTER = 788400000000;
+static const int64_t USECS_PER_MONTH = 2592000000000;
 static const int64_t USECS_PER_WEEK = 604800000000;
 static const int64_t USECS_PER_DAY = 86400000000;
 static const int64_t USECS_PER_HOUR = 3600000000;
 static const int64_t USECS_PER_MINUTE = 60000000;
 static const int64_t USECS_PER_SEC = 1000000;
+static const int64_t USECS_PER_MILLIS = 1000;
 
 static const int64_t NANOSECS_PER_USEC = 1000;
 static const int64_t NANOSECS_PER_SEC = 1000000000;
@@ -76,6 +83,7 @@ static const int64_t NANOSECS_PER_SEC = 1000000000;
 // Corresponding to TimeUnit
 static constexpr int64_t USECS_PER_UNIT[] = {
         1,                // Microsecond
+        USECS_PER_MILLIS, // Millisecond
         USECS_PER_SEC,    // Second
         USECS_PER_MINUTE, // Minute
         USECS_PER_HOUR,   // Hour
@@ -109,7 +117,7 @@ public:
 
     inline static void to_date_with_cache(JulianDate julian, int* year, int* month, int* day);
 
-    static bool check(int year, int month, int day);
+    inline static bool check(int year, int month, int day);
 
     static JulianDate from_date(int year, int month, int day);
 
@@ -136,7 +144,7 @@ public:
 
     // Get date base on format "%Y-%m-%d", '-' means any char.
     // compare every char.
-    static bool from_string_to_date_internal(const char* ptr, int* year, int* month, int* day);
+    static bool from_string_to_date_internal(const char* ptr, int* pyear, int* pmonth, int* pday);
 
     // process string based on format like "%Y-%m-%d %H:%i:%s",
     // if successful return true;
@@ -149,8 +157,17 @@ public:
                             int* second, int* microsecond);
     static bool from_string_to_date(const char* date_str, size_t len, int* year, int* month, int* day);
     static bool is_standard_datetime_format(const char* ptr, int length, const char** ptr_time);
-    static bool from_string_to_datetime(const char* date_str, size_t len, int* year, int* month, int* day, int* hour,
-                                        int* minute, int* second, int* microsecond);
+    struct ToDatetimeResult {
+        int year;
+        int month;
+        int day;
+        int hour;
+        int minute;
+        int second;
+        int microsecond;
+    };
+
+    static std::pair<bool, bool> from_string_to_datetime(const char* date_str, size_t len, ToDatetimeResult* res);
 
 public:
     // from_date(1970, 1, 1)
@@ -193,17 +210,22 @@ public:
 
     inline static Timestamp from_julian_and_time(JulianDate julian, Timestamp microsecond);
 
-    static bool check_time(int hour, int minute, int second, int microsecond);
+    inline static bool check_time(int hour, int minute, int second, int microsecond);
 
     inline static bool check(int year, int month, int day, int hour, int minute, int second, int microsecond);
 
     template <TimeUnit UNIT>
     static Timestamp add(Timestamp timestamp, int count);
 
+    template <TimeUnit UNIT>
+    static Timestamp sub(Timestamp timestamp, int count);
+
+    template <bool use_iso8601_format = false>
     static std::string to_string(Timestamp timestamp);
 
     // Returns the length of formatted string or -1 if the size of buffer too
     // small to fill the formatted string.
+    template <bool use_iso8601_format = false>
     static int to_string(Timestamp timestamp, char* s, size_t n);
 
     inline static double time_to_literal(double time);
@@ -217,7 +239,7 @@ public:
     // MIN_DATE | 0
     static const Timestamp MIN_TIMESTAMP = (1892325482100162560LL);
 
-    // seconds from 1970.01.01
+    // seconds since julian date epoch to 1970.01.01
     static const Timestamp UNIX_EPOCH_SECONDS = (210866803200LL);
 };
 
@@ -229,10 +251,13 @@ JulianDate date::add(JulianDate date, int count) {
         return date + count;
     } else if constexpr (UNIT == TimeUnit::WEEK) {
         return date + 7 * count;
-    } else if constexpr (UNIT == TimeUnit::MONTH) {
+    } else if constexpr (UNIT == TimeUnit::MONTH || UNIT == TimeUnit::QUARTER) {
         int year, month, day;
         to_date_with_cache(date, &year, &month, &day);
 
+        if (UNIT == TimeUnit::QUARTER) {
+            count = 3 * count;
+        }
         int months = year * 12 + month - 1 + count;
         if (months < 0) {
             // @INFO: NOT SUPPORT BCE
@@ -292,6 +317,14 @@ bool date::char_to_digit(const char* value, int i, uint8_t* v) {
     } else {
         return false;
     }
+}
+
+bool date::check(int year, int month, int day) {
+    if (year > 9999 || month > 12 || month < 1 || day > 31 || day < 1) {
+        return false;
+    }
+
+    return day <= DAYS_IN_MONTH[is_leap(year)][month];
 }
 
 // ============================== Timestamp inline function ==================================
@@ -368,6 +401,11 @@ Timestamp timestamp::add(Timestamp timestamp, int count) {
     }
 }
 
+template <TimeUnit UNIT>
+Timestamp timestamp::sub(Timestamp timestamp, int count) {
+    return timestamp::add<UNIT>(timestamp, -count);
+}
+
 double timestamp::time_to_literal(double time) {
     uint64_t t = time;
     uint64_t hour = t / 3600;
@@ -380,6 +418,10 @@ Timestamp timestamp::of_epoch_second(int64_t seconds, int64_t nanoseconds) {
     int64_t second = seconds + timestamp::UNIX_EPOCH_SECONDS;
     JulianDate day = second / SECS_PER_DAY;
     return timestamp::from_julian_and_time(day, second * USECS_PER_SEC + nanoseconds / NANOSECS_PER_USEC);
+}
+
+bool timestamp::check_time(int hour, int minute, int second, int microsecond) {
+    return hour < HOURS_PER_DAY && minute < MINS_PER_HOUR && second < SECS_PER_MINUTE && microsecond < USECS_PER_SEC;
 }
 
 struct JulianToDateEntry {
@@ -439,4 +481,61 @@ inline void date::to_date_with_cache(JulianDate julian, int* year, int* month, i
 
     return to_date(julian, year, month, day);
 }
+
+template <bool use_iso8601_format>
+std::string timestamp::to_string(Timestamp timestamp) {
+    std::string s;
+    raw::make_room(&s, 26);
+    int len = to_string<use_iso8601_format>(timestamp, s.data(), s.size());
+    s.resize(len);
+    return s;
+}
+
+template <bool use_iso8601_format>
+int timestamp::to_string(Timestamp timestamp, char* to, size_t n) {
+    int year, month, day;
+    int hour, minute, second, microsecond;
+    date::to_date_with_cache(timestamp::to_julian(timestamp), &year, &month, &day);
+    to_time(timestamp, &hour, &minute, &second, &microsecond);
+
+    if (n < 19) {
+        return -1;
+    }
+
+    date::to_string(year, month, day, to);
+
+    if constexpr (use_iso8601_format) {
+        to[10] = (char)('T');
+    } else {
+        to[10] = (char)(' ');
+    }
+    to[11] = (char)('0' + (hour / 10));
+    to[12] = (char)('0' + (hour % 10));
+    to[13] = ':';
+    // Minute
+    to[14] = (char)('0' + (minute / 10));
+    to[15] = (char)('0' + (minute % 10));
+    to[16] = ':';
+    /* Second */
+    to[17] = (char)('0' + (second / 10));
+    to[18] = (char)('0' + (second % 10));
+    if (use_iso8601_format || microsecond > 0) {
+        if (n < 26) {
+            return -1;
+        }
+        to[19] = '.';
+        uint32_t first = microsecond / 10000;
+        uint32_t second = (microsecond % 10000) / 100;
+        uint32_t third = microsecond % 100;
+        to[20] = (char)('0' + first / 10);
+        to[21] = (char)('0' + first % 10);
+        to[22] = (char)('0' + second / 10);
+        to[23] = (char)('0' + second % 10);
+        to[24] = (char)('0' + third / 10);
+        to[25] = (char)('0' + third % 10);
+        return 26;
+    }
+    return 19;
+}
+
 } // namespace starrocks

@@ -31,6 +31,7 @@
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
 #include "testutil/assert.h"
+#include "util/failpoint/fail_point.h"
 
 using namespace std;
 
@@ -39,7 +40,7 @@ namespace starrocks {
 class UpdateManagerTest : public testing::Test {
 public:
     void SetUp() override {
-        _root_path = "./ut_dir/olap_update_manager_test";
+        _root_path = "./olap_update_manager_test";
         fs::remove_all(_root_path);
         fs::create_directories(_root_path);
         _meta = std::make_unique<KVStore>(_root_path);
@@ -58,7 +59,7 @@ public:
         writer_context.partition_id = 0;
         writer_context.rowset_path_prefix = _tablet->schema_hash_path();
         writer_context.rowset_state = COMMITTED;
-        writer_context.tablet_schema = &_tablet->tablet_schema();
+        writer_context.tablet_schema = _tablet->tablet_schema();
         writer_context.version.first = 0;
         writer_context.version.second = 0;
         writer_context.segments_overlap = NONOVERLAPPING;
@@ -86,7 +87,7 @@ public:
         request.__set_version(1);
         request.__set_version_hash(0);
         request.tablet_schema.schema_hash = schema_hash;
-        request.tablet_schema.short_key_column_count = 6;
+        request.tablet_schema.short_key_column_count = 1;
         request.tablet_schema.keys_type = TKeysType::PRIMARY_KEYS;
         request.tablet_schema.storage_type = TStorageType::COLUMN;
 
@@ -194,6 +195,42 @@ TEST_F(UpdateManagerTest, testExpireEntry) {
     ASSERT_GT(_update_manager->update_state_cache().size(), 0);
     const auto remaining_size = _update_manager->update_state_cache().size();
     ASSERT_EQ(peak_size - expiring_size, remaining_size);
+}
+
+TEST_F(UpdateManagerTest, testSetEmptyCachedDeltaColumnGroup) {
+    srand(time(nullptr));
+    create_tablet(rand(), rand());
+    TabletSegmentId tsid;
+    tsid.tablet_id = _tablet->tablet_id();
+    tsid.segment_id = 1;
+    _update_manager->set_cached_empty_delta_column_group(_tablet->data_dir()->get_meta(), tsid);
+    // search this empty dcg
+    DeltaColumnGroupList dcgs;
+    // search in cache
+    ASSERT_TRUE(_update_manager->get_cached_delta_column_group(tsid, 1, &dcgs));
+    ASSERT_TRUE(dcgs.empty());
+    _update_manager->get_delta_column_group(_tablet->data_dir()->get_meta(), tsid, 1, &dcgs);
+    ASSERT_TRUE(dcgs.empty());
+}
+
+TEST_F(UpdateManagerTest, test_on_rowset_finished) {
+    srand(time(nullptr));
+    create_tablet(rand(), rand());
+    const int N = 10;
+    std::vector<int64_t> keys;
+    for (int i = 0; i < N; i++) {
+        keys.push_back(i);
+    }
+    auto rs0 = create_rowset(keys);
+    ASSERT_TRUE(_update_manager->on_rowset_finished(_tablet.get(), rs0.get()).ok());
+    PFailPointTriggerMode trigger_mode;
+    trigger_mode.set_mode(FailPointTriggerModeType::ENABLE);
+    auto fp = starrocks::failpoint::FailPointRegistry::GetInstance()->get("on_rowset_finished_failed_due_to_mem");
+    fp->setMode(trigger_mode);
+    auto rs1 = create_rowset(keys);
+    ASSERT_TRUE(_update_manager->on_rowset_finished(_tablet.get(), rs1.get()).ok());
+    trigger_mode.set_mode(FailPointTriggerModeType::DISABLE);
+    fp->setMode(trigger_mode);
 }
 
 } // namespace starrocks

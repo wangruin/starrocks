@@ -14,19 +14,38 @@
 
 package com.starrocks.sql.analyzer;
 
-import com.starrocks.common.AnalysisException;
+import com.google.common.base.Strings;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.RunMode;
+import com.starrocks.server.StorageVolumeMgr;
 import com.starrocks.sql.ast.CreateDbStmt;
+import com.starrocks.sql.common.MetaUtils;
+
+import java.util.Map;
 
 public class CreateDbAnalyzer {
     public static void analyze(CreateDbStmt statement, ConnectContext context) {
         String dbName = statement.getFullDbName();
-        try {
-            FeNameFormat.checkDbName(dbName);
-        } catch (AnalysisException e) {
-            ErrorReport.reportSemanticException(ErrorCode.ERR_WRONG_DB_NAME, dbName);
+        FeNameFormat.checkDbName(dbName);
+
+        String catalogName = statement.getCatalogName();
+        if (Strings.isNullOrEmpty(catalogName)) {
+            catalogName = context.getCurrentCatalog();
+            statement.setCatalogName(catalogName);
+        }
+
+        MetaUtils.checkCatalogExistAndReport(catalogName);
+
+        Map<String, String> properties = statement.getProperties();
+        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_VOLUME)) {
+            String volume = properties.get(PropertyAnalyzer.PROPERTIES_STORAGE_VOLUME);
+            if (RunMode.isSharedNothingMode() && !StorageVolumeMgr.LOCAL.equalsIgnoreCase(volume)) {
+                ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
+                        "Storage volume can only be 'local' in shared nothing mode");
+            }
         }
     }
 }

@@ -23,8 +23,11 @@ import com.starrocks.analysis.LabelName;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReport;
 import com.starrocks.common.Pair;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.Util;
 import com.starrocks.load.RoutineLoadDesc;
@@ -93,10 +96,17 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     public static final String DESIRED_CONCURRENT_NUMBER_PROPERTY = "desired_concurrent_number";
     // max error number in ten thousand records
     public static final String MAX_ERROR_NUMBER_PROPERTY = "max_error_number";
+    // The maximum error rate that can be tolerated in a batch of data. 
+    // If the error rate exceeds this, the job will be paused.
+    public static final String MAX_FILTER_RATIO_PROPERTY = "max_filter_ratio";
 
     public static final String MAX_BATCH_INTERVAL_SEC_PROPERTY = "max_batch_interval";
     public static final String MAX_BATCH_ROWS_PROPERTY = "max_batch_rows";
     public static final String MAX_BATCH_SIZE_PROPERTY = "max_batch_size";  // deprecated
+    public static final String TASK_CONSUME_SECOND = "task_consume_second";
+    public static final String TASK_TIMEOUT_SECOND = "task_timeout_second";
+    public static final int TASK_TIMEOUT_SECOND_TASK_CONSUME_SECOND_RATIO = 4;
+    public static final String LOG_REJECTED_RECORD_NUM_PROPERTY = "log_rejected_record_num";
 
     // the value is csv or json, default is csv
     public static final String FORMAT = "format";
@@ -129,11 +139,13 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     public static final String PULSAR_DEFAULT_INITIAL_POSITION = "pulsar_default_initial_position";
 
     private static final String NAME_TYPE = "ROUTINE LOAD NAME";
-    private static final String ENDPOINT_REGEX = "[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]";
+    // from: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/common/utils/Utils.java#L97
+    private static final String ENDPOINT_REGEX = ".*?\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(\\d+)";
 
     private static final ImmutableSet<String> PROPERTIES_SET = new ImmutableSet.Builder<String>()
             .add(DESIRED_CONCURRENT_NUMBER_PROPERTY)
             .add(MAX_ERROR_NUMBER_PROPERTY)
+            .add(MAX_FILTER_RATIO_PROPERTY)
             .add(MAX_BATCH_INTERVAL_SEC_PROPERTY)
             .add(MAX_BATCH_ROWS_PROPERTY)
             .add(MAX_BATCH_SIZE_PROPERTY)
@@ -148,6 +160,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             .add(TRIMSPACE)
             .add(ENCLOSE)
             .add(ESCAPE)
+            .add(LOG_REJECTED_RECORD_NUM_PROPERTY)
+            .add(TASK_CONSUME_SECOND)
+            .add(TASK_TIMEOUT_SECOND)
+            .add(PropertyAnalyzer.PROPERTIES_WAREHOUSE)
             .build();
 
     private static final ImmutableSet<String> KAFKA_PROPERTIES_SET = new ImmutableSet.Builder<String>()
@@ -165,7 +181,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             .add(PULSAR_PARTITIONS_PROPERTY)
             .add(PULSAR_INITIAL_POSITIONS_PROPERTY)
             .build();
-        
+
     private String confluentSchemaRegistryUrl;
     private LabelName labelName;
     private final String tableName;
@@ -181,12 +197,17 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private RoutineLoadDesc routineLoadDesc;
     private int desiredConcurrentNum = 1;
     private long maxErrorNum = -1;
+    private double maxFilterRatio = 1;
     private long maxBatchIntervalS = -1;
     private long maxBatchRows = -1;
+    private long taskConsumeSecond;
+    private long taskTimeoutSecond;
+    private long logRejectedRecordNum = 0;
     private boolean strictMode = true;
     private String timezone = TimeUtils.DEFAULT_TIME_ZONE;
     private boolean partialUpdate = false;
     private String mergeConditionStr;
+    private String partialUpdateMode = "row";
     /**
      * RoutineLoad support json data.
      * Require Params:
@@ -227,6 +248,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     public static final Predicate<Long> MAX_ERROR_NUMBER_PRED = (v) -> v >= 0L;
     public static final Predicate<Long> MAX_BATCH_INTERVAL_PRED = (v) -> v >= 5;
     public static final Predicate<Long> MAX_BATCH_ROWS_PRED = (v) -> v >= 200000;
+    public static final Predicate<Long> LOG_REJECTED_RECORD_NUM_PRED = (v) -> v >= -1L;
 
     public CreateRoutineLoadStmt(LabelName labelName, String tableName, List<ParseNode> loadPropertyList,
                                  Map<String, String> jobProperties,
@@ -254,6 +276,14 @@ public class CreateRoutineLoadStmt extends DdlStmt {
 
     public void setConfluentSchemaRegistryUrl(String confluentSchemaRegistryUrl) {
         this.confluentSchemaRegistryUrl = confluentSchemaRegistryUrl;
+    }
+
+    public long getTaskConsumeSecond() {
+        return taskConsumeSecond;
+    }
+
+    public long getTaskTimeoutSecond() {
+        return taskTimeoutSecond;
     }
 
     public boolean isTrimspace() {
@@ -316,12 +346,20 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         return maxErrorNum;
     }
 
+    public double getMaxFilterRatio() {
+        return maxFilterRatio;
+    }
+
     public long getMaxBatchIntervalS() {
         return maxBatchIntervalS;
     }
 
     public long getMaxBatchRows() {
         return maxBatchRows;
+    }
+
+    public long getLogRejectedRecordNum() {
+        return logRejectedRecordNum;
     }
 
     public boolean isStrictMode() {
@@ -334,6 +372,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
 
     public boolean isPartialUpdate() {
         return partialUpdate;
+    }
+
+    public String getPartialUpdateMode() {
+        return partialUpdateMode;
     }
 
     public String getMergeConditionStr() {
@@ -430,7 +472,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         }
     }
 
-    public static RoutineLoadDesc buildLoadDesc(List<ParseNode> loadPropertyList) throws UserException {
+    public static RoutineLoadDesc buildLoadDesc(List<ParseNode> loadPropertyList) throws StarRocksException {
         if (loadPropertyList == null) {
             return null;
         }
@@ -464,6 +506,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                     throw new AnalysisException("repeat setting of where predicate");
                 }
                 importWhereStmt = (ImportWhereStmt) parseNode;
+                if (importWhereStmt.isContainSubquery()) {
+                    throw new AnalysisException("the predicate cannot contain subqueries");
+                }
             } else if (parseNode instanceof PartitionNames) {
                 // check partition names
                 if (partitionNames != null) {
@@ -477,7 +522,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 partitionNames);
     }
 
-    public void checkJobProperties() throws UserException {
+    public void checkJobProperties() throws StarRocksException {
         Optional<String> optional = jobProperties.keySet().stream().filter(
                 entity -> !PROPERTIES_SET.contains(entity)).findFirst();
         if (optional.isPresent()) {
@@ -494,6 +539,18 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 RoutineLoadJob.DEFAULT_MAX_ERROR_NUM, MAX_ERROR_NUMBER_PRED,
                 MAX_ERROR_NUMBER_PROPERTY + " should >= 0");
 
+        if (jobProperties.containsKey(MAX_FILTER_RATIO_PROPERTY)) {
+            String maxFilterRatioStr = jobProperties.get(MAX_FILTER_RATIO_PROPERTY);
+            try {
+                maxFilterRatio = Double.valueOf(maxFilterRatioStr);
+            } catch (NumberFormatException exception) {
+                throw new StarRocksException("Incorrect format of max_filter_ratio", exception);
+            }
+            if (maxFilterRatio < 0.0 || maxFilterRatio > 1.0) {
+                throw new StarRocksException(MAX_FILTER_RATIO_PROPERTY + " must between 0.0 and 1.0.");
+            }
+        }
+
         maxBatchIntervalS = Util.getLongPropertyOrDefault(jobProperties.get(MAX_BATCH_INTERVAL_SEC_PROPERTY),
                 RoutineLoadJob.DEFAULT_TASK_SCHED_INTERVAL_SECOND, MAX_BATCH_INTERVAL_PRED,
                 MAX_BATCH_INTERVAL_SEC_PROPERTY + " should >= 5");
@@ -501,6 +558,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         maxBatchRows = Util.getLongPropertyOrDefault(jobProperties.get(MAX_BATCH_ROWS_PROPERTY),
                 RoutineLoadJob.DEFAULT_MAX_BATCH_ROWS, MAX_BATCH_ROWS_PRED,
                 MAX_BATCH_ROWS_PROPERTY + " should >= 200000");
+
+        logRejectedRecordNum = Util.getLongPropertyOrDefault(jobProperties.get(LOG_REJECTED_RECORD_NUM_PROPERTY),
+                0, LOG_REJECTED_RECORD_NUM_PRED,
+                LOG_REJECTED_RECORD_NUM_PROPERTY + " should >= -1");
 
         strictMode = Util.getBooleanPropertyOrDefault(jobProperties.get(LoadStmt.STRICT_MODE),
                 RoutineLoadJob.DEFAULT_STRICT_MODE,
@@ -511,6 +572,8 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 LoadStmt.PARTIAL_UPDATE + " should be a boolean");
 
         mergeConditionStr = jobProperties.get(LoadStmt.MERGE_CONDITION);
+
+        partialUpdateMode = jobProperties.get(LoadStmt.PARTIAL_UPDATE_MODE);
 
         if (ConnectContext.get() != null) {
             timezone = ConnectContext.get().getSessionVariable().getTimeZone();
@@ -528,8 +591,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 stripOuterArray = Boolean.valueOf(jobProperties.getOrDefault(STRIP_OUTER_ARRAY, "false"));
             } else if (format.equalsIgnoreCase("avro")) {
                 format = "avro";
+                jsonPaths = jobProperties.get(JSONPATHS);
             } else {
-                throw new UserException("Format type is invalid. format=`" + format + "`");
+                throw new StarRocksException("Format type is invalid. format=`" + format + "`");
             }
         } else {
             format = "csv"; // default csv
@@ -542,10 +606,50 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 enclose = 0;
             }
             if (jobProperties.containsKey(ESCAPE)) {
-                escape = (byte) jobProperties.get(ESCAPE).charAt(0);            
+                escape = (byte) jobProperties.get(ESCAPE).charAt(0);
             } else {
                 escape = 0;
             }
+        }
+
+        if (jobProperties.containsKey(TASK_CONSUME_SECOND) && jobProperties.containsKey(TASK_TIMEOUT_SECOND)) {
+            String taskConsumeSecondStr = jobProperties.get(TASK_CONSUME_SECOND);
+            try {
+                taskConsumeSecond = Long.parseLong(taskConsumeSecondStr);
+            } catch (NumberFormatException e) {
+                throw new StarRocksException(e.getMessage());
+            }
+            String taskTimeoutSecondStr = jobProperties.get(TASK_TIMEOUT_SECOND);
+            try {
+                taskTimeoutSecond = Long.parseLong(taskTimeoutSecondStr);
+            } catch (NumberFormatException e) {
+                throw new StarRocksException(e.getMessage());
+            }
+            if (taskConsumeSecond >= taskTimeoutSecond) {
+                throw new StarRocksException("task_timeout_second must be larger than task_consume_second");
+            }
+        } else if (jobProperties.containsKey(TASK_CONSUME_SECOND) || jobProperties.containsKey(TASK_TIMEOUT_SECOND)) {
+            if (jobProperties.containsKey(TASK_CONSUME_SECOND)) {
+                String taskConsumeSecondStr = jobProperties.get(TASK_CONSUME_SECOND);
+                try {
+                    taskConsumeSecond = Long.parseLong(taskConsumeSecondStr);
+                } catch (NumberFormatException e) {
+                    throw new StarRocksException(e.getMessage());
+                }
+                taskTimeoutSecond = taskConsumeSecond * TASK_TIMEOUT_SECOND_TASK_CONSUME_SECOND_RATIO;
+            }
+            if (jobProperties.containsKey(TASK_TIMEOUT_SECOND)) {
+                String taskTimeoutSecondStr = jobProperties.get(TASK_TIMEOUT_SECOND);
+                try {
+                    taskTimeoutSecond = Long.parseLong(taskTimeoutSecondStr);
+                } catch (NumberFormatException e) {
+                    throw new StarRocksException(e.getMessage());
+                }
+                taskConsumeSecond = taskTimeoutSecond / TASK_TIMEOUT_SECOND_TASK_CONSUME_SECOND_RATIO;
+            }
+        } else {
+            taskConsumeSecond = Config.routine_load_task_consume_second;
+            taskTimeoutSecond = Config.routine_load_task_timeout_second;
         }
     }
 
@@ -632,8 +736,8 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                                                      Map<String, String> customKafkaProperties,
                                                      List<Pair<Integer, Long>> kafkaPartitionOffsets)
             throws AnalysisException {
-        kafkaPartitionsString = kafkaPartitionsString.replaceAll(" ", "");
-        if (kafkaPartitionsString.isEmpty()) {
+        String trimedKafkaPartitionsStr = kafkaPartitionsString.trim();
+        if (trimedKafkaPartitionsStr.isEmpty()) {
             throw new AnalysisException(KAFKA_PARTITIONS_PROPERTY + " could not be a empty string");
         }
 
@@ -643,23 +747,18 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             kafkaDefaultOffset = getKafkaOffset(customKafkaProperties.get(KAFKA_DEFAULT_OFFSETS));
         }
 
-        String[] kafkaPartitionsStringList = kafkaPartitionsString.split(",");
+        String[] kafkaPartitionsStringList = trimedKafkaPartitionsStr.split(",");
         for (String s : kafkaPartitionsStringList) {
-            try {
-                kafkaPartitionOffsets.add(
-                        Pair.create(getIntegerValueFromString(s, KAFKA_PARTITIONS_PROPERTY),
-                                kafkaDefaultOffset == null ? KafkaProgress.OFFSET_END_VAL : kafkaDefaultOffset));
-            } catch (AnalysisException e) {
-                throw new AnalysisException(KAFKA_PARTITIONS_PROPERTY
-                        + " must be a number string with comma-separated");
-            }
+            kafkaPartitionOffsets.add(
+                    Pair.create(getIntegerValueFromString(s.trim(), "kafka partition"),
+                            kafkaDefaultOffset == null ? KafkaProgress.OFFSET_END_VAL : kafkaDefaultOffset));
         }
     }
 
     public static void analyzeKafkaOffsetProperty(String kafkaOffsetsString,
                                                   List<Pair<Integer, Long>> kafkaPartitionOffsets)
             throws AnalysisException {
-        kafkaOffsetsString = kafkaOffsetsString.replaceAll(" ", "");
+        kafkaOffsetsString = kafkaOffsetsString.trim();
         if (kafkaOffsetsString.isEmpty()) {
             throw new AnalysisException(KAFKA_OFFSETS_PROPERTY + " could not be a empty string");
         }
@@ -678,6 +777,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     // OFFSET_BEGINNING: -2
     // OFFSET_END: -1
     public static long getKafkaOffset(String offsetStr) throws AnalysisException {
+        offsetStr = offsetStr.trim();
         long offset = -1;
         try {
             offset = getLongValueFromString(offsetStr, "kafka offset");
@@ -853,11 +953,11 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         if (valueString.isEmpty()) {
             throw new AnalysisException(propertyName + " could not be a empty string");
         }
-        int value;
+        int value = -1;
         try {
             value = Integer.parseInt(valueString);
         } catch (NumberFormatException e) {
-            throw new AnalysisException(propertyName + " must be a integer");
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_INVALID_VALUE, propertyName, valueString, "an integer");
         }
         return value;
     }
@@ -866,11 +966,12 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         if (valueString.isEmpty()) {
             throw new AnalysisException(propertyName + " could not be a empty string");
         }
-        long value;
+        long value = -1L;
         try {
             value = Long.valueOf(valueString);
         } catch (NumberFormatException e) {
-            throw new AnalysisException(propertyName + " must be a integer: " + valueString);
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_INVALID_VALUE, propertyName, valueString,
+                    String.format("an integer, %s, or %s", KafkaProgress.OFFSET_BEGINNING, KafkaProgress.OFFSET_END));
         }
         return value;
     }
@@ -894,10 +995,5 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) throws RuntimeException {
         return visitor.visitCreateRoutineLoadStatement(this, context);
-    }
-
-    @Override
-    public boolean needAuditEncryption() {
-        return true;
     }
 }

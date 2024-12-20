@@ -27,6 +27,12 @@
 
 namespace starrocks::stream {
 
+#define ASSERT_IF_ERROR(stmt)           \
+    do {                                \
+        auto&& st__ = (stmt);           \
+        ASSERT_TRUE(st__.ok()) << st__; \
+    } while (0)
+
 bool GeneratorStreamSourceOperator::is_trigger_finished(const EpochInfo& epoch_info) {
     auto trigger_mode = epoch_info.trigger_mode;
     switch (trigger_mode) {
@@ -62,7 +68,7 @@ StatusOr<ChunkPtr> GeneratorStreamSourceOperator::pull_chunk(starrocks::RuntimeS
 }
 
 Status PrinterStreamSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
-    std::cout << "<<<<<<<<< Sink Result: " << chunk->debug_columns() << std::endl;
+    std::cout << "========= Sink Result: " << chunk->debug_columns() << std::endl;
     for (auto& col : chunk->columns()) {
         std::cout << col->debug_string() << std::endl;
     }
@@ -77,12 +83,12 @@ public:
 
     void CheckResult(std::vector<ChunkPtr> epoch_results,
                      std::vector<std::vector<std::vector<int64_t>>> expect_results) {
-        DCHECK(!epoch_results.empty());
+        ASSERT_TRUE(!epoch_results.empty());
         for (size_t i = 0; i < epoch_results.size(); i++) {
             auto result = epoch_results[i];
             auto columns = result->columns();
             auto expect = expect_results[i];
-            DCHECK_EQ(columns.size(), expect.size());
+            ASSERT_EQ(columns.size(), expect.size());
             for (size_t j = 0; j < expect.size(); j++) {
                 CheckColumn<int64_t>(columns[j], expect[j]);
             }
@@ -106,14 +112,12 @@ protected:
 
 std::shared_ptr<TPlanNode> StreamOperatorsTest::_create_tplan_node(int node_id, int tuple_id) {
     std::vector<::starrocks::TTupleId> tuple_ids{tuple_id};
-    std::vector<bool> nullable_tuples{true};
 
     auto tnode = std::make_shared<TPlanNode>();
 
     tnode->__set_node_id(node_id);
     tnode->__set_node_type(TPlanNodeType::STREAM_SCAN_NODE);
     tnode->__set_row_tuples(tuple_ids);
-    tnode->__set_nullable_tuples(nullable_tuples);
     tnode->__set_use_vectorized(true);
     tnode->__set_limit(-1);
 
@@ -135,7 +139,7 @@ DescriptorTbl* StreamOperatorsTest::_create_table_desc(int num_columns, int chun
     tuple_desc_builder.build(&desc_tbl_builder);
 
     DescriptorTbl* tbl = nullptr;
-    DescriptorTbl::create(_runtime_state, _obj_pool, desc_tbl_builder.desc_tbl(), &tbl, chunk_size);
+    CHECK(DescriptorTbl::create(_runtime_state, _obj_pool, desc_tbl_builder.desc_tbl(), &tbl, chunk_size).ok());
     _runtime_state->set_desc_tbl(tbl);
     return tbl;
 }
@@ -175,39 +179,41 @@ void StreamOperatorsTest::_generate_morse_queue(ConnectorScanNode* scan_node,
 
     std::map<int32_t, std::vector<TScanRangeParams>> no_scan_ranges_per_driver_seq;
     auto morsel_queue_factory = scan_node->convert_scan_range_to_morsel_queue_factory(
-            scan_ranges, no_scan_ranges_per_driver_seq, scan_node->id(), degree_of_parallelism, true,
+            scan_ranges, no_scan_ranges_per_driver_seq, scan_node->id(), degree_of_parallelism, false, true,
             TTabletInternalParallelMode::type::AUTO);
-    DCHECK(morsel_queue_factory.ok());
+    ASSERT_TRUE(morsel_queue_factory.ok());
     morsel_queue_factories.emplace(scan_node->id(), std::move(morsel_queue_factory).value());
 }
 
 TEST_F(StreamOperatorsTest, Dop_1) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 1;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             OpFactories op_factories{
                     std::make_shared<GeneratorStreamSourceOperatorFactory>(
                             next_operator_id(), next_plan_node_id(),
                             GeneratorStreamSourceParam{.num_column = 2, .start = 0, .step = 1, .chunk_size = 4}),
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()),
             };
-            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories));
+            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group));
         };
         return Status::OK();
     }));
 
     EpochInfo epoch_info{.epoch_id = 0, .trigger_mode = TriggerMode::MANUAL};
-    DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-    DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+    ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+    ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
     CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info), {{{1, 2, 3, 4}, {5, 6, 7, 8}}});
 
     stop_mv();
 }
 
 TEST_F(StreamOperatorsTest, MultiDop_4) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 4;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             OpFactories op_factories;
             auto source_factory = std::make_shared<GeneratorStreamSourceOperatorFactory>(
                     next_operator_id(), next_plan_node_id(),
@@ -216,18 +222,18 @@ TEST_F(StreamOperatorsTest, MultiDop_4) {
             source_factory->set_degree_of_parallelism(_degree_of_parallelism);
             op_factories.emplace_back(std::move(source_factory));
             // add exchange node to gather multi source operator to one sink operator
-            op_factories = maybe_interpolate_local_passthrough_exchange(op_factories);
+            op_factories = maybe_interpolate_local_passthrough_exchange(op_factories, exec_group);
             op_factories.emplace_back(
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()));
-            auto pipeline = std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories);
+            auto pipeline = std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group);
             _pipelines.push_back(std::move(pipeline));
         };
         return Status::OK();
     }));
 
     EpochInfo epoch_info{.epoch_id = 0, .trigger_mode = TriggerMode::MANUAL};
-    DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-    DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+    ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+    ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
     CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info), {{{1, 2, 3, 4}, {5, 6, 7, 0}}, // chunk 0
                                                                        {{1, 2, 3, 4}, {5, 6, 7, 0}}, // chunk 1
                                                                        {{1, 2, 3, 4}, {5, 6, 7, 0}},
@@ -237,9 +243,10 @@ TEST_F(StreamOperatorsTest, MultiDop_4) {
 }
 
 TEST_F(StreamOperatorsTest, Test_StreamAggregator_Dop1) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 1;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             _slot_infos = std::vector<std::vector<SlotTypeInfo>>{
                     // input slots
                     {
@@ -273,15 +280,15 @@ TEST_F(StreamOperatorsTest, Test_StreamAggregator_Dop1) {
                                                                      _stream_aggregator),
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()),
             };
-            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories));
+            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group));
         };
         return Status::OK();
     }));
 
     for (auto i = 0; i < 3; i++) {
         EpochInfo epoch_info{.epoch_id = i, .trigger_mode = TriggerMode::MANUAL};
-        DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-        DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+        ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+        ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
         CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info),
                     {{{1, 2, 3, 0}, {i + 1, i + 1, i + 1, i + 1}}});
     }
@@ -290,9 +297,10 @@ TEST_F(StreamOperatorsTest, Test_StreamAggregator_Dop1) {
 }
 
 TEST_F(StreamOperatorsTest, Test_StreamAggregator_MultiDop) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 4;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             _slot_infos = std::vector<std::vector<SlotTypeInfo>>{
                     // input slots
                     {
@@ -325,36 +333,38 @@ TEST_F(StreamOperatorsTest, Test_StreamAggregator_MultiDop) {
             source_factory->set_degree_of_parallelism(_degree_of_parallelism);
             op_factories.emplace_back(std::move(source_factory));
             // add exchange node to gather multi source operator to one sink operator
-            op_factories = maybe_interpolate_local_passthrough_exchange(op_factories);
+            op_factories = maybe_interpolate_local_passthrough_exchange(op_factories, exec_group);
             op_factories.emplace_back(std::make_shared<StreamAggregateOperatorFactory>(
                     next_operator_id(), next_plan_node_id(), _stream_aggregator));
             op_factories.emplace_back(
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()));
-            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories));
+            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group));
         };
         return Status::OK();
     }));
 
     for (auto i = 0; i < 10; i++) {
         EpochInfo epoch_info{.epoch_id = i, .trigger_mode = TriggerMode::MANUAL};
-        DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-        DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+        ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+        ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
         CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info),
                     {{{1, 2, 3, 4}, {(i + 1) * 4, (i + 1) * 4, (i + 1) * 4, (i + 1) * 4}}});
-        sleep(0.5);
+        using namespace std::chrono_literals;
+        std::this_thread::sleep_for(500ms);
     }
     stop_mv();
 }
 
 TEST_F(StreamOperatorsTest, binlog_dop_1) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 1;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             auto* descs = _create_table_desc(2, 4);
             auto tnode = _create_tplan_node(next_plan_node_id(), 0);
             auto binlog_scan_node = std::make_shared<starrocks::ConnectorScanNode>(_obj_pool, *tnode, *descs);
             _connector_node = binlog_scan_node;
-            Status status = binlog_scan_node->init(*tnode, _runtime_state);
+            ASSERT_TRUE(binlog_scan_node->init(*tnode, _runtime_state).ok());
             auto scan_ranges = _create_binlog_scan_ranges(_degree_of_parallelism);
             _generate_morse_queue(binlog_scan_node.get(), scan_ranges, _degree_of_parallelism);
             OpFactories op_factories = binlog_scan_node->decompose_to_pipeline(_pipeline_context);
@@ -364,23 +374,24 @@ TEST_F(StreamOperatorsTest, binlog_dop_1) {
 
             op_factories.push_back(
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()));
-            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories));
+            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group));
         };
         return Status::OK();
     }));
 
     EpochInfo epoch_info{
             .epoch_id = 0, .max_exec_millis = -1, .max_scan_rows = -1, .trigger_mode = TriggerMode::MANUAL};
-    DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-    DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+    ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+    ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
     CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info), {{{1, 2, 3, 4}, {5, 6, 7, 8}}});
     stop_mv();
 }
 
 TEST_F(StreamOperatorsTest, binlog_dop_1_multi_epoch) {
-    DCHECK_IF_ERROR(start_mv([&]() {
+    ASSERT_IF_ERROR(start_mv([&](auto* stream_ctx) {
+        auto exec_group = stream_ctx->exec_group.get();
         _degree_of_parallelism = 1;
-        _pipeline_builder = [&](RuntimeState* state) {
+        _pipeline_builder = [=](RuntimeState* state) {
             auto* descs = _create_table_desc(2, 4);
             auto tnode = _create_tplan_node(next_plan_node_id(), 0);
             auto binlog_scan_node = std::make_shared<starrocks::ConnectorScanNode>(_obj_pool, *tnode, *descs);
@@ -395,7 +406,7 @@ TEST_F(StreamOperatorsTest, binlog_dop_1_multi_epoch) {
 
             op_factories.push_back(
                     std::make_shared<PrinterStreamSinkOperatorFactory>(next_operator_id(), next_plan_node_id()));
-            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories));
+            _pipelines.push_back(std::make_shared<pipeline::Pipeline>(next_pipeline_id(), op_factories, exec_group));
         };
         return Status::OK();
     }));
@@ -403,8 +414,8 @@ TEST_F(StreamOperatorsTest, binlog_dop_1_multi_epoch) {
     for (auto i = 0; i < 3; i++) {
         EpochInfo epoch_info{
                 .epoch_id = 0, .max_exec_millis = -1, .max_scan_rows = -1, .trigger_mode = TriggerMode::MANUAL};
-        DCHECK_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
-        DCHECK_IF_ERROR(wait_until_epoch_finished(epoch_info));
+        ASSERT_IF_ERROR(start_epoch(_tablet_ids, epoch_info));
+        ASSERT_IF_ERROR(wait_until_epoch_finished(epoch_info));
         CheckResult(fetch_results<PrinterStreamSinkOperator>(epoch_info), {{{1, 2, 3, 4}, {5, 6, 7, 8}}});
     }
 

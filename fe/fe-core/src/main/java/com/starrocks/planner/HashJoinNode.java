@@ -35,12 +35,15 @@
 package com.starrocks.planner;
 
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.analysis.SlotId;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableRef;
+import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.thrift.TEqJoinCondition;
 import com.starrocks.thrift.THashJoinNode;
 import com.starrocks.thrift.TNormalHashJoinNode;
@@ -50,7 +53,6 @@ import com.starrocks.thrift.TPlanNodeType;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * Hash join between left child and right child.
@@ -115,8 +117,23 @@ public class HashJoinNode extends JoinNode {
             msg.hash_join_node.setBuild_runtime_filters(
                     RuntimeFilterDescription.toThriftRuntimeFilterDescriptions(buildRuntimeFilters));
         }
-        msg.hash_join_node.setBuild_runtime_filters_from_planner(
-                ConnectContext.get().getSessionVariable().getEnableGlobalRuntimeFilter());
+        SessionVariable sv = ConnectContext.get().getSessionVariable();
+
+        msg.hash_join_node.setLate_materialization(enableLateMaterialization);
+        // predicate filtration rate
+        double predicateRate = getCardinality() / (double) getChild(0).getCardinality();
+        if (enableLateMaterialization) {
+            // If join late materialize is turned on higher filtering can lead to performance degradation.
+            if (predicateRate > Config.partition_hash_join_min_cardinality_rate) {
+                msg.hash_join_node.setEnable_partition_hash_join(sv.enablePartitionHashJoin());
+            } else {
+                msg.hash_join_node.setEnable_partition_hash_join(false);
+            }
+        } else {
+            msg.hash_join_node.setEnable_partition_hash_join(sv.enablePartitionHashJoin());
+        }
+        msg.hash_join_node.setBuild_runtime_filters_from_planner(sv.getEnableGlobalRuntimeFilter());
+
         if (partitionExprs != null) {
             msg.hash_join_node.setPartition_exprs(Expr.treesToThrift(partitionExprs));
         }
@@ -124,6 +141,10 @@ public class HashJoinNode extends JoinNode {
 
         if (outputSlots != null) {
             msg.hash_join_node.setOutput_columns(outputSlots);
+        }
+
+        if (getCanLocalShuffle()) {
+            msg.hash_join_node.setInterpolate_passthrough(sv.isHashJoinInterpolatePassthrough());
         }
     }
 
@@ -137,6 +158,7 @@ public class HashJoinNode extends JoinNode {
         hashJoinNode.setIs_rewritten_from_not_in(innerRef != null && innerRef.isJoinRewrittenFromNotIn());
         hashJoinNode.setPartition_exprs(normalizer.normalizeOrderedExprs(partitionExprs));
         hashJoinNode.setOutput_columns(normalizer.remapIntegerSlotIds(outputSlots));
+        hashJoinNode.setLate_materialization(enableLateMaterialization);
         planNode.setHash_join_node(hashJoinNode);
         planNode.setNode_type(TPlanNodeType.HASH_JOIN_NODE);
         normalizeConjuncts(normalizer, planNode, conjuncts);
@@ -148,7 +170,7 @@ public class HashJoinNode extends JoinNode {
             return;
         }
         for (BinaryPredicate eq : eqJoinConjuncts) {
-            if (!eq.getOp().equals(BinaryPredicate.Operator.EQ)) {
+            if (!eq.getOp().equals(BinaryType.EQ)) {
                 continue;
             }
             SlotId lhsSlotId = ((SlotRef) eq.getChild(0)).getSlotId();

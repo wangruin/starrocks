@@ -37,19 +37,19 @@ package com.starrocks.sql.ast;
 import com.google.common.base.Strings;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.ParseNode;
-import com.starrocks.authentication.AuthenticationManager;
+import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.CaseSensibility;
 import com.starrocks.common.PatternMatcher;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.sql.analyzer.FeNameFormat;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TUserIdentity;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
@@ -62,13 +62,19 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
     private String host;
     @SerializedName("isDomain")
     private boolean isDomain;
+    /**
+     * A user is ephemeral meaning that it has a session level life circle, i.e. it's created on user connecting and
+     * destroyed after disconnected, currently it's used by ldap security integration where we use external ldap server
+     * to authenticate and the metadata of a user is not stored on StarRocks.
+     */
+    private boolean ephemeral;
 
     private final NodePosition pos;
 
     public static final UserIdentity ROOT;
 
     static {
-        ROOT = new UserIdentity(AuthenticationManager.ROOT_USER, "%");
+        ROOT = new UserIdentity(AuthenticationMgr.ROOT_USER, "%");
     }
 
     /**
@@ -82,15 +88,20 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
         this(user, host, false);
     }
 
-    public UserIdentity(String user, String host, boolean isDomain) {
-        this(user, host, isDomain, NodePosition.ZERO);
+    public UserIdentity(boolean ephemeral, String user, String host) {
+        this(user, host, false, NodePosition.ZERO, ephemeral);
     }
 
-    public UserIdentity(String user, String host, boolean isDomain, NodePosition pos) {
+    public UserIdentity(String user, String host, boolean isDomain) {
+        this(user, host, isDomain, NodePosition.ZERO, false);
+    }
+
+    public UserIdentity(String user, String host, boolean isDomain, NodePosition pos, boolean ephemeral) {
         this.pos = pos;
         this.user = user;
         this.host = Strings.emptyToNull(host);
         this.isDomain = isDomain;
+        this.ephemeral = ephemeral;
     }
 
     public static UserIdentity createAnalyzedUserIdentWithIp(String user, String host) {
@@ -105,7 +116,11 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
         return new UserIdentity(tUserIdent.getUsername(), tUserIdent.getHost(), tUserIdent.is_domain);
     }
 
-    public String getQualifiedUser() {
+    public static UserIdentity createEphemeralUserIdent(String user, String host) {
+        return new UserIdentity(true, user, host);
+    }
+
+    public String getUser() {
         return user;
     }
 
@@ -115,6 +130,10 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
 
     public boolean isDomain() {
         return isDomain;
+    }
+
+    public boolean isEphemeral() {
+        return ephemeral;
     }
 
     public void analyze() {
@@ -169,7 +188,7 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
             return false;
         }
         UserIdentity other = (UserIdentity) obj;
-        return user.equals(other.getQualifiedUser()) && host.equals(other.getHost()) && this.isDomain == other.isDomain;
+        return user.equals(other.getUser()) && host.equals(other.getHost()) && this.isDomain == other.isDomain;
     }
 
     @Override
@@ -201,25 +220,9 @@ public class UserIdentity implements ParseNode, Writable, GsonPostProcessable {
         return sb.toString();
     }
 
-    // change user to default_cluster:user for write
-    // and change default_cluster:user to user after read
     @Override
     public void write(DataOutput out) throws IOException {
-        Text.writeString(out, ClusterNamespace.getFullName(user));
-        Text.writeString(out, host);
-        out.writeBoolean(isDomain);
-    }
-
-    public static UserIdentity read(DataInput in) throws IOException {
-        UserIdentity userIdentity = new UserIdentity();
-        userIdentity.readFields(in);
-        return userIdentity;
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        user = ClusterNamespace.getNameFromFullName(Text.readString(in));
-        host = Text.readString(in);
-        isDomain = in.readBoolean();
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
     @Override

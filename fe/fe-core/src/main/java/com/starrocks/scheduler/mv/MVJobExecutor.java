@@ -15,7 +15,8 @@
 
 package com.starrocks.scheduler.mv;
 
-import com.starrocks.common.util.LeaderDaemon;
+import com.starrocks.common.util.FrontendDaemon;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -32,7 +33,7 @@ import java.util.stream.Collectors;
  * <p>
  * TODO(murphy) extend executor to multi-threading
  */
-public class MVJobExecutor extends LeaderDaemon {
+public class MVJobExecutor extends FrontendDaemon {
     private static final long EXECUTOR_INTERVAL_MILLIS = 1000;
     private static final Logger LOG = LogManager.getLogger(MVJobExecutor.class);
 
@@ -50,7 +51,7 @@ public class MVJobExecutor extends LeaderDaemon {
     }
 
     private void runImpl() {
-        List<MVMaintenanceJob> jobs = MVManager.getInstance().getRunnableJobs();
+        List<MVMaintenanceJob> jobs = GlobalStateMgr.getCurrentState().getMaterializedViewMgr().getRunnableJobs();
         if (CollectionUtils.isEmpty(jobs)) {
             return;
         }

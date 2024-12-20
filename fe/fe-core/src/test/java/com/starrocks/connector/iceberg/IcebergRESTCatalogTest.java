@@ -15,17 +15,14 @@
 
 package com.starrocks.connector.iceberg;
 
+import com.google.common.collect.ImmutableList;
 import com.starrocks.connector.iceberg.rest.IcebergRESTCatalog;
 import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
 import mockit.Mocked;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.iceberg.BaseTable;
-import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.rest.RESTCatalog;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -36,52 +33,48 @@ import java.util.Map;
 
 public class IcebergRESTCatalogTest {
     @Test
-    public void testCatalogType() {
-        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog();
-        Assert.assertEquals(IcebergCatalogType.REST_CATALOG, icebergRESTCatalog.getIcebergCatalogType());
-    }
-
-    @Test
-    public void testLoadTable(@Mocked IcebergRESTCatalog restCatalog) {
-        TableIdentifier identifier = TableIdentifier.of("db", "table");
+    public void testListAllDatabases(@Mocked RESTCatalog restCatalog) {
         new Expectations() {
             {
-                restCatalog.loadTable(identifier);
-                result = new BaseTable(null, "test");
-                minTimes = 0;
-            }
-        };
-
-        new MockUp<CatalogUtil>() {
-            @Mock
-            public Catalog loadCatalog(String catalogImpl, String catalogName,
-                                       Map<String, String> properties,
-                                       Configuration hadoopConf) {
-                return restCatalog;
+                restCatalog.listNamespaces();
+                result = ImmutableList.of(Namespace.of("db1"), Namespace.of("db2"));
+                times = 1;
             }
         };
 
         Map<String, String> icebergProperties = new HashMap<>();
-        IcebergRESTCatalog icebergRESTCatalog = (IcebergRESTCatalog) CatalogLoader.rest(
-                "rest_catalog", new Configuration(), icebergProperties).loadCatalog();
-        Table table = icebergRESTCatalog.loadTable(identifier);
-        Assert.assertEquals("test", table.name());
-    }
-
-    @Test
-    public void testListAllDatabases(@Mocked IcebergRESTCatalog restCatalog) {
-        new Expectations() {
-            {
-                restCatalog.listAllDatabases();
-                result = Arrays.asList("db1", "db2");
-                minTimes = 0;
-            }
-        };
-
-        Map<String, String> icebergProperties = new HashMap<>();
-        IcebergRESTCatalog icebergRESTCatalog = (IcebergRESTCatalog) CatalogLoader.rest(
-                "rest_catalog", new Configuration(), icebergProperties).loadCatalog();
+        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(
+                "rest_native_catalog", new Configuration(), icebergProperties);
         List<String> dbs = icebergRESTCatalog.listAllDatabases();
         Assert.assertEquals(Arrays.asList("db1", "db2"), dbs);
+    }
+
+    @Test
+    public void testTableExists(@Mocked RESTCatalog restCatalog) {
+        new Expectations() {
+            {
+                restCatalog.tableExists((TableIdentifier) any);
+                result = true;
+            }
+        };
+        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(
+                "rest_native_catalog", new Configuration(), new HashMap<>());
+        boolean exists = icebergRESTCatalog.tableExists("db1", "tbl1");
+        Assert.assertTrue(exists);
+    }
+
+    @Test
+    public void testRenameTable(@Mocked RESTCatalog restCatalog) {
+        new Expectations() {
+            {
+                restCatalog.tableExists((TableIdentifier) any);
+                result = true;
+            }
+        };
+        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(
+                "rest_native_catalog", new Configuration(), new HashMap<>());
+        icebergRESTCatalog.renameTable("db", "tb1", "tb2");
+        boolean exists = icebergRESTCatalog.tableExists("db", "tbl2");
+        Assert.assertTrue(exists);
     }
 }

@@ -15,6 +15,7 @@
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.AggregateFunction;
@@ -24,11 +25,14 @@ import com.starrocks.catalog.AnyMapType;
 import com.starrocks.catalog.AnyStructType;
 import com.starrocks.catalog.ArrayType;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.MapType;
 import com.starrocks.catalog.ScalarFunction;
+import com.starrocks.catalog.StructField;
 import com.starrocks.catalog.StructType;
 import com.starrocks.catalog.TableFunction;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.common.TypeManager;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -36,66 +40,28 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import static com.starrocks.sql.analyzer.AnalyzerUtils.replaceNullType2Boolean;
+
 public class PolymorphicFunctionAnalyzer {
     private static final Logger LOGGER = LogManager.getLogger(PolymorphicFunctionAnalyzer.class);
 
-    private static Type getSuperType(Type t1, Type t2) {
-        if (t1.matchesType(t2)) {
-            return t1;
-        }
-        if (t1.isNull()) {
-            return t2;
-        }
-        if (t2.isNull()) {
-            return t1;
-        }
-        if (t1.isScalarType() && t2.isScalarType()) {
-            Type commonType = Type.getCommonType(t1, t2);
-            return commonType.isValid() ? commonType : null;
-        }
-        if (t1.isArrayType() && t2.isArrayType()) {
-            Type superElementType = getSuperType(((ArrayType) t1).getItemType(), ((ArrayType) t2).getItemType());
-            return superElementType != null ? new ArrayType(superElementType) : null;
-        }
-        if (t1.isMapType() && t2.isMapType()) {
-            Type superKeyType = getSuperType(((MapType) t1).getKeyType(), ((MapType) t2).getKeyType());
-            Type superValueType = getSuperType(((MapType) t1).getValueType(), ((MapType) t2).getValueType());
-            return superKeyType != null && superValueType != null ? new MapType(superKeyType, superValueType) : null;
-        }
-        return null;
-    }
-
     private static Function newScalarFunction(ScalarFunction fn, List<Type> newArgTypes, Type newRetType) {
-        ScalarFunction newFn = new ScalarFunction(fn.getFunctionName(), newArgTypes, newRetType,
-                fn.getLocation(), fn.getSymbolName(), fn.getPrepareFnSymbol(),
-                fn.getCloseFnSymbol());
-        newFn.setFunctionId(fn.getFunctionId());
-        newFn.setChecksum(fn.getChecksum());
-        newFn.setBinaryType(fn.getBinaryType());
-        newFn.setHasVarArgs(fn.hasVarArgs());
-        newFn.setId(fn.getId());
-        newFn.setUserVisible(fn.isUserVisible());
-        return newFn;
+        return fn.withNewTypes(newArgTypes, newRetType);
     }
 
     private static Function newAggregateFunction(AggregateFunction fn, List<Type> newArgTypes, Type newRetType) {
-        AggregateFunction newFn = new AggregateFunction(fn.getFunctionName(), newArgTypes, newRetType,
-                fn.getIntermediateType(), fn.hasVarArgs());
-        newFn.setFunctionId(fn.getFunctionId());
-        newFn.setChecksum(fn.getChecksum());
-        newFn.setBinaryType(fn.getBinaryType());
-        newFn.setHasVarArgs(fn.hasVarArgs());
-        newFn.setId(fn.getId());
-        newFn.setUserVisible(fn.isUserVisible());
-        return newFn;
+        return fn.withNewTypes(newArgTypes, newRetType);
     }
 
-    private static Type[] resolveArgTypes(Type[] declTypes, Type[] inputArgTypes) {
+    // only works for null into array[null]/map{null:null}/struct(null)
+    private static Type[] resolveArgTypes(Function fn, Type[] inputArgTypes) {
         // Use inputArgTypes length, because function may be a variable arguments
         Type[] resolvedTypes = Arrays.copyOf(inputArgTypes, inputArgTypes.length);
+        Type[] argsTypes = fn.getArgs();
 
-        for (int i = 0; i < declTypes.length; ++i) {
-            Type declType = declTypes[i];
+        int size = Math.max(argsTypes.length, inputArgTypes.length);
+        for (int i = 0; i < size; ++i) {
+            Type declType = i >= argsTypes.length ? argsTypes[argsTypes.length - 1] : argsTypes[i];
             Type inputType = inputArgTypes[i];
 
             // If declaration type is not a pseudo type, use it.
@@ -104,22 +70,24 @@ public class PolymorphicFunctionAnalyzer {
                 continue;
             }
 
-            // Need to make input be a valid complex type if the input is Type NULL
+            // for complex type, change NULL into Array[NULL]/Map[NULL:NULL]/Struct(NULL)
             if (declType instanceof AnyArrayType) {
-                resolvedTypes[i] = inputType.isNull() ? new ArrayType(Type.NULL) : inputType;
+                resolvedTypes[i] = inputType.isNull() ? new ArrayType(inputType) : inputType;
             } else if (declType instanceof AnyMapType) {
-                resolvedTypes[i] = inputType.isNull() ? new MapType(Type.NULL, Type.NULL) : inputType;
+                resolvedTypes[i] = inputType.isNull() ? new MapType(inputType, inputType) : inputType;
             } else if (declType instanceof AnyStructType) {
-                resolvedTypes[i] = inputType.isNull() ? new StructType(Lists.newArrayList(Type.NULL)) : inputType;
+                resolvedTypes[i] = inputType.isNull() ? new StructType(Lists.newArrayList(inputType)) : inputType;
             } else {
                 resolvedTypes[i] = inputType;
             }
+
         }
         return resolvedTypes;
     }
 
     private static Function resolveByReplacingInputs(Function fn, Type[] inputArgTypes) {
-        Type[] resolvedArgTypes = resolveArgTypes(fn.getArgs(), inputArgTypes);
+        Type[] resolvedArgTypes = resolveArgTypes(fn, inputArgTypes);
+        resolvedArgTypes = AnalyzerUtils.replaceNullTypes2Booleans(resolvedArgTypes);
         if (fn instanceof ScalarFunction) {
             return newScalarFunction((ScalarFunction) fn, Arrays.asList(resolvedArgTypes), fn.getReturnType());
         }
@@ -162,12 +130,29 @@ public class PolymorphicFunctionAnalyzer {
         }
     }
 
-    // map_apply(lambda of function, map) -> return type of lambda
-    private static class MapApplyDeduce implements java.util.function.Function<Type[], Type> {
+    // map_apply/array_map(lambda of function, map/array) -> return type of lambda
+    private static class LambdaDeduce implements java.util.function.Function<Type[], Type> {
         @Override
         public Type apply(Type[] types) {
             // fake return type, the real return type is from the right part lambda expression of lambda functions.
             return types[1];
+        }
+    }
+
+    private static class DistinctMapKeysDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            return types[0];
+        }
+    }
+
+    private static class IfDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            Type commonType = TypeManager.getCommonSuperType(types[1], types[2]);
+            types[1] = commonType;
+            types[2] = commonType;
+            return commonType;
         }
     }
 
@@ -178,14 +163,66 @@ public class PolymorphicFunctionAnalyzer {
         }
     }
 
+    private static class CommonDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            Type commonType = TypeManager.getCommonSuperType(Arrays.asList(types));
+            Arrays.fill(types, commonType);
+            return commonType;
+        }
+    }
+
+    private static class ArrayAggStateDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            return FunctionAnalyzer.getArrayAggGroupConcatIntermediateType(FunctionSet.ARRAY_AGG,
+                    types, ImmutableList.of()).second;
+        }
+    }
+
+    private static class ArrayAggMergeDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            Type type0 = types[0];
+            Preconditions.checkArgument(type0 instanceof StructType);
+            StructType structType = (StructType) type0;
+            StructField field0 = structType.getField(0);
+            return field0.getType();
+        }
+    }
+
+    private static class MapAggDeduce implements java.util.function.Function<Type[], Type> {
+        @Override
+        public Type apply(Type[] types) {
+            return new MapType(types[0], types[1]);
+        }
+    }
+
     private static final ImmutableMap<String, java.util.function.Function<Type[], Type>> DEDUCE_RETURN_TYPE_FUNCTIONS
             = ImmutableMap.<String, java.util.function.Function<Type[], Type>>builder()
-            .put("map_keys", new MapKeysDeduce())
-            .put("map_values", new MapValuesDeduce())
-            .put("map_from_arrays", new MapFromArraysDeduce())
-            .put("row", new RowDeduce())
-            .put("map_apply", new MapApplyDeduce())
-            .put("map_filter", new MapFilterDeduce())
+            .put(FunctionSet.MAP_KEYS, new MapKeysDeduce())
+            .put(FunctionSet.MAP_VALUES, new MapValuesDeduce())
+            .put(FunctionSet.MAP_FROM_ARRAYS, new MapFromArraysDeduce())
+            .put(FunctionSet.ROW, new RowDeduce())
+            .put(FunctionSet.MAP_APPLY, new LambdaDeduce())
+            .put(FunctionSet.ARRAY_MAP, new LambdaDeduce())
+            .put(FunctionSet.MAP_FILTER, new MapFilterDeduce())
+            .put(FunctionSet.DISTINCT_MAP_KEYS, new DistinctMapKeysDeduce())
+            .put(FunctionSet.MAP_CONCAT, new CommonDeduce())
+            .put(FunctionSet.IF, new IfDeduce())
+            .put(FunctionSet.IFNULL, new CommonDeduce())
+            .put(FunctionSet.NULLIF, new CommonDeduce())
+            .put(FunctionSet.COALESCE, new CommonDeduce())
+            // it's mock, need handle it in expressionAnalyzer
+            .put(FunctionSet.NAMED_STRUCT, new RowDeduce())
+            .put(FunctionSet.ANY_VALUE, types -> types[0])
+            .put(FunctionSet.getAggStateName(FunctionSet.ANY_VALUE), types -> types[0])
+            .put(FunctionSet.getAggStateUnionName(FunctionSet.ANY_VALUE), types -> types[0])
+            .put(FunctionSet.getAggStateMergeName(FunctionSet.ANY_VALUE), types -> types[0])
+            .put(FunctionSet.getAggStateName(FunctionSet.ARRAY_AGG), new ArrayAggStateDeduce())
+            .put(FunctionSet.getAggStateUnionName(FunctionSet.ARRAY_AGG), types -> types[0])
+            .put(FunctionSet.getAggStateMergeName(FunctionSet.ARRAY_AGG), new ArrayAggMergeDeduce())
+            .put(FunctionSet.MAP_AGG, new MapAggDeduce())
             .build();
 
     private static Function resolveByDeducingReturnType(Function fn, Type[] inputArgTypes) {
@@ -193,13 +230,35 @@ public class PolymorphicFunctionAnalyzer {
         if (deduce == null) {
             return null;
         }
-        Type[] resolvedArgTypes = resolveArgTypes(fn.getArgs(), inputArgTypes);
+
+        Type[] resolvedArgTypes = resolveArgTypes(fn, inputArgTypes);
         Type newRetType = deduce.apply(resolvedArgTypes);
+
+        // change null type into boolean type
+        resolvedArgTypes = AnalyzerUtils.replaceNullTypes2Booleans(resolvedArgTypes);
+        newRetType = replaceNullType2Boolean(newRetType);
+
         if (fn instanceof ScalarFunction) {
             return newScalarFunction((ScalarFunction) fn, Arrays.asList(resolvedArgTypes), newRetType);
         }
         if (fn instanceof AggregateFunction) {
             return newAggregateFunction((AggregateFunction) fn, Arrays.asList(resolvedArgTypes), newRetType);
+        }
+        return null;
+    }
+
+    private static Function resolvePolymorphicArrayFunction(Function fn, Type[] inputArgTypes) {
+        // for some special array function, they have ANY_ARRAY/ANY_ELEMENT in arguments, should align type
+        String fnName = fn.getFunctionName().getFunction();
+        if (FunctionSet.ARRAY_CONTAINS.equalsIgnoreCase(fnName) ||
+                FunctionSet.ARRAY_POSITION.equalsIgnoreCase(fnName))  {
+            Type elementType = ((ArrayType) inputArgTypes[0]).getItemType();
+            Type commonType = TypeManager.getCommonSuperType(elementType, inputArgTypes[1]);
+            if (commonType == null) {
+                return null;
+            }
+            return newScalarFunction((ScalarFunction) fn,
+                    Arrays.asList(new ArrayType(commonType), commonType), fn.getReturnType());
         }
         return null;
     }
@@ -252,6 +311,7 @@ public class PolymorphicFunctionAnalyzer {
         Type retType = fn.getReturnType();
         Type[] declTypes = fn.getArgs();
         Function resolvedFunction;
+
         long numPseudoArgs = Arrays.stream(declTypes).filter(Type::isPseudoType).count();
         // resolve single pseudo type parameter, example: int array_length(ANY_ARRAY)
         if (!retType.isPseudoType() && numPseudoArgs == 1) {
@@ -261,8 +321,12 @@ public class PolymorphicFunctionAnalyzer {
             }
         }
         // deduce by special function
-        // TODO: refactor resolve arg types, some from L254, others from L262.
         resolvedFunction = resolveByDeducingReturnType(fn, paramTypes);
+        if (resolvedFunction != null) {
+            return resolvedFunction;
+        }
+
+        resolvedFunction = resolvePolymorphicArrayFunction(fn, paramTypes);
         if (resolvedFunction != null) {
             return resolvedFunction;
         }
@@ -272,9 +336,9 @@ public class PolymorphicFunctionAnalyzer {
         Type typeElement;
 
         List<Type> allRealElementType = Lists.newArrayList();
-
-        for (int i = 0; i < declTypes.length; i++) {
-            Type declType = declTypes[i];
+        int size = fn.hasVarArgs() ? paramTypes.length : declTypes.length;
+        for (int i = 0; i < size; i++) {
+            Type declType = i >= declTypes.length ? fn.getVarArgsType() : declTypes[i];
             Type realType = paramTypes[i];
             if (declType instanceof AnyArrayType) {
                 if (realType.isNull()) {
@@ -292,19 +356,23 @@ public class PolymorphicFunctionAnalyzer {
 
         if (!allRealElementType.isEmpty()) {
             Type commonType = allRealElementType.get(0);
-            for (Type type : allRealElementType) {
-                commonType = getSuperType(commonType, type);
-                if (commonType == null) {
-                    LOGGER.warn("could not determine polymorphic type because input has non-match types");
-                    return null;
+            // For ARRAY_SORTBY, use the Type of the first AnyArray as the return value,
+            // Rather than the Common Type of all AnyArray Types
+            if (!FunctionSet.ARRAY_SORTBY.equals(fn.functionName())) {
+                for (Type type : allRealElementType) {
+                    commonType = TypeManager.getCommonSuperType(commonType, type);
+                    if (commonType == null) {
+                        LOGGER.warn("could not determine polymorphic type because input has non-match types");
+                        return null;
+                    }
                 }
             }
-
+            commonType = replaceNullType2Boolean(commonType);
             typeArray = new ArrayType(commonType);
             typeElement = commonType;
         } else {
-            typeElement = Type.NULL;
-            typeArray = new ArrayType(Type.NULL);
+            typeElement = Type.BOOLEAN;
+            typeArray = new ArrayType(Type.BOOLEAN);
         }
 
         if (retType instanceof AnyArrayType) {
@@ -370,3 +438,4 @@ public class PolymorphicFunctionAnalyzer {
         return null;
     }
 }
+

@@ -43,19 +43,17 @@ import com.starrocks.common.Pair;
 import com.starrocks.load.routineload.LoadDataSourceType;
 import com.starrocks.sql.ast.CreateRoutineLoadStmt;
 import com.starrocks.sql.parser.NodePosition;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 public class RoutineLoadDataSourceProperties implements ParseNode {
-    private static final Logger LOG = LogManager.getLogger(RoutineLoadDataSourceProperties.class);
 
     private static final ImmutableSet<String> CONFIGURABLE_KAFKA_PROPERTIES_SET = new ImmutableSet.Builder<String>()
             .add(CreateRoutineLoadStmt.KAFKA_PARTITIONS_PROPERTY)
             .add(CreateRoutineLoadStmt.KAFKA_OFFSETS_PROPERTY)
+            .add(CreateRoutineLoadStmt.CONFLUENT_SCHEMA_REGISTRY_URL)
             .build();
 
     private static final ImmutableSet<String> CONFIGURABLE_PULSAR_PROPERTIES_SET = new ImmutableSet.Builder<String>()
@@ -77,6 +75,8 @@ public class RoutineLoadDataSourceProperties implements ParseNode {
     private List<Pair<String, Long>> pulsarPartitionInitialPositions = Lists.newArrayList();
     @SerializedName(value = "customPulsarProperties")
     private Map<String, String> customPulsarProperties = Maps.newHashMap();
+    @SerializedName(value = "confluentSchemaRegistryUrl")
+    private String confluentSchemaRegistryUrl;
 
     private final NodePosition pos;
 
@@ -111,6 +111,10 @@ public class RoutineLoadDataSourceProperties implements ParseNode {
 
     public String getType() {
         return type;
+    }
+
+    public String getConfluentSchemaRegistryUrl() {
+        return confluentSchemaRegistryUrl;
     }
 
     public List<Pair<Integer, Long>> getKafkaPartitionOffsets() {
@@ -151,7 +155,7 @@ public class RoutineLoadDataSourceProperties implements ParseNode {
     private void checkKafkaProperties() throws AnalysisException {
         Optional<String> optional = properties.keySet().stream().filter(
                 entity -> !CONFIGURABLE_KAFKA_PROPERTIES_SET.contains(entity)).filter(
-                entity -> !entity.startsWith("property.")).findFirst();
+                entity -> !entity.startsWith("property.") && !entity.startsWith("confluent.")).findFirst();
         if (optional.isPresent()) {
             throw new AnalysisException(optional.get() + " is invalid kafka custom property");
         }
@@ -179,6 +183,10 @@ public class RoutineLoadDataSourceProperties implements ParseNode {
 
         // check custom properties
         CreateRoutineLoadStmt.analyzeKafkaCustomProperties(properties, customKafkaProperties);
+
+        if (properties.containsKey(CreateRoutineLoadStmt.CONFLUENT_SCHEMA_REGISTRY_URL)) {
+            confluentSchemaRegistryUrl = properties.get(CreateRoutineLoadStmt.CONFLUENT_SCHEMA_REGISTRY_URL);
+        }
     }
 
     private void checkPulsarProperties() throws AnalysisException {

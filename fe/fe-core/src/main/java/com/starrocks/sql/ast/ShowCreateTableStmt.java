@@ -52,6 +52,12 @@ public class ShowCreateTableStmt extends ShowStmt {
                     .addColumn(new Column("collation_connection", ScalarType.createVarchar(30)))
                     .build();
 
+    private static final ShowResultSetMetaData CONNECTOR_VIEW_META_DATA =
+            ShowResultSetMetaData.builder()
+                    .addColumn(new Column("View", ScalarType.createVarchar(20)))
+                    .addColumn(new Column("Create View", ScalarType.createVarchar(30)))
+                    .build();
+
     private static final ShowResultSetMetaData MATERIALIZED_VIEW_META_DATA =
             ShowResultSetMetaData.builder()
                     .addColumn(new Column("Materialized View", ScalarType.createVarchar(20)))
@@ -91,10 +97,13 @@ public class ShowCreateTableStmt extends ShowStmt {
         return VIEW_META_DATA;
     }
 
+    public static ShowResultSetMetaData getConnectorViewMetaData() {
+        return CONNECTOR_VIEW_META_DATA;
+    }
+
     public static ShowResultSetMetaData getMaterializedViewMetaData() {
         return MATERIALIZED_VIEW_META_DATA;
     }
-
 
     @Override
     public ShowResultSetMetaData getMetaData() {

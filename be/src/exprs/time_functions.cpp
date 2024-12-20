@@ -14,13 +14,15 @@
 
 #include "exprs/time_functions.h"
 
+#include <algorithm>
 #include <string_view>
+#include <unordered_map>
 
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
 #include "exprs/binary_function.h"
 #include "exprs/unary_function.h"
-#include "gen_cpp/InternalService_constants.h"
+#include "gen_cpp/InternalService_types.h"
 #include "runtime/datetime_value.h"
 #include "runtime/runtime_state.h"
 #include "types/date_value.h"
@@ -171,7 +173,7 @@ StatusOr<ColumnPtr> TimeFunctions::convert_tz_general(FunctionContext* context, 
     auto size = columns[0]->size();
     ColumnBuilder<TYPE_DATETIME> result(size);
     TimezoneHsScan timezone_hsscan;
-    timezone_hsscan.compile();
+    RETURN_IF_ERROR(timezone_hsscan.compile());
     for (int row = 0; row < size; ++row) {
         if (time_viewer.is_null(row) || from_str.is_null(row) || to_str.is_null(row)) {
             result.append_null();
@@ -190,8 +192,8 @@ StatusOr<ColumnPtr> TimeFunctions::convert_tz_general(FunctionContext* context, 
         int64_t timestamp;
         int64_t offset;
         if (TimezoneUtils::timezone_offsets(from_format, to_format, &offset)) {
-            TimestampValue ts = TimestampValue::create(year, month, day, hour, minute, second);
-            ts.from_unix_second(ts.to_unix_second() + offset);
+            TimestampValue ts = TimestampValue::create(year, month, day, hour, minute, second, usec);
+            ts.from_unix_second(ts.to_unix_second() + offset, usec);
             result.append(ts);
             continue;
         }
@@ -204,14 +206,13 @@ StatusOr<ColumnPtr> TimeFunctions::convert_tz_general(FunctionContext* context, 
 
         DateTimeValue ts_value2;
         if (!ts_value2.from_cctz_timezone(timezone_hsscan, to_format, ctz) ||
-            !ts_value2.from_unixtime(timestamp, ctz)) {
+            !ts_value2.from_unixtime(timestamp, ts_value.microsecond(), ctz)) {
             result.append_null();
             continue;
         }
-
         TimestampValue ts;
         ts.from_timestamp(ts_value2.year(), ts_value2.month(), ts_value2.day(), ts_value2.hour(), ts_value2.minute(),
-                          ts_value2.second(), 0);
+                          ts_value2.second(), ts_value2.microsecond());
         result.append(ts);
     }
 
@@ -244,14 +245,13 @@ StatusOr<ColumnPtr> TimeFunctions::convert_tz_const(FunctionContext* context, co
         }
         DateTimeValue ts_value2;
         // TODO find a better approach to replace datetime_value.from_unixtime
-        if (!ts_value2.from_unixtime(timestamp, to)) {
+        if (!ts_value2.from_unixtime(timestamp, ts_value.microsecond(), to)) {
             result.append_null();
             continue;
         }
-
         TimestampValue ts;
         ts.from_timestamp(ts_value2.year(), ts_value2.month(), ts_value2.day(), ts_value2.hour(), ts_value2.minute(),
-                          ts_value2.second(), 0);
+                          ts_value2.second(), ts_value2.microsecond());
         result.append(ts);
     }
 
@@ -298,16 +298,54 @@ StatusOr<ColumnPtr> TimeFunctions::timestamp(FunctionContext* context, const Col
     return columns[0];
 }
 
+static const std::vector<int> NOW_PRECISION_FACTORS = {1000000, 100000, 10000, 1000, 100, 10, 1};
+
 StatusOr<ColumnPtr> TimeFunctions::now(FunctionContext* context, const Columns& columns) {
     starrocks::RuntimeState* state = context->state();
+    int64_t timestamp_us = state->timestamp_us();
     DateTimeValue dtv;
-    if (dtv.from_unixtime(state->timestamp_ms() / 1000, state->timezone_obj())) {
+    if (!dtv.from_unixtime(timestamp_us / 1000000, state->timezone_obj())) {
+        return ColumnHelper::create_const_null_column(1);
+    }
+    if (columns.empty()) {
         TimestampValue ts;
         ts.from_timestamp(dtv.year(), dtv.month(), dtv.day(), dtv.hour(), dtv.minute(), dtv.second(), 0);
         return ColumnHelper::create_const_column<TYPE_DATETIME>(ts, 1);
-    } else {
-        return ColumnHelper::create_const_null_column(1);
     }
+
+    if (context->is_constant_column(1)) {
+        auto col = context->get_constant_column(1);
+        if (col->only_null()) {
+            return Status::InvalidArgument("the precision of now function must between 0 and 6");
+        }
+        int precision = ColumnHelper::get_const_value<TYPE_INT>(col);
+        if (precision < 0 || precision > 6) {
+            return Status::InvalidArgument("the precision of now function must between 0 and 6");
+        }
+        TimestampValue ts;
+        ts.from_timestamp(dtv.year(), dtv.month(), dtv.day(), dtv.hour(), dtv.minute(), dtv.second(),
+                          timestamp_us % 1000000 / NOW_PRECISION_FACTORS[precision] * NOW_PRECISION_FACTORS[precision]);
+        return ColumnHelper::create_const_column<TYPE_DATETIME>(ts, 1);
+    }
+
+    auto size = columns[0]->size();
+    auto precision_viewer = ColumnViewer<TYPE_INT>(columns[0]);
+    ColumnBuilder<TYPE_DATETIME> result(size);
+    for (int row = 0; row < size; row++) {
+        if (precision_viewer.is_null(row)) {
+            return Status::InvalidArgument("the precision of now function must between 0 and 6");
+        }
+        int precision = precision_viewer.value(row);
+        if (precision < 0 || precision > 6) {
+            return Status::InvalidArgument("the precision of now function must between 0 and 6");
+        }
+        int factor = NOW_PRECISION_FACTORS[precision];
+        TimestampValue ts;
+        ts.from_timestamp(dtv.year(), dtv.month(), dtv.day(), dtv.hour(), dtv.minute(), dtv.second(),
+                          timestamp_us % 1000000 / factor * factor);
+        result.append(ts);
+    }
+    return result.build(ColumnHelper::is_all_const(columns));
 }
 
 StatusOr<ColumnPtr> TimeFunctions::curtime(FunctionContext* context, const Columns& columns) {
@@ -471,6 +509,13 @@ DEFINE_UNARY_FN_WITH_IMPL(day_of_weekImpl, v) {
 }
 DEFINE_TIME_UNARY_FN(day_of_week, TYPE_DATETIME, TYPE_INT);
 
+// day_of_week_iso
+DEFINE_UNARY_FN_WITH_IMPL(day_of_week_isoImpl, v) {
+    int day = ((DateValue)v).weekday();
+    return (day + 6) % 7 + 1;
+}
+DEFINE_TIME_UNARY_FN(day_of_week_iso, TYPE_DATETIME, TYPE_INT);
+
 DEFINE_UNARY_FN_WITH_IMPL(time_to_secImpl, v) {
     return static_cast<int64_t>(v);
 }
@@ -509,6 +554,26 @@ DEFINE_UNARY_FN_WITH_IMPL(week_of_yearImpl, v) {
     return day.get_week_of_year();
 }
 DEFINE_TIME_UNARY_FN(week_of_year, TYPE_DATETIME, TYPE_INT);
+
+DEFINE_UNARY_FN_WITH_IMPL(year_week_with_default_modeImpl, t) {
+    auto date_value = (DateValue)t;
+    int year = 0, month = 0, day = 0;
+    date_value.to_date(&year, &month, &day);
+    uint to_year = 0;
+    int week = TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(0 | 2), &to_year);
+    return to_year * 100 + week;
+}
+DEFINE_TIME_UNARY_FN(year_week_with_default_mode, TYPE_DATETIME, TYPE_INT);
+
+DEFINE_BINARY_FUNCTION_WITH_IMPL(year_week_with_modeImpl, t, m) {
+    auto date_value = (DateValue)t;
+    int year = 0, month = 0, day = 0;
+    date_value.to_date(&year, &month, &day);
+    uint to_year = 0;
+    int week = TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(m | 2), &to_year);
+    return to_year * 100 + week;
+}
+DEFINE_TIME_BINARY_FN(year_week_with_mode, TYPE_DATETIME, TYPE_INT, TYPE_INT);
 
 uint TimeFunctions::week_mode(uint mode) {
     uint week_format = (mode & 7);
@@ -564,7 +629,7 @@ long TimeFunctions::compute_daynr(uint year, uint month, uint day) {
     return (delsum + static_cast<int>(y) / 4 - temp);
 }
 
-int32_t TimeFunctions::compute_week(uint year, uint month, uint day, uint week_behaviour) {
+int32_t TimeFunctions::compute_week(uint year, uint month, uint day, uint week_behaviour, uint* to_year) {
     uint days;
     ulong daynr = TimeFunctions::compute_daynr((uint)year, (uint)month, (uint)day);
     ulong first_daynr = TimeFunctions::compute_daynr((uint)year, 1, 1);
@@ -574,13 +639,14 @@ int32_t TimeFunctions::compute_week(uint year, uint month, uint day, uint week_b
 
     uint weekday = TimeFunctions::compute_weekday(first_daynr, !monday_first);
     uint year_local = year;
-
+    *to_year = year;
     if (month == 1 && day <= 7 - weekday) {
         if (!week_year && ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4))) {
             return 0;
         }
         week_year = true;
         year_local--;
+        (*to_year)--;
         first_daynr -= (days = TimeFunctions::compute_days_in_year(year_local));
         weekday = (weekday + 53 * 7 - days) % 7;
     }
@@ -595,6 +661,7 @@ int32_t TimeFunctions::compute_week(uint year, uint month, uint day, uint week_b
         weekday = (weekday + TimeFunctions::compute_days_in_year(year_local)) % 7;
         if ((!first_weekday && weekday < 4) || (first_weekday && weekday == 0)) {
             year_local++;
+            (*to_year)++;
             return 1;
         }
     }
@@ -605,17 +672,27 @@ DEFINE_UNARY_FN_WITH_IMPL(week_of_year_with_default_modeImpl, t) {
     auto date_value = (DateValue)t;
     int year = 0, month = 0, day = 0;
     date_value.to_date(&year, &month, &day);
-
-    return TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(0));
+    uint to_year = 0;
+    return TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(0), &to_year);
 }
 DEFINE_TIME_UNARY_FN(week_of_year_with_default_mode, TYPE_DATETIME, TYPE_INT);
+
+DEFINE_UNARY_FN_WITH_IMPL(week_of_year_isoImpl, t) {
+    auto date_value = (DateValue)t;
+    int year = 0, month = 0, day = 0;
+    date_value.to_date(&year, &month, &day);
+    uint to_year = 0;
+    return TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(3), &to_year);
+}
+
+DEFINE_TIME_UNARY_FN(week_of_year_iso, TYPE_DATETIME, TYPE_INT);
 
 DEFINE_BINARY_FUNCTION_WITH_IMPL(week_of_year_with_modeImpl, t, m) {
     auto date_value = (DateValue)t;
     int year = 0, month = 0, day = 0;
     date_value.to_date(&year, &month, &day);
-
-    return TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(m));
+    uint to_year = 0;
+    return TimeFunctions::compute_week(year, month, day, TimeFunctions::week_mode(m), &to_year);
 }
 DEFINE_TIME_BINARY_FN(week_of_year_with_mode, TYPE_DATETIME, TYPE_INT, TYPE_INT);
 
@@ -624,6 +701,134 @@ DEFINE_UNARY_FN_WITH_IMPL(to_dateImpl, v) {
     return (DateValue)v;
 }
 DEFINE_TIME_UNARY_FN(to_date, TYPE_DATETIME, TYPE_DATE);
+
+struct TeradataFormatState {
+    std::unique_ptr<TeradataFormat> formatter;
+};
+
+// to_tera_date
+Status TimeFunctions::to_tera_date_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    if (!context->is_notnull_constant_column(1)) {
+        return Status::NotSupported("The 2rd argument must be literal");
+    }
+    auto* state = new TeradataFormatState();
+    context->set_function_state(scope, state);
+    state->formatter = std::make_unique<TeradataFormat>();
+    auto format_col = context->get_constant_column(1);
+    auto format_str = ColumnHelper::get_const_value<TYPE_VARCHAR>(format_col);
+    if (!state->formatter->prepare(format_str)) {
+        return Status::NotSupported(fmt::format("The format parameter {} is invalid", format_str));
+    }
+    return Status::OK();
+}
+
+Status TimeFunctions::to_tera_date_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        auto* state = reinterpret_cast<TeradataFormatState*>(context->get_function_state(scope));
+        delete state;
+    }
+    return Status::OK();
+}
+
+StatusOr<ColumnPtr> TimeFunctions::to_tera_date(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    size_t size = columns[0]->size(); // minimum number of rows.
+    ColumnBuilder<TYPE_DATE> result(size);
+    auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
+
+    auto state = reinterpret_cast<TeradataFormatState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (!state->formatter) {
+        return Status::InvalidArgument("invalid date format");
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        if (str_viewer.is_null(i)) {
+            result.append_null();
+        } else {
+            std::string_view str(str_viewer.value(i));
+
+            DateTimeValue date_time_value;
+            if (!state->formatter->parse(str, &date_time_value)) {
+                result.append_null();
+            } else {
+                TimestampValue ts = TimestampValue::create(
+                        date_time_value.year(), date_time_value.month(), date_time_value.day(), date_time_value.hour(),
+                        date_time_value.minute(), date_time_value.second(), date_time_value.microsecond());
+                result.append((DateValue)ts);
+            }
+        }
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+// to_tera_timestamp
+Status TimeFunctions::to_tera_timestamp_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    if (!context->is_notnull_constant_column(1)) {
+        return Status::NotSupported("The 2rd argument must be literal");
+    }
+    auto* state = new TeradataFormatState();
+    context->set_function_state(scope, state);
+    state->formatter = std::make_unique<TeradataFormat>();
+    auto format_col = context->get_constant_column(1);
+    auto format_str = ColumnHelper::get_const_value<TYPE_VARCHAR>(format_col);
+    if (!state->formatter->prepare(format_str)) {
+        return Status::NotSupported(fmt::format("The format parameter {} is invalid", format_str));
+    }
+    return Status::OK();
+}
+
+// to_tera_timestamp
+Status TimeFunctions::to_tera_timestamp_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        auto* state = reinterpret_cast<TeradataFormatState*>(context->get_function_state(scope));
+        delete state;
+    }
+    return Status::OK();
+}
+
+// to_tera_timestamp
+StatusOr<ColumnPtr> TimeFunctions::to_tera_timestamp(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    size_t size = columns[0]->size(); // minimum number of rows.
+    ColumnBuilder<TYPE_DATETIME> result(size);
+    auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
+
+    auto state = reinterpret_cast<TeradataFormatState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (!state->formatter) {
+        return Status::InvalidArgument("invalid datetime format");
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        if (str_viewer.is_null(i)) {
+            result.append_null();
+        } else {
+            std::string_view str(str_viewer.value(i));
+
+            DateTimeValue date_time_value;
+            if (!state->formatter->parse(str, &date_time_value)) {
+                result.append_null();
+            } else {
+                TimestampValue ts = TimestampValue::create(
+                        date_time_value.year(), date_time_value.month(), date_time_value.day(), date_time_value.hour(),
+                        date_time_value.minute(), date_time_value.second(), date_time_value.microsecond());
+                result.append(ts);
+            }
+        }
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
 
 template <TimeUnit UNIT>
 TimestampValue timestamp_add(TimestampValue tsv, int count) {
@@ -647,6 +852,10 @@ TimestampValue timestamp_add(TimestampValue tsv, int count) {
 // years_add
 // years_sub
 DEFINE_TIME_ADD_AND_SUB_FN(years, TimeUnit::YEAR);
+
+// quarters_add
+// quarters_sub
+DEFINE_TIME_ADD_AND_SUB_FN(quarters, TimeUnit::QUARTER);
 
 // months_add
 // months_sub
@@ -672,6 +881,10 @@ DEFINE_TIME_ADD_AND_SUB_FN(minutes, TimeUnit::MINUTE);
 // seconds_sub
 DEFINE_TIME_ADD_AND_SUB_FN(seconds, TimeUnit::SECOND);
 
+// millis_add
+// millis_sub
+DEFINE_TIME_ADD_AND_SUB_FN(millis, TimeUnit::MILLISECOND);
+
 // micros_add
 // micros_sub
 DEFINE_TIME_ADD_AND_SUB_FN(micros, TimeUnit::MICROSECOND);
@@ -689,16 +902,25 @@ Status TimeFunctions::time_slice_prepare(FunctionContext* context, FunctionConte
     Slice format_slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column_format);
     auto period_unit = format_slice.to_string();
 
-    ColumnPtr column_time_base = context->get_constant_column(3);
-    Slice time_base_slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column_time_base);
-    auto time_base = time_base_slice.to_string();
+    std::string time_base;
+    if (UNLIKELY(context->get_num_constant_columns() == 3)) {
+        time_base = "floor";
+    } else {
+        ColumnPtr column_time_base = context->get_constant_column(3);
+        Slice time_base_slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column_time_base);
+        time_base = time_base_slice.to_string();
+    }
 
     ScalarFunction function;
     const FunctionContext::TypeDesc* boundary = context->get_arg_type(0);
     if (boundary->type == LogicalType::TYPE_DATETIME) {
         // floor specify START as the result time.
         if (time_base == "floor") {
-            if (period_unit == "second") {
+            if (period_unit == "microsecond") {
+                function = &TimeFunctions::time_slice_datetime_start_microsecond;
+            } else if (period_unit == "millisecond") {
+                function = &TimeFunctions::time_slice_datetime_start_millisecond;
+            } else if (period_unit == "second") {
                 function = &TimeFunctions::time_slice_datetime_start_second;
             } else if (period_unit == "minute") {
                 function = &TimeFunctions::time_slice_datetime_start_minute;
@@ -716,12 +938,17 @@ Status TimeFunctions::time_slice_prepare(FunctionContext* context, FunctionConte
                 function = &TimeFunctions::time_slice_datetime_start_quarter;
             } else {
                 return Status::InternalError(
-                        "period unit must in {second, minute, hour, day, month, year, week, quarter}");
+                        "period unit must in {microsecond, millisecond, second, minute, hour, day, month, year, week, "
+                        "quarter}");
             }
         } else {
             // ceil specify END as the result time.
             DCHECK_EQ(time_base, "ceil");
-            if (period_unit == "second") {
+            if (period_unit == "microsecond") {
+                function = &TimeFunctions::time_slice_datetime_end_microsecond;
+            } else if (period_unit == "millisecond") {
+                function = &TimeFunctions::time_slice_datetime_end_millisecond;
+            } else if (period_unit == "second") {
                 function = &TimeFunctions::time_slice_datetime_end_second;
             } else if (period_unit == "minute") {
                 function = &TimeFunctions::time_slice_datetime_end_minute;
@@ -739,7 +966,8 @@ Status TimeFunctions::time_slice_prepare(FunctionContext* context, FunctionConte
                 function = &TimeFunctions::time_slice_datetime_end_quarter;
             } else {
                 return Status::InternalError(
-                        "period unit must in {second, minute, hour, day, month, year, week, quarter}");
+                        "period unit must in {microsecond, millisecond, second, minute, hour, day, month, year, week, "
+                        "quarter}");
             }
         }
     } else {
@@ -824,6 +1052,12 @@ Status TimeFunctions::time_slice_prepare(FunctionContext* context, FunctionConte
     DEFINE_TIME_SLICE_FN_CALL(date, UNIT, TYPE_DATE, TYPE_INT, TYPE_DATE);
 
 // time_slice_to_second
+DEFINE_TIME_SLICE_FN(microsecond);
+
+// time_slice_to_second
+DEFINE_TIME_SLICE_FN(millisecond);
+
+// time_slice_to_second
 DEFINE_TIME_SLICE_FN(second);
 
 // time_slice_to_minute
@@ -865,41 +1099,103 @@ Status TimeFunctions::time_slice_close(FunctionContext* context, FunctionContext
 
 // years_diff
 DEFINE_BINARY_FUNCTION_WITH_IMPL(years_diffImpl, l, r) {
-    int year1, month1, day1, hour1, mintue1, second1, usec1;
-    int year2, month2, day2, hour2, mintue2, second2, usec2;
-    l.to_timestamp(&year1, &month1, &day1, &hour1, &mintue1, &second1, &usec1);
-    r.to_timestamp(&year2, &month2, &day2, &hour2, &mintue2, &second2, &usec2);
+    int year1, month1, day1, hour1, minute1, second1, usec1;
+    int year2, month2, day2, hour2, minute2, second2, usec2;
+    l.to_timestamp(&year1, &month1, &day1, &hour1, &minute1, &second1, &usec1);
+    r.to_timestamp(&year2, &month2, &day2, &hour2, &minute2, &second2, &usec2);
 
     int year = (year1 - year2);
 
-    if (year >= 0) {
-        year -= ((month1 * 100 + day1) * 1000000L + (hour1 * 10000 + mintue1 * 100 + second1) <
-                 (month2 * 100 + day2) * 1000000L + (hour2 * 10000 + mintue2 * 100 + second2));
-    } else {
-        year += ((month1 * 100 + day1) * 1000000L + (hour1 * 10000 + mintue1 * 100 + second1) >
-                 (month2 * 100 + day2) * 1000000L + (hour2 * 10000 + mintue2 * 100 + second2));
-    }
+    const auto func = [](int month, int day, int hour, int minute, int second, int usec) -> int64_t {
+        return int64_t(month) * 100'000'000'000'000LL + day * 1'000'000'000'000LL + hour * 10'000'000'000LL +
+               minute * 100'000'000LL + second * 1'000'000LL + usec;
+    };
 
+    if (year >= 0) {
+        year -= (func(month1, day1, hour1, minute1, second1, usec1) <
+                 func(month2, day2, hour2, minute2, second2, usec2));
+    } else {
+        year += (func(month1, day1, hour1, minute1, second1, usec1) >
+                 func(month2, day2, hour2, minute2, second2, usec2));
+    }
     return year;
 }
 
 DEFINE_TIME_BINARY_FN(years_diff, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
 
+// years_diff_v2
+DEFINE_BINARY_FUNCTION_WITH_IMPL(years_diff_v2Impl, to_timestamp, from_timestamp) {
+    int8_t sign = from_timestamp < to_timestamp ? 1 : -1;
+
+    int year1, month1, day1, hour1, minute1, second1, usec1;
+    std::min(from_timestamp, to_timestamp).to_timestamp(&year1, &month1, &day1, &hour1, &minute1, &second1, &usec1);
+    int64_t us_of_day1 = 1LL * hour1 * 3600000 + minute1 * 60000 + second1 * 1000 + usec1;
+    int32_t last_day_of_month1 = DAYS_IN_MONTH[date::is_leap(year1)][month1];
+
+    int year2, month2, day2, hour2, minute2, second2, usec2;
+    std::max(from_timestamp, to_timestamp).to_timestamp(&year2, &month2, &day2, &hour2, &minute2, &second2, &usec2);
+    int64_t us_of_day2 = 1LL * hour2 * 3600000 + minute2 * 60000 + second2 * 1000 + usec2;
+    int32_t last_day_of_month2 = DAYS_IN_MONTH[date::is_leap(year2)][month2];
+
+    int64_t diff = year2 - year1;
+
+    // too many special cases, need handle it carefully
+    // @TODO(silverbullet233): how to simplify so many if-else
+    if (month1 > month2) {
+        diff--;
+    } else if (month1 == month2) {
+        if (last_day_of_month1 != last_day_of_month2) {
+            DCHECK_EQ(month1, 2);
+            // The number of days in Feb is different in normal years and leap years,
+            // and requires special handling
+            if (day1 > day2) {
+                if (day2 != last_day_of_month2) {
+                    diff--;
+                } else {
+                    if (day1 == last_day_of_month1 && us_of_day1 > us_of_day2) {
+                        // date_diff('year', '2017-02-28', '2016-02-29 00:00:00.01') should return 0
+                        diff--;
+                    }
+                    // date_diff('year', '2017-02-28', '2016-02-29') should return 1
+                }
+            } else if (day1 == day2) {
+                if (day2 != last_day_of_month2) {
+                    if (us_of_day1 > us_of_day2) {
+                        // date_diff('year', '2016-02-28', '2015-02-28 00:00:00.01') should return 0
+                        diff--;
+                    }
+                    // date_diff('year', '2016-02-28', '2015-02-28') should return 1
+                }
+            }
+        } else {
+            if ((day1 > day2) || (day1 == day2 && us_of_day1 > us_of_day2)) {
+                diff--;
+            }
+        }
+    }
+
+    return diff * sign;
+}
+
+DEFINE_TIME_BINARY_FN(years_diff_v2, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
+
 // months_diff
 DEFINE_BINARY_FUNCTION_WITH_IMPL(months_diffImpl, l, r) {
-    int year1, month1, day1, hour1, mintue1, second1, usec1;
-    int year2, month2, day2, hour2, mintue2, second2, usec2;
-    l.to_timestamp(&year1, &month1, &day1, &hour1, &mintue1, &second1, &usec1);
-    r.to_timestamp(&year2, &month2, &day2, &hour2, &mintue2, &second2, &usec2);
+    int year1, month1, day1, hour1, minute1, second1, usec1;
+    int year2, month2, day2, hour2, minute2, second2, usec2;
+    l.to_timestamp(&year1, &month1, &day1, &hour1, &minute1, &second1, &usec1);
+    r.to_timestamp(&year2, &month2, &day2, &hour2, &minute2, &second2, &usec2);
 
     int month = (year1 - year2) * 12 + (month1 - month2);
+    const auto func = [](int day, int hour, int minute, int second, int usec) -> int64_t {
+        return int64_t(day) * 1'000'000'000'000LL + hour * 10'000'000'000LL + minute * 100'000'000LL +
+               second * 1'000'000LL + usec;
+    };
 
     if (month >= 0) {
-        month -= (day1 * 1000000L + (hour1 * 10000 + mintue1 * 100 + second1) <
-                  day2 * 1000000L + (hour2 * 10000 + mintue2 * 100 + second2));
+        month -= (func(day1, hour1, minute1, second1, usec1) < func(day2, hour2, minute2, second2, usec2));
     } else {
-        month += (day1 * 1000000L + (hour1 * 10000 + mintue1 * 100 + second1) >
-                  day2 * 1000000L + (hour2 * 10000 + mintue2 * 100 + second2));
+        month += (func(day1, hour1, minute1, second1, usec1) > func(day2, hour2, minute2, second2, usec2));
     }
 
     return month;
@@ -907,12 +1203,77 @@ DEFINE_BINARY_FUNCTION_WITH_IMPL(months_diffImpl, l, r) {
 
 DEFINE_TIME_BINARY_FN(months_diff, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
 
+// months_diff_v2
+DEFINE_BINARY_FUNCTION_WITH_IMPL(months_diff_v2Impl, to_timestamp, from_timestamp) {
+    int8_t sign = from_timestamp < to_timestamp ? 1 : -1;
+
+    int year1, month1, day1, hour1, mintue1, second1, usec1;
+    std::min(from_timestamp, to_timestamp).to_timestamp(&year1, &month1, &day1, &hour1, &mintue1, &second1, &usec1);
+    int64_t us_of_day1 = 1LL * hour1 * 3600000 + mintue1 * 60000 + second1 * 1000 + usec1;
+    int32_t last_day_of_month1 = DAYS_IN_MONTH[date::is_leap(year1)][month1];
+
+    int year2, month2, day2, hour2, mintue2, second2, usec2;
+    std::max(from_timestamp, to_timestamp).to_timestamp(&year2, &month2, &day2, &hour2, &mintue2, &second2, &usec2);
+    int64_t us_of_day2 = 1LL * hour2 * 3600000 + mintue2 * 60000 + second2 * 1000 + usec2;
+
+    int32_t last_day_of_month2 = DAYS_IN_MONTH[date::is_leap(year2)][month2];
+
+    int64_t diff = (year2 - year1) * 12 + (month2 - month1);
+
+    // too many special cases, need handle it carefully
+    // @TODO(silverbullet233): how to simplify so many if-else
+    if (day1 > day2) {
+        if (day2 != last_day_of_month2) {
+            // the most common cases
+            diff--;
+        } else {
+            if (day1 == last_day_of_month1 && us_of_day1 > us_of_day2) {
+                // both are the last day of their respective month
+                // date_diff('month', '2017-02-28', '2016-02-29 00:00:00.01') should return 11
+                diff--;
+            }
+            // other cases
+            // date_diff('month', '2017-02-28', '2016-02-29') should return 12
+            // date_diff('month', '2017-02-28', '2016-02-28 00:00:00.01') should return 12
+        }
+    } else if (day1 == day2) {
+        if (day2 == last_day_of_month2) {
+            if (day1 == last_day_of_month1) {
+                // both are the last day of their respective month
+                if (us_of_day1 > us_of_day2) {
+                    // date_diff('month', '2016-06-30', '2016-04-30 00:00:00.01') should return 1
+                    diff--;
+                }
+                // date_diff('month', '2016-06-30', '2016-04-30') should return 2
+            }
+            // date_diff('month', '2017-02-28', '2016-02-28') should return 12
+            // date_diff('month', '2016-06-30', '2016-05-30 00:00:00.01') should return 1
+            // date_diff('month', '2016-02-29', '2016-01-29 00:00:00.01') should return 1
+        } else {
+            if (us_of_day1 > us_of_day2) {
+                // date_diff('month', '2016-02-28', '2016-01-28 00:00:00.01') should return 0
+                diff--;
+            }
+            // date_diff('month', '2016-02-28', '2016-01-28') should return 1
+        }
+    }
+
+    return sign * diff;
+}
+
+DEFINE_TIME_BINARY_FN(months_diff_v2, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
+
 // quarters_diff
 DEFINE_BINARY_FUNCTION_WITH_IMPL(quarters_diffImpl, l, r) {
     auto diff = months_diffImpl::apply<LType, RType, ResultType>(l, r);
     return diff / 3;
 }
 DEFINE_TIME_BINARY_FN(quarters_diff, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
+
+DEFINE_BINARY_FUNCTION_WITH_IMPL(quarters_diff_v2Impl, l, r) {
+    return months_diff_v2Impl::apply<LType, RType, ResultType>(l, r) / 3;
+}
+DEFINE_TIME_BINARY_FN(quarters_diff_v2, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
 
 // weeks_diff
 DEFINE_BINARY_FUNCTION_WITH_IMPL(weeks_diffImpl, l, r) {
@@ -956,6 +1317,12 @@ DEFINE_BINARY_FUNCTION_WITH_IMPL(seconds_diffImpl, l, r) {
 }
 DEFINE_TIME_BINARY_FN(seconds_diff, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
 
+// milliseconds_diff
+DEFINE_BINARY_FUNCTION_WITH_IMPL(milliseconds_diffImpl, l, r) {
+    return l.diff_microsecond(r) / USECS_PER_MILLIS;
+}
+DEFINE_TIME_BINARY_FN(milliseconds_diff, TYPE_DATETIME, TYPE_DATETIME, TYPE_BIGINT);
+
 /*
  * definition for to_unix operators(SQL TYPE: DATETIME)
  */
@@ -992,13 +1359,12 @@ StatusOr<ColumnPtr> TimeFunctions::_t_to_unix_from_datetime(FunctionContext* con
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime(FunctionContext* context, const Columns& columns) {
-    int func_version = context->state()->func_version();
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        return _t_to_unix_from_datetime<TYPE_BIGINT>(context, columns);
-    } else {
-        return _t_to_unix_from_datetime<TYPE_INT>(context, columns);
-    }
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime_64(FunctionContext* context, const Columns& columns) {
+    return _t_to_unix_from_datetime<TYPE_BIGINT>(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime_32(FunctionContext* context, const Columns& columns) {
+    return _t_to_unix_from_datetime<TYPE_INT>(context, columns);
 }
 
 /*
@@ -1037,13 +1403,11 @@ StatusOr<ColumnPtr> TimeFunctions::_t_to_unix_from_date(FunctionContext* context
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-StatusOr<ColumnPtr> TimeFunctions::to_unix_from_date(FunctionContext* context, const Columns& columns) {
-    int func_version = context->state()->func_version();
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        return _t_to_unix_from_date<TYPE_BIGINT>(context, columns);
-    } else {
-        return _t_to_unix_from_date<TYPE_INT>(context, columns);
-    }
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_date_64(FunctionContext* context, const Columns& columns) {
+    return _t_to_unix_from_date<TYPE_BIGINT>(context, columns);
+}
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_date_32(FunctionContext* context, const Columns& columns) {
+    return _t_to_unix_from_date<TYPE_INT>(context, columns);
 }
 
 template <LogicalType TIMESTAMP_TYPE>
@@ -1088,28 +1452,30 @@ StatusOr<ColumnPtr> TimeFunctions::_t_to_unix_from_datetime_with_format(Function
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime_with_format(FunctionContext* context, const Columns& columns) {
-    int func_version = context->state()->func_version();
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        return _t_to_unix_from_datetime_with_format<TYPE_BIGINT>(context, columns);
-    } else {
-        return _t_to_unix_from_datetime_with_format<TYPE_INT>(context, columns);
-    }
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime_with_format_64(FunctionContext* context,
+                                                                        const Columns& columns) {
+    return _t_to_unix_from_datetime_with_format<TYPE_BIGINT>(context, columns);
 }
 
-StatusOr<ColumnPtr> TimeFunctions::to_unix_for_now(FunctionContext* context, const Columns& columns) {
-    int func_version = context->state()->func_version();
+StatusOr<ColumnPtr> TimeFunctions::to_unix_from_datetime_with_format_32(FunctionContext* context,
+                                                                        const Columns& columns) {
+    return _t_to_unix_from_datetime_with_format<TYPE_INT>(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::to_unix_for_now_64(FunctionContext* context, const Columns& columns) {
     DCHECK_EQ(columns.size(), 0);
     int64_t value = context->state()->timestamp_ms() / 1000;
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        auto result = Int64Column::create();
-        result->append(value);
-        return ConstColumn::create(result, 1);
-    } else {
-        auto result = Int32Column::create();
-        result->append(value);
-        return ConstColumn::create(result, 1);
-    }
+    auto result = Int64Column::create();
+    result->append(value);
+    return ConstColumn::create(result, 1);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::to_unix_for_now_32(FunctionContext* context, const Columns& columns) {
+    DCHECK_EQ(columns.size(), 0);
+    int64_t value = context->state()->timestamp_ms() / 1000;
+    auto result = Int32Column::create();
+    result->append(value);
+    return ConstColumn::create(result, 1);
 }
 
 /*
@@ -1154,13 +1520,51 @@ StatusOr<ColumnPtr> TimeFunctions::_t_from_unix_to_datetime(FunctionContext* con
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime(FunctionContext* context, const Columns& columns) {
-    int func_version = context->state()->func_version();
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        return _t_from_unix_to_datetime<TYPE_BIGINT>(context, columns);
-    } else {
-        return _t_from_unix_to_datetime<TYPE_INT>(context, columns);
+template <LogicalType TIMESTAMP_TYPE>
+StatusOr<ColumnPtr> TimeFunctions::_t_from_unix_to_datetime_ms(FunctionContext* context, const Columns& columns) {
+    DCHECK_EQ(columns.size(), 1);
+
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    ColumnViewer<TIMESTAMP_TYPE> data_column(columns[0]);
+
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (data_column.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+
+        auto date = data_column.value(row) / 1000;
+        if (date < 0 || date > MAX_UNIX_TIMESTAMP) {
+            result.append_null();
+            continue;
+        }
+
+        DateTimeValue dtv;
+        if (!dtv.from_unixtime(date, context->state()->timezone_obj())) {
+            result.append_null();
+            continue;
+        }
+        char buf[64];
+        dtv.to_string(buf);
+        result.append(Slice(buf));
     }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_64(FunctionContext* context, const Columns& columns) {
+    return _t_from_unix_to_datetime<TYPE_BIGINT>(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_32(FunctionContext* context, const Columns& columns) {
+    return _t_from_unix_to_datetime<TYPE_INT>(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_ms_64(FunctionContext* context, const Columns& columns) {
+    return _t_from_unix_to_datetime_ms<TYPE_BIGINT>(context, columns);
 }
 
 std::string TimeFunctions::convert_format(const Slice& format) {
@@ -1310,26 +1714,25 @@ StatusOr<ColumnPtr> TimeFunctions::_t_from_unix_with_format_const(std::string& f
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
-StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_with_format(FunctionContext* context,
-                                                                     const starrocks::Columns& columns) {
+template <LogicalType TIMESTAMP_TYPE>
+StatusOr<ColumnPtr> TimeFunctions::_t_from_unix_with_format(FunctionContext* context,
+                                                            const starrocks::Columns& columns) {
     DCHECK_EQ(columns.size(), 2);
-    int func_version = context->state()->func_version();
     auto* state = reinterpret_cast<FromUnixState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
-
     if (state->const_format) {
         std::string format_content = state->format_content;
-        if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-            return _t_from_unix_with_format_const<TYPE_BIGINT>(format_content, context, columns);
-        } else {
-            return _t_from_unix_with_format_const<TYPE_INT>(format_content, context, columns);
-        }
+        return _t_from_unix_with_format_const<TIMESTAMP_TYPE>(format_content, context, columns);
     }
+    return _t_from_unix_with_format_general<TIMESTAMP_TYPE>(context, columns);
+}
 
-    if (func_version >= TFunctionVersion::type::FUNC_VERSION_UNIX_TIMESTAMP_INT64) {
-        return _t_from_unix_with_format_general<TYPE_BIGINT>(context, columns);
-    } else {
-        return _t_from_unix_with_format_general<TYPE_INT>(context, columns);
-    }
+StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_with_format_64(FunctionContext* context,
+                                                                        const starrocks::Columns& columns) {
+    return _t_from_unix_with_format<TYPE_BIGINT>(context, columns);
+}
+StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_with_format_32(FunctionContext* context,
+                                                                        const starrocks::Columns& columns) {
+    return _t_from_unix_with_format<TYPE_INT>(context, columns);
 }
 
 /*
@@ -1338,7 +1741,7 @@ StatusOr<ColumnPtr> TimeFunctions::from_unix_to_datetime_with_format(FunctionCon
 
 // from_days
 DEFINE_UNARY_FN_WITH_IMPL(from_daysImpl, v) {
-    //return 00-00-00 if the argument is negative or too large, according to MySQL
+    // return 00-00-00 if the argument is negative or too large, according to MySQL
     DateValue dv{date::BC_EPOCH_JULIAN + v};
     if (!dv.is_valid()) {
         return DateValue{date::ZERO_EPOCH_JULIAN};
@@ -1437,6 +1840,7 @@ Status TimeFunctions::str_to_date_prepare(FunctionContext* context, FunctionCont
 // try to transfer content to date format based on "%Y-%m-%d",
 // if successful, return result TimestampValue
 // else take a uncommon approach to process this content.
+template <bool isYYYYMMDD>
 StatusOr<ColumnPtr> TimeFunctions::str_to_date_from_date_format(FunctionContext* context,
                                                                 const starrocks::Columns& columns,
                                                                 const char* str_format) {
@@ -1446,72 +1850,18 @@ StatusOr<ColumnPtr> TimeFunctions::str_to_date_from_date_format(FunctionContext*
     TimestampValue ts;
     auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     auto fmt_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
-    if (!columns[0]->has_null()) {
-        for (size_t i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; ++i) {
+        if (str_viewer.is_null(i)) {
+            result.append_null();
+        } else {
             const Slice& str = str_viewer.value(i);
-            bool r = ts.from_date_format_str(str.get_data(), str.get_size(), str_format);
+            bool r = isYYYYMMDD ? ts.from_date_format_str(str.get_data(), str.get_size(), str_format)
+                                : ts.from_datetime_format_str(str.get_data(), str.get_size(), str_format);
             if (r) {
                 result.append(ts);
             } else {
                 const Slice& fmt = fmt_viewer.value(i);
                 str_to_date_internal(&ts, fmt, str, &result);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < size; ++i) {
-            if (str_viewer.is_null(i)) {
-                result.append_null();
-            } else {
-                const Slice& str = str_viewer.value(i);
-                bool r = ts.from_date_format_str(str.get_data(), str.get_size(), str_format);
-                if (r) {
-                    result.append(ts);
-                } else {
-                    const Slice& fmt = fmt_viewer.value(i);
-                    str_to_date_internal(&ts, fmt, str, &result);
-                }
-            }
-        }
-    }
-    return result.build(ColumnHelper::is_all_const(columns));
-}
-
-// try to transfer content to date format based on "%Y-%m-%d %H:%i:%s",
-// if successful, return result TimestampValue
-// else take a uncommon approach to process this content.
-StatusOr<ColumnPtr> TimeFunctions::str_to_date_from_datetime_format(FunctionContext* context,
-                                                                    const starrocks::Columns& columns,
-                                                                    const char* str_format) {
-    size_t size = columns[0]->size();
-    ColumnBuilder<TYPE_DATETIME> result(size);
-
-    TimestampValue ts;
-    auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
-    auto fmt_viewer = ColumnViewer<TYPE_VARCHAR>(columns[1]);
-    if (!columns[0]->has_null()) {
-        for (size_t i = 0; i < size; ++i) {
-            const Slice& str = str_viewer.value(i);
-            bool r = ts.from_datetime_format_str(str.get_data(), str.get_size(), str_format);
-            if (r) {
-                result.append(ts);
-            } else {
-                const Slice& fmt = fmt_viewer.value(i);
-                str_to_date_internal(&ts, fmt, str, &result);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < size; ++i) {
-            if (str_viewer.is_null(i)) {
-                result.append_null();
-            } else {
-                const Slice& str = str_viewer.value(i);
-                bool r = ts.from_datetime_format_str(str.get_data(), str.get_size(), str_format);
-                if (r) {
-                    result.append(ts);
-                } else {
-                    const Slice& fmt = fmt_viewer.value(i);
-                    str_to_date_internal(&ts, fmt, str, &result);
-                }
             }
         }
     }
@@ -1552,15 +1902,82 @@ StatusOr<ColumnPtr> TimeFunctions::str_to_date_uncommon(FunctionContext* context
     return result.build(ColumnHelper::is_all_const(columns));
 }
 
+Status TimeFunctions::ParseJodaState::prepare(std::string_view format_str) {
+    joda = std::make_unique<joda::JodaFormat>();
+    if (!joda->prepare(format_str)) {
+        return Status::InvalidArgument(fmt::format("invalid datetime format: {}", format_str));
+    }
+    return {};
+}
+
+Status TimeFunctions::parse_joda_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    if (!context->is_notnull_constant_column(1)) {
+        return Status::NotSupported("The 2rd argument must be literal");
+    }
+    std::string_view format_str = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
+    auto state = std::make_unique<ParseJodaState>();
+    RETURN_IF_ERROR(state->prepare(format_str));
+    context->set_function_state(scope, state.release());
+
+    return Status::OK();
+}
+
+Status TimeFunctions::parse_joda_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    auto* fc = reinterpret_cast<ParseJodaState*>(context->get_function_state(scope));
+    if (fc) delete fc;
+    return {};
+}
+
+StatusOr<ColumnPtr> TimeFunctions::parse_jodatime(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    size_t size = columns[0]->size(); // minimum number of rows.
+    ColumnBuilder<TYPE_DATETIME> result(size);
+    auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
+
+    auto state = reinterpret_cast<ParseJodaState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    auto& formatter = state->joda;
+    RETURN_IF(!formatter, Status::InternalError("unprepared"));
+
+    for (size_t i = 0; i < size; ++i) {
+        if (str_viewer.is_null(i)) {
+            result.append_null();
+        } else {
+            std::string_view str(str_viewer.value(i));
+
+            DateTimeValue date_time_value;
+            if (!formatter->parse(str, &date_time_value)) {
+                if (context->state() && context->state()->get_sql_dialect() == "trino") {
+                    std::string_view format_str =
+                            ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
+                    return Status::InvalidArgument(fmt::format("Invalid format '{}' for '{}'", format_str, str));
+                }
+                result.append_null();
+            } else {
+                TimestampValue ts = TimestampValue::create(
+                        date_time_value.year(), date_time_value.month(), date_time_value.day(), date_time_value.hour(),
+                        date_time_value.minute(), date_time_value.second(), date_time_value.microsecond());
+                result.append(ts);
+            }
+        }
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
 // str_to_date, for the "str_to_date" in sql.
 StatusOr<ColumnPtr> TimeFunctions::str_to_date(FunctionContext* context, const Columns& columns) {
     auto* ctx = reinterpret_cast<StrToDateCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
     if (ctx == nullptr) {
         return str_to_date_uncommon(context, columns);
     } else if (ctx->fmt_type == yyyycMMcdd) { // for string format like "%Y-%m-%d"
-        return str_to_date_from_date_format(context, columns, ctx->fmt);
+        return str_to_date_from_date_format<true>(context, columns, ctx->fmt);
     } else { // for string format like "%Y-%m-%d %H:%i:%s"
-        return str_to_date_from_datetime_format(context, columns, ctx->fmt);
+        return str_to_date_from_date_format<false>(context, columns, ctx->fmt);
     }
 }
 
@@ -1684,7 +2101,7 @@ std::string format_for_yyyyMMdd(const DateValue& date_value) {
     to[5] = m % 10 + '0';
     to[6] = d / 10 + '0';
     to[7] = d % 10 + '0';
-    return std::string(to, 8);
+    return {to, 8};
 }
 
 DEFINE_STRING_UNARY_FN_WITH_IMPL(yyyyMMddImpl, v) {
@@ -1723,7 +2140,7 @@ std::string format_for_yyyy_MMImpl(const DateValue& date_value) {
     to[4] = '-';
     to[5] = m / 10 + '0';
     to[6] = m % 10 + '0';
-    return std::string(to, 7);
+    return {to, 7};
 }
 
 DEFINE_STRING_UNARY_FN_WITH_IMPL(yyyy_MMImpl, v) {
@@ -1744,7 +2161,7 @@ std::string format_for_yyyyMMImpl(const DateValue& date_value) {
 
     to[4] = m / 10 + '0';
     to[5] = m % 10 + '0';
-    return std::string(to, 6);
+    return {to, 6};
 }
 
 DEFINE_STRING_UNARY_FN_WITH_IMPL(yyyyMMImpl, v) {
@@ -1762,11 +2179,15 @@ std::string format_for_yyyyImpl(const DateValue& date_value) {
     t = y % 100;
     to[2] = t / 10 + '0';
     to[3] = t % 10 + '0';
-    return std::string(to, 4);
+    return {to, 4};
 }
 
 DEFINE_STRING_UNARY_FN_WITH_IMPL(yyyyImpl, v) {
     return format_for_yyyyImpl((DateValue)v);
+}
+
+DEFINE_STRING_UNARY_FN_WITH_IMPL(to_iso8601Impl, v) {
+    return timestamp::to_string<true>(((TimestampValue)v).timestamp());
 }
 
 bool standard_format_one_row(const TimestampValue& timestamp_value, char* buf, const std::string& fmt) {
@@ -1898,9 +2319,212 @@ StatusOr<ColumnPtr> TimeFunctions::date_format(FunctionContext* context, const C
 
             common_format_process(&viewer_date, &viewer_format, &builder, i);
         }
-
         return builder.build(ColumnHelper::is_all_const(columns));
     }
+}
+
+Status TimeFunctions::jodatime_format_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    if (!context->is_constant_column(1)) {
+        return Status::OK();
+    }
+
+    ColumnPtr column = context->get_constant_column(1);
+    auto* fc = new FormatCtx();
+    context->set_function_state(scope, fc);
+
+    if (column->only_null()) {
+        fc->is_valid = false;
+        return Status::OK();
+    }
+
+    Slice slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
+    fc->fmt = slice.to_string();
+
+    fc->len = DateTimeValue::compute_format_len(slice.data, slice.size);
+    if (fc->len >= 128) {
+        fc->is_valid = false;
+        return Status::OK();
+    }
+
+    if (fc->fmt == "yyyyMMdd") {
+        fc->fmt_type = TimeFunctions::yyyyMMdd;
+    } else if (fc->fmt == "yyyy-MM-dd") {
+        fc->fmt_type = TimeFunctions::yyyy_MM_dd;
+    } else if (fc->fmt == "yyyy-MM-dd HH:mm:ss") {
+        fc->fmt_type = TimeFunctions::yyyy_MM_dd_HH_mm_ss;
+    } else if (fc->fmt == "yyyy-MM") {
+        fc->fmt_type = TimeFunctions::yyyy_MM;
+    } else if (fc->fmt == "yyyyMM") {
+        fc->fmt_type = TimeFunctions::yyyyMM;
+    } else if (fc->fmt == "yyyy") {
+        fc->fmt_type = TimeFunctions::yyyy;
+    } else {
+        fc->fmt_type = TimeFunctions::None;
+    }
+
+    fc->is_valid = true;
+    return Status::OK();
+}
+
+Status TimeFunctions::jodatime_format_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    auto* fc = reinterpret_cast<FormatCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (fc != nullptr) {
+        delete fc;
+    }
+
+    return Status::OK();
+}
+
+bool joda_standard_format_one_row(const TimestampValue& timestamp_value, char* buf, std::string_view fmt) {
+    int year, month, day, hour, minute, second, microsecond;
+    timestamp_value.to_timestamp(&year, &month, &day, &hour, &minute, &second, &microsecond);
+    DateTimeValue dt(TIME_DATETIME, year, month, day, hour, minute, second, microsecond);
+    bool b = dt.to_joda_format_string(fmt.data(), fmt.size(), buf);
+    return b;
+}
+
+template <LogicalType Type>
+StatusOr<ColumnPtr> joda_standard_format(const std::string& fmt, int len, const starrocks::Columns& columns) {
+    if (fmt.size() <= 0) {
+        return ColumnHelper::create_const_null_column(columns[0]->size());
+    }
+
+    auto ts_viewer = ColumnViewer<Type>(columns[0]);
+
+    size_t size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
+
+    char buf[len];
+    for (size_t i = 0; i < size; ++i) {
+        if (ts_viewer.is_null(i)) {
+            result.append_null();
+        } else {
+            auto ts = (TimestampValue)ts_viewer.value(i);
+            bool b = joda_standard_format_one_row(ts, buf, fmt);
+            result.append(Slice(std::string(buf)), !b);
+        }
+    }
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+template <LogicalType Type>
+StatusOr<ColumnPtr> joda_format(const TimeFunctions::FormatCtx* ctx, const Columns& cols) {
+    if (ctx->fmt_type == TimeFunctions::yyyyMMdd) {
+        return date_format_func<yyyyMMddImpl, Type>(cols, 8);
+    } else if (ctx->fmt_type == TimeFunctions::yyyy_MM_dd) {
+        return date_format_func<yyyy_MM_dd_Impl, Type>(cols, 10);
+    } else if (ctx->fmt_type == TimeFunctions::yyyy_MM_dd_HH_mm_ss) {
+        return date_format_func<yyyyMMddHHmmssImpl, Type>(cols, 28);
+    } else if (ctx->fmt_type == TimeFunctions::yyyy_MM) {
+        return date_format_func<yyyy_MMImpl, Type>(cols, 7);
+    } else if (ctx->fmt_type == TimeFunctions::yyyyMM) {
+        return date_format_func<yyyyMMImpl, Type>(cols, 6);
+    } else if (ctx->fmt_type == TimeFunctions::yyyy) {
+        return date_format_func<yyyyImpl, Type>(cols, 4);
+    } else {
+        return joda_standard_format<Type>(ctx->fmt, 128, cols);
+    }
+}
+
+template <LogicalType Type>
+void common_joda_format_process(ColumnViewer<Type>* viewer_date, ColumnViewer<TYPE_VARCHAR>* viewer_format,
+                                ColumnBuilder<TYPE_VARCHAR>* builder, int i) {
+    if (viewer_format->is_null(i) || viewer_format->value(i).empty()) {
+        builder->append_null();
+        return;
+    }
+
+    std::string_view format = viewer_format->value(i);
+    if (format == "yyyyMMdd") {
+        builder->append(format_for_yyyyMMdd(viewer_date->value(i)));
+    } else if (format == "yyyy-MM-dd") {
+        builder->append(format_for_yyyy_MM_dd_Impl(viewer_date->value(i)));
+    } else if (format == "yyyy-MM-dd HH:mm:ss") {
+        builder->append(format_for_yyyyMMddHHmmssImpl(viewer_date->value(i)));
+    } else if (format == "yyyy-MM") {
+        builder->append(format_for_yyyy_MMImpl(viewer_date->value(i)));
+    } else if (format == "yyyyMM") {
+        builder->append(format_for_yyyyMMImpl(viewer_date->value(i)));
+    } else if (format == "yyyy") {
+        builder->append(format_for_yyyyImpl(viewer_date->value(i)));
+    } else {
+        char buf[128];
+        auto ts = (TimestampValue)viewer_date->value(i);
+        bool b = joda_standard_format_one_row(ts, buf, format);
+        builder->append(Slice(std::string(buf)), !b);
+    }
+}
+
+// format datetime using joda format
+StatusOr<ColumnPtr> TimeFunctions::jodadatetime_format(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    auto* fc = reinterpret_cast<FormatCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+
+    if (fc != nullptr && fc->is_valid) {
+        return joda_format<TYPE_DATETIME>(fc, columns);
+    } else {
+        auto [all_const, num_rows] = ColumnHelper::num_packed_rows(columns);
+        ColumnViewer<TYPE_DATETIME> viewer_date(columns[0]);
+        ColumnViewer<TYPE_VARCHAR> viewer_format(columns[1]);
+
+        ColumnBuilder<TYPE_VARCHAR> builder(num_rows);
+        for (int i = 0; i < num_rows; ++i) {
+            if (viewer_date.is_null(i)) {
+                builder.append_null();
+                continue;
+            }
+
+            common_joda_format_process(&viewer_date, &viewer_format, &builder, i);
+        }
+
+        return builder.build(all_const);
+    }
+}
+
+// format date using joda format
+StatusOr<ColumnPtr> TimeFunctions::jodadate_format(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    auto* fc = reinterpret_cast<FormatCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+
+    if (fc != nullptr && fc->is_valid) {
+        return joda_format<TYPE_DATE>(fc, columns);
+    } else {
+        int num_rows = columns[0]->size();
+        ColumnViewer<TYPE_DATE> viewer_date(columns[0]);
+        ColumnViewer<TYPE_VARCHAR> viewer_format(columns[1]);
+
+        ColumnBuilder<TYPE_VARCHAR> builder(columns[0]->size());
+
+        for (int i = 0; i < num_rows; ++i) {
+            if (viewer_date.is_null(i)) {
+                builder.append_null();
+                continue;
+            }
+
+            common_joda_format_process(&viewer_date, &viewer_format, &builder, i);
+        }
+        return builder.build(ColumnHelper::is_all_const(columns));
+    }
+}
+
+StatusOr<ColumnPtr> TimeFunctions::date_to_iso8601(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    return date_format_func<yyyy_MM_dd_Impl, TYPE_DATE>(columns, 10);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::datetime_to_iso8601(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    return date_format_func<to_iso8601Impl, TYPE_DATETIME>(columns, 26);
 }
 
 Status TimeFunctions::datetime_trunc_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
@@ -1916,8 +2540,16 @@ Status TimeFunctions::datetime_trunc_prepare(FunctionContext* context, FunctionC
     Slice slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     auto format_value = slice.to_string();
 
+    // to lower case
+    std::transform(format_value.begin(), format_value.end(), format_value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
     ScalarFunction function;
-    if (format_value == "second") {
+    if (format_value == "microsecond") {
+        function = &TimeFunctions::datetime_trunc_microsecond;
+    } else if (format_value == "millisecond") {
+        function = &TimeFunctions::datetime_trunc_millisecond;
+    } else if (format_value == "second") {
         function = &TimeFunctions::datetime_trunc_second;
     } else if (format_value == "minute") {
         function = &TimeFunctions::datetime_trunc_minute;
@@ -1934,7 +2566,9 @@ Status TimeFunctions::datetime_trunc_prepare(FunctionContext* context, FunctionC
     } else if (format_value == "quarter") {
         function = &TimeFunctions::datetime_trunc_quarter;
     } else {
-        return Status::InternalError("format value must in {second, minute, hour, day, month, year, week, quarter}");
+        return Status::InternalError(
+                "format value must in {microsecond, millisecond, second, minute, hour, day, month, year, week, "
+                "quarter}");
     }
 
     auto fc = new DateTruncCtx();
@@ -1942,6 +2576,18 @@ Status TimeFunctions::datetime_trunc_prepare(FunctionContext* context, FunctionC
     context->set_function_state(scope, fc);
     return Status::OK();
 }
+
+DEFINE_UNARY_FN_WITH_IMPL(datetime_trunc_microsecondImpl, v) {
+    return v;
+}
+DEFINE_TIME_UNARY_FN_EXTEND(datetime_trunc_microsecond, TYPE_DATETIME, TYPE_DATETIME, 1);
+
+DEFINE_UNARY_FN_WITH_IMPL(datetime_trunc_millisecondImpl, v) {
+    TimestampValue result = v;
+    result.trunc_to_millisecond();
+    return result;
+}
+DEFINE_TIME_UNARY_FN_EXTEND(datetime_trunc_millisecond, TYPE_DATETIME, TYPE_DATETIME, 1);
 
 DEFINE_UNARY_FN_WITH_IMPL(datetime_trunc_secondImpl, v) {
     TimestampValue result = v;
@@ -2032,6 +2678,10 @@ Status TimeFunctions::date_trunc_prepare(FunctionContext* context, FunctionConte
     Slice slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     auto format_value = slice.to_string();
 
+    // to lower case
+    std::transform(format_value.begin(), format_value.end(), format_value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
     ScalarFunction function;
     if (format_value == "day") {
         function = &TimeFunctions::date_trunc_day;
@@ -2108,5 +2758,557 @@ std::string TimeFunctions::info_reported_by_time_slice = "time used with time_sl
 #undef DEFINE_TIME_BINARY_FN_WITH_IMPL
 #undef DEFINE_TIME_STRING_UNARY_FN
 #undef DEFINE_TIME_UNARY_FN_EXTEND
+
+static int weekday_from_dow_abbreviation(const std::string& dow) {
+    const int err_tag = -1, base = 1000;
+    if (dow.length() < 2) {
+        return err_tag;
+    }
+    switch (dow[0] + dow[1] * base) {
+    case 'S' + 'u' * base:
+        return (dow == "Su" || dow == "Sun" || dow == "Sunday") ? 0 : err_tag;
+    case 'M' + 'o' * base:
+        return (dow == "Mo" || dow == "Mon" || dow == "Monday") ? 1 : err_tag;
+    case 'T' + 'u' * base:
+        return (dow == "Tu" || dow == "Tue" || dow == "Tuesday") ? 2 : err_tag;
+    case 'W' + 'e' * base:
+        return (dow == "We" || dow == "Wed" || dow == "Wednesday") ? 3 : err_tag;
+    case 'T' + 'h' * base:
+        return (dow == "Th" || dow == "Thu" || dow == "Thursday") ? 4 : err_tag;
+    case 'F' + 'r' * base:
+        return (dow == "Fr" || dow == "Fri" || dow == "Friday") ? 5 : err_tag;
+    case 'S' + 'a' * base:
+        return (dow == "Sa" || dow == "Sat" || dow == "Saturday") ? 6 : err_tag;
+    default:
+        return err_tag;
+    }
+}
+
+// next_day
+StatusOr<ColumnPtr> TimeFunctions::next_day(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (wdc == nullptr) {
+        return next_day_common(context, columns);
+    }
+    return next_day_wdc(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::next_day_wdc(FunctionContext* context, const Columns& columns) {
+    auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (wdc->dow_weekday == -2) {
+        return ColumnHelper::create_const_null_column(columns[0]->size());
+    }
+    auto time_viewer = ColumnViewer<TYPE_DATETIME>(columns[0]);
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (time_viewer.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        TimestampValue time = time_viewer.value(row);
+        int datetime_weekday = ((DateValue)time).weekday();
+        auto date = (DateValue)timestamp_add<TimeUnit::DAY>(time, (6 + wdc->dow_weekday - datetime_weekday) % 7 + 1);
+        result.append(date);
+    }
+    return date_valid<TYPE_DATE>(result.build(ColumnHelper::is_all_const(columns)));
+}
+
+StatusOr<ColumnPtr> TimeFunctions::next_day_common(FunctionContext* context, const Columns& columns) {
+    auto time_viewer = ColumnViewer<TYPE_DATETIME>(columns[0]);
+    auto dow_str = ColumnViewer<TYPE_VARCHAR>(columns[1]);
+
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (time_viewer.is_null(row) || dow_str.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        TimestampValue time = time_viewer.value(row);
+        auto dow = dow_str.value(row).to_string();
+        int dow_weekday = weekday_from_dow_abbreviation(dow);
+        if (dow_weekday == -1) {
+            return Status::InvalidArgument(dow + " not supported in next_day dow_string");
+        }
+        int datetime_weekday = ((DateValue)time).weekday();
+        auto date = (DateValue)timestamp_add<TimeUnit::DAY>(time, (6 + dow_weekday - datetime_weekday) % 7 + 1);
+        result.append(date);
+    }
+    return date_valid<TYPE_DATE>(result.build(ColumnHelper::is_all_const(columns)));
+}
+
+Status TimeFunctions::next_day_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL || !context->is_constant_column(1)) {
+        return Status::OK();
+    }
+
+    ColumnPtr column = context->get_constant_column(1);
+    if (column->only_null()) {
+        auto* wdc = new WeekDayCtx();
+        wdc->dow_weekday = -2;
+        context->set_function_state(scope, wdc);
+        return Status::OK();
+    }
+
+    Slice slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
+    auto dow = slice.to_string();
+    int dow_weekday = weekday_from_dow_abbreviation(dow);
+    if (dow_weekday == -1) {
+        return Status::InvalidArgument(dow + " not supported in next_day dow_string");
+    }
+    auto* wdc = new WeekDayCtx();
+    wdc->dow_weekday = dow_weekday;
+    context->set_function_state(scope, wdc);
+    return Status::OK();
+}
+
+Status TimeFunctions::next_day_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+        if (wdc != nullptr) {
+            delete wdc;
+        }
+    }
+
+    return Status::OK();
+}
+
+// previous_day
+StatusOr<ColumnPtr> TimeFunctions::previous_day(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (wdc == nullptr) {
+        return previous_day_common(context, columns);
+    }
+    return previous_day_wdc(context, columns);
+}
+
+StatusOr<ColumnPtr> TimeFunctions::previous_day_wdc(FunctionContext* context, const Columns& columns) {
+    auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (wdc->dow_weekday == -2) {
+        return ColumnHelper::create_const_null_column(columns[0]->size());
+    }
+    auto time_viewer = ColumnViewer<TYPE_DATETIME>(columns[0]);
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (time_viewer.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        TimestampValue time = time_viewer.value(row);
+        int datetime_weekday = ((DateValue)time).weekday();
+        auto date = (DateValue)timestamp_add<TimeUnit::DAY>(time, -((6 + datetime_weekday - wdc->dow_weekday) % 7 + 1));
+        result.append(date);
+    }
+    return date_valid<TYPE_DATE>(result.build(ColumnHelper::is_all_const(columns)));
+}
+
+StatusOr<ColumnPtr> TimeFunctions::previous_day_common(FunctionContext* context, const Columns& columns) {
+    auto time_viewer = ColumnViewer<TYPE_DATETIME>(columns[0]);
+    auto dow_str = ColumnViewer<TYPE_VARCHAR>(columns[1]);
+
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (time_viewer.is_null(row) || dow_str.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        TimestampValue time = time_viewer.value(row);
+        auto dow = dow_str.value(row).to_string();
+        int dow_weekday = weekday_from_dow_abbreviation(dow);
+        if (dow_weekday == -1) {
+            return Status::InvalidArgument(dow + " not supported in previous_day dow_string");
+        }
+        int datetime_weekday = ((DateValue)time).weekday();
+        auto date = (DateValue)timestamp_add<TimeUnit::DAY>(time, -((6 + datetime_weekday - dow_weekday) % 7 + 1));
+        result.append(date);
+    }
+    return date_valid<TYPE_DATE>(result.build(ColumnHelper::is_all_const(columns)));
+}
+
+Status TimeFunctions::previous_day_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL || !context->is_constant_column(1)) {
+        return Status::OK();
+    }
+
+    ColumnPtr column = context->get_constant_column(1);
+    if (column->only_null()) {
+        auto* wdc = new WeekDayCtx();
+        wdc->dow_weekday = -2;
+        context->set_function_state(scope, wdc);
+        return Status::OK();
+    }
+
+    Slice slice = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
+    auto dow = slice.to_string();
+    int dow_weekday = weekday_from_dow_abbreviation(dow);
+    if (dow_weekday == -1) {
+        return Status::InvalidArgument(dow + " not supported in previous_day dow_string");
+    }
+    auto* wdc = new WeekDayCtx();
+    wdc->dow_weekday = dow_weekday;
+    context->set_function_state(scope, wdc);
+    return Status::OK();
+}
+
+Status TimeFunctions::previous_day_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        auto* wdc = reinterpret_cast<WeekDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+        if (wdc != nullptr) {
+            delete wdc;
+        }
+    }
+
+    return Status::OK();
+}
+
+StatusOr<ColumnPtr> TimeFunctions::make_date(FunctionContext* context, const Columns& columns) {
+    auto year_viewer = ColumnViewer<TYPE_INT>(columns[0]);
+    auto date_viewer = ColumnViewer<TYPE_INT>(columns[1]);
+
+    auto size = columns[0]->size();
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (year_viewer.is_null(row) || date_viewer.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+
+        auto date_of_year = date_viewer.value(row);
+        if (date_of_year <= 0) {
+            result.append_null();
+            continue;
+        }
+
+        auto year = year_viewer.value(row);
+        DateValue dv = DateValue::create(year, 1, 1);
+        dv = dv.add<TimeUnit::DAY>(date_of_year - 1);
+        if (!dv.is_valid()) {
+            result.append_null();
+            continue;
+        }
+
+        int tmp_year = 0, tmp_month = 0, tmp_day = 0;
+        dv.to_date(&tmp_year, &tmp_month, &tmp_day);
+        if (tmp_year != year) {
+            result.append_null();
+            continue;
+        }
+
+        result.append(dv);
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+// date_diff
+using DateDiffFunctionImpl = int64_t (*)(const TimestampValue&, const TimestampValue&);
+const static std::unordered_map<std::string, std::pair<ScalarFunction, DateDiffFunctionImpl>> date_diff_func_map = {
+        {"millisecond",
+         {&TimeFunctions::milliseconds_diff, &milliseconds_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"second", {&TimeFunctions::seconds_diff, &seconds_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"minute", {&TimeFunctions::minutes_diff, &minutes_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"hour", {&TimeFunctions::hours_diff, &hours_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"day", {&TimeFunctions::days_diff, &days_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"week", {&TimeFunctions::weeks_diff, &weeks_diffImpl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"month",
+         {&TimeFunctions::months_diff_v2, &months_diff_v2Impl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"quarter",
+         {&TimeFunctions::quarters_diff_v2, &quarters_diff_v2Impl::apply<TimestampValue, TimestampValue, int64_t>}},
+        {"year", {&TimeFunctions::years_diff_v2, &years_diff_v2Impl::apply<TimestampValue, TimestampValue, int64_t>}}};
+
+StatusOr<ColumnPtr> TimeFunctions::datediff(FunctionContext* context, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    if (context->is_notnull_constant_column(DateDiffCtx::TYPE_INDEX)) {
+        auto ctx = reinterpret_cast<DateDiffCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+        return ctx->function(context, {columns[DateDiffCtx::LHS_INDEX], columns[DateDiffCtx::RHS_INDEX]});
+    }
+
+    ColumnViewer<TYPE_VARCHAR> type_column(columns[DateDiffCtx::TYPE_INDEX]);
+    ColumnViewer<TYPE_DATETIME> lv_column(columns[DateDiffCtx::LHS_INDEX]);
+    ColumnViewer<TYPE_DATETIME> rv_column(columns[DateDiffCtx::RHS_INDEX]);
+    auto size = columns[DateDiffCtx::TYPE_INDEX]->size();
+    ColumnBuilder<TYPE_BIGINT> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (lv_column.is_null(row) || rv_column.is_null(row) || type_column.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        TimestampValue l = (TimestampValue)lv_column.value(row);
+        TimestampValue r = (TimestampValue)rv_column.value(row);
+        auto type_str = type_column.value(row).to_string();
+        transform(type_str.begin(), type_str.end(), type_str.begin(), ::tolower);
+        auto iter = date_diff_func_map.find(type_str);
+        if (iter != date_diff_func_map.end()) {
+            result.append(iter->second.second(l, r));
+        } else {
+            return Status::InvalidArgument(
+                    "unit of date_diff must be one of year/month/quarter/day/hour/minute/second/millisecond");
+        }
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+Status TimeFunctions::datediff_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL || !context->is_notnull_constant_column(DateDiffCtx::TYPE_INDEX)) {
+        return Status::OK();
+    }
+    ColumnPtr column = context->get_constant_column(DateDiffCtx::TYPE_INDEX);
+    auto type_str = ColumnHelper::get_const_value<TYPE_VARCHAR>(column).to_string();
+    transform(type_str.begin(), type_str.end(), type_str.begin(), ::tolower);
+    auto iter = date_diff_func_map.find(type_str);
+    if (iter == date_diff_func_map.end()) {
+        return Status::InvalidArgument("type column should be one of day/hour/minute/second/millisecond");
+    }
+    auto fc = new TimeFunctions::DateDiffCtx();
+    fc->function = iter->second.first;
+
+    context->set_function_state(scope, fc);
+    return Status::OK();
+}
+
+Status TimeFunctions::datediff_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        auto fc = reinterpret_cast<DateDiffCtx*>(context->get_function_state(scope));
+        delete fc;
+    }
+    return Status::OK();
+}
+
+// last_day
+StatusOr<ColumnPtr> TimeFunctions::last_day(FunctionContext* context, const Columns& columns) {
+    ColumnViewer<TYPE_DATETIME> data_column(columns[0]);
+    auto size = columns[0]->size();
+
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (data_column.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+
+        DateValue date = (DateValue)data_column.value(row);
+        date.set_end_of_month(); // default month
+        result.append(date);
+    }
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+Status TimeFunctions::_error_date_part() {
+    return Status::InvalidArgument("avaiable data_part parameter is year/month/quarter");
+}
+
+StatusOr<ColumnPtr> TimeFunctions::_last_day_with_format_const(std::string& format_content, FunctionContext* context,
+                                                               const Columns& columns) {
+    ColumnViewer<TYPE_DATETIME> data_column(columns[0]);
+    auto size = columns[0]->size();
+
+    ColumnBuilder<TYPE_DATE> result(size);
+    if (format_content == "year") {
+        for (int row = 0; row < size; ++row) {
+            if (data_column.is_null(row)) {
+                result.append_null();
+                continue;
+            }
+            DateValue date = (DateValue)data_column.value(row);
+            date.set_end_of_year();
+            result.append(date);
+        }
+    } else if (format_content == "quarter") {
+        for (int row = 0; row < size; ++row) {
+            if (data_column.is_null(row)) {
+                result.append_null();
+                continue;
+            }
+            DateValue date = (DateValue)data_column.value(row);
+            date.set_end_of_quarter();
+            result.append(date);
+        }
+    } else if (format_content == "month") {
+        for (int row = 0; row < size; ++row) {
+            if (data_column.is_null(row)) {
+                result.append_null();
+                continue;
+            }
+            DateValue date = (DateValue)data_column.value(row);
+            date.set_end_of_month();
+            result.append(date);
+        }
+    } else {
+        return _error_date_part();
+    }
+
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+StatusOr<ColumnPtr> TimeFunctions::_last_day_with_format(FunctionContext* context, const Columns& columns) {
+    ColumnViewer<TYPE_DATETIME> data_column(columns[0]);
+    ColumnViewer<TYPE_VARCHAR> format_column(columns[1]);
+    auto size = columns[0]->size();
+
+    ColumnBuilder<TYPE_DATE> result(size);
+    for (int row = 0; row < size; ++row) {
+        if (data_column.is_null(row) || format_column.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+
+        DateValue date = (DateValue)data_column.value(row);
+        Slice format_content = format_column.value(row);
+        std::transform(format_content.data, format_content.data + format_content.size, format_content.data,
+                       [](auto x) { return std::tolower(x); });
+
+        if (format_content == "year") {
+            date.set_end_of_year();
+        } else if (format_content == "quarter") {
+            date.set_end_of_quarter();
+        } else if (format_content == "month") {
+            date.set_end_of_month();
+        } else {
+            return _error_date_part();
+        }
+        result.append(date);
+    }
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+StatusOr<ColumnPtr> TimeFunctions::last_day_with_format(FunctionContext* context, const Columns& columns) {
+    DCHECK_EQ(columns.size(), 2);
+    auto* state = reinterpret_cast<LastDayCtx*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    if (state->const_optional) {
+        std::string format_content = state->optional_content;
+        return _last_day_with_format_const(format_content, context, columns);
+    }
+    return _last_day_with_format(context, columns);
+}
+
+Status TimeFunctions::last_day_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    auto* state = new LastDayCtx();
+    context->set_function_state(scope, state);
+
+    if (!context->is_notnull_constant_column(1)) {
+        return Status::OK();
+    }
+
+    state->const_optional = true;
+    ColumnPtr column = context->get_constant_column(1);
+    Slice optional = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
+    std::transform(optional.data, optional.data + optional.size, optional.data, [](auto x) { return std::tolower(x); });
+    if (!(optional == "year" || optional == "month" || optional == "quarter")) {
+        return _error_date_part();
+    }
+    state->optional_content = optional;
+    return Status::OK();
+}
+
+Status TimeFunctions::last_day_close(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+    if (scope != FunctionContext::FRAGMENT_LOCAL) {
+        return Status::OK();
+    }
+
+    auto* ctx = reinterpret_cast<LastDayCtx*>(context->get_function_state(scope));
+    if (ctx != nullptr) {
+        delete ctx;
+    }
+    return Status::OK();
+}
+
+// Format a time value according to a format string
+StatusOr<ColumnPtr> TimeFunctions::time_format(FunctionContext* context, const starrocks::Columns& columns) {
+    if (columns.size() != 2) {
+        return Status::InvalidArgument("FORMAT_TIME requires exactly 2 arguments");
+    }
+
+    const auto& time_column = columns[0];
+    const auto& format_column = columns[1];
+
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    auto time_viewer = ColumnViewer<TYPE_TIME>(time_column);
+    auto format_viewer = ColumnViewer<TYPE_VARCHAR>(format_column);
+
+    const size_t size = time_column->size();
+    auto builder = ColumnBuilder<TYPE_VARCHAR>(size);
+
+    for (size_t i = 0; i < size; ++i) {
+        if (time_viewer.is_null(i) || format_viewer.is_null(i)) {
+            builder.append_null();
+            continue;
+        }
+
+        TimestampValue time_val;
+        time_val.set_timestamp(time_viewer.value(i));
+        std::string_view format_str = format_viewer.value(i);
+
+        // Convert TimeValue to hours, minutes, seconds
+        int year;
+        int month;
+        int day;
+        int hours;
+        int minutes;
+        int seconds;
+        int microseconds;
+        time_val.to_timestamp(&year, &month, &day, &hours, &minutes, &seconds, &microseconds);
+
+        std::stringstream result;
+        bool in_format = false;
+
+        for (size_t j = 0; j < format_str.size(); ++j) {
+            char c = format_str[j];
+            if (c == '%') {
+                in_format = true;
+                continue;
+            }
+
+            if (!in_format) {
+                result << c;
+                continue;
+            }
+
+            in_format = false;
+            switch (c) {
+            case 'H': // Hour (00-23)
+                result << std::setfill('0') << std::setw(2) << hours;
+                break;
+            case 'h': // Hour (01-12)
+                result << std::setfill('0') << std::setw(2) << (((hours % 12) == 0) ? 12 : (hours % 12));
+                break;
+            case 'i': // Minutes (00-59)
+                result << std::setfill('0') << std::setw(2) << minutes;
+                break;
+            case 'S': // Seconds (00-59)
+            case 's': // Seconds (00-59)
+                result << std::setfill('0') << std::setw(2) << seconds;
+                break;
+            case 'f': // Microseconds (000000-999999)
+                result << std::setfill('0') << std::setw(6) << microseconds;
+                break;
+            case 'p': // AM or PM
+                result << (hours < 12 ? "AM" : "PM");
+                break;
+            default:
+                result << '%' << c;
+                break;
+            }
+        }
+
+        if (in_format) {
+            result << '%'; // Handle trailing %
+        }
+
+        builder.append(result.str());
+    }
+
+    return builder.build(ColumnHelper::is_all_const(columns));
+}
 
 } // namespace starrocks

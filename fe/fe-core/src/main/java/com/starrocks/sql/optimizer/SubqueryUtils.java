@@ -17,6 +17,7 @@ package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.Function;
@@ -25,11 +26,9 @@ import com.starrocks.catalog.Type;
 import com.starrocks.common.Pair;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.DecimalV3FunctionAnalyzer;
-import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.QueryRelation;
-import com.starrocks.sql.ast.SelectRelation;
-import com.starrocks.sql.ast.SubqueryRelation;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
+import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalApplyOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOperator;
@@ -39,7 +38,6 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.SubqueryOperator;
-import com.starrocks.sql.optimizer.rewrite.BaseScalarOperatorShuttle;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.rewrite.scalar.ReplaceSubqueryRewriteRule;
 import com.starrocks.sql.optimizer.rewrite.scalar.ScalarOperatorRewriteRule;
@@ -100,10 +98,6 @@ public class SubqueryUtils {
     public static LogicalPlan getLogicalPlan(ConnectContext session, CTETransformerContext cteContext,
                                              ColumnRefFactory columnRefFactory, QueryRelation relation,
                                              ExpressionMapping outer) {
-        if (!(relation instanceof SelectRelation) && !(relation instanceof SubqueryRelation)) {
-            throw new SemanticException("Currently only subquery of the Select type are supported");
-        }
-
         // For in subQuery, the order by is meaningless
         if (!relation.hasLimit()) {
             relation.getOrderBy().clear();
@@ -117,8 +111,8 @@ public class SubqueryUtils {
                 Function.CompareMode.IS_IDENTICAL);
         if (argTypes.length > 0 && argTypes[0].isDecimalV3()) {
             func = DecimalV3FunctionAnalyzer.rectifyAggregationFunction((AggregateFunction) func,
-                            argTypes[0],
-                            argTypes[0]);
+                    argTypes[0],
+                    argTypes[0]);
         }
         return func;
     }
@@ -135,9 +129,30 @@ public class SubqueryUtils {
             }
 
             BinaryPredicateOperator bpo = ((BinaryPredicateOperator) predicate);
-            if (!BinaryPredicateOperator.BinaryType.EQ.equals(bpo.getBinaryType())) {
+            if (!BinaryType.EQ.equals(bpo.getBinaryType())) {
                 return false;
             }
+        }
+        return true;
+    }
+
+    public static boolean checkUniqueCorrelation(ScalarOperator correlationPredicate, ColumnRefSet outerRefs) {
+        if (correlationPredicate == null) {
+            return true;
+        }
+        
+        if (!OperatorType.BINARY.equals(correlationPredicate.getOpType())) {
+            return false;
+        }
+
+        BinaryPredicateOperator bpo = ((BinaryPredicateOperator) correlationPredicate);
+        if (!BinaryType.EQ.equals(bpo.getBinaryType())) {
+            return false;
+        }
+
+        if (outerRefs.containsAny(bpo.getChild(0).getUsedColumns()) &&
+                outerRefs.containsAny(bpo.getChild(1).getUsedColumns())) {
+            return false;
         }
         return true;
     }
@@ -202,21 +217,6 @@ public class SubqueryUtils {
         }
 
         return false;
-    }
-
-    /**
-     * rewrite the predicate and collect info according to your operatorShuttle
-     *
-     * @param correlationPredicate
-     * @param scalarOperatorShuttle
-     * @return
-     */
-    public static ScalarOperator rewritePredicateAndExtractColumnRefs(
-            ScalarOperator correlationPredicate, BaseScalarOperatorShuttle scalarOperatorShuttle) {
-        if (correlationPredicate == null) {
-            return null;
-        }
-        return correlationPredicate.clone().accept(scalarOperatorShuttle, null);
     }
 
     public static boolean existNonColumnRef(Collection<ScalarOperator> scalarOperators) {

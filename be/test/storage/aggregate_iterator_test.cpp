@@ -14,7 +14,7 @@
 
 #include "storage/aggregate_iterator.h"
 
-#include "column/column_pool.h"
+#include "common/config.h"
 #include "gtest/gtest.h"
 #include "storage/aggregate_type.h"
 #include "storage/vector_chunk_iterator.h"
@@ -36,7 +36,7 @@ static std::vector<Datum> row(const Chunk& chunk, size_t row_id) {
 class AggregateIteratorTest : public testing::Test {
 protected:
     void SetUp() override {}
-    void TearDown() override { TEST_clear_all_columns_this_thread(); }
+    void TearDown() override {}
 };
 
 // NOLINTNEXTLINE
@@ -924,7 +924,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         ASSERT_EQ(2, values[1]);
         ASSERT_EQ(3, values[2]);
         ASSERT_EQ(4, values[3]);
-        agg_iter->get_next(chunk.get());
+        ASSERT_FALSE(agg_iter->get_next(chunk.get()).ok());
     }
     {
         auto pk1 = std::vector<std::string>{"abc", "abc", "abc", "abc"};

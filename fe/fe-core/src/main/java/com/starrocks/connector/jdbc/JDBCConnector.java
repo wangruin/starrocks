@@ -49,13 +49,17 @@ public class JDBCConnector implements Connector {
         validate(JDBCResource.PASSWORD);
         validate(JDBCResource.DRIVER_URL);
 
-        computeDriverChecksum();
+        // CHECK_SUM used to check the `Dirver` file's integrity in `be`, we only compute it when creating catalog,
+        // and put it into properties and then persisted, when `fe` replay create catalog, we can skip it.
+        if (this.properties.get(JDBCResource.CHECK_SUM) == null) {
+            computeDriverChecksum();
+        }
     }
 
     private void validate(String propertyKey) {
         String value = properties.get(propertyKey);
         if (value == null) {
-            throw new IllegalArgumentException("Missing " + propertyKey + " in properties");
+            throw new StarRocksConnectorException("Missing " + propertyKey + " in properties");
         }
     }
 
@@ -83,7 +87,7 @@ public class JDBCConnector implements Connector {
             String checkSum = Hex.encodeHexString(digest.digest());
             properties.put(JDBCResource.CHECK_SUM, checkSum);
         } catch (Exception e) {
-            throw new IllegalArgumentException("Cannot get driver from url: " + properties.get(JDBCResource.DRIVER_URL));
+            throw new StarRocksConnectorException("Cannot get driver from url: " + properties.get(JDBCResource.DRIVER_URL));
         }
     }
 
@@ -91,7 +95,7 @@ public class JDBCConnector implements Connector {
     public ConnectorMetadata getMetadata() {
         if (metadata == null) {
             try {
-                metadata = new JDBCMetadata(properties);
+                metadata = new JDBCMetadata(properties, catalogName);
             } catch (StarRocksConnectorException e) {
                 LOG.error("Failed to create jdbc metadata on [catalog : {}]", catalogName, e);
                 throw e;

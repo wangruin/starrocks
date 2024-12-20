@@ -21,7 +21,8 @@
 namespace starrocks::query_cache {
 MultilaneOperator::MultilaneOperator(pipeline::OperatorFactory* factory, int32_t driver_sequence, size_t num_lanes,
                                      pipeline::Operators&& processors, bool can_passthrough)
-        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), driver_sequence),
+        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), true,
+                             driver_sequence),
           _num_lanes(num_lanes),
           _can_passthrough(can_passthrough) {
     DCHECK_EQ(processors.size(), _num_lanes);
@@ -289,6 +290,19 @@ pipeline::OperatorPtr MultilaneOperator::get_internal_op(size_t i) {
     DCHECK(i >= 0 && i < _lanes.size());
     return _lanes[i].processor;
 }
+
+const pipeline::LocalRFWaitingSet& MultilaneOperator::rf_waiting_set() const {
+    return _lanes[0].processor->rf_waiting_set();
+}
+
+RuntimeFilterProbeCollector* MultilaneOperator::runtime_bloom_filters() {
+    return _lanes[0].processor->runtime_bloom_filters();
+}
+
+const RuntimeFilterProbeCollector* MultilaneOperator::runtime_bloom_filters() const {
+    return _lanes[0].processor->runtime_bloom_filters();
+}
+
 void MultilaneOperator::set_precondition_ready(RuntimeState* state) {
     for (auto& lane : _lanes) {
         lane.processor->set_precondition_ready(state);

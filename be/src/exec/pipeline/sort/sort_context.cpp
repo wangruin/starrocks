@@ -56,16 +56,10 @@ bool SortContext::is_partition_ready() const {
     });
 }
 
-void SortContext::cancel() {
-    for (const auto& sorter : _chunks_sorter_partitions) {
-        if (sorter) {
-            sorter->cancel();
-        }
-    }
-}
+void SortContext::cancel() {}
 
 StatusOr<ChunkPtr> SortContext::pull_chunk() {
-    _init_merger();
+    RETURN_IF_ERROR(_init_merger());
 
     while (_required_rows > 0 && !_merger.is_eos()) {
         if (_current_chunk.empty()) {
@@ -143,8 +137,11 @@ Status SortContext::_init_merger() {
 SortContextFactory::SortContextFactory(RuntimeState* state, const TTopNType::type topn_type, bool is_merging,
                                        std::vector<ExprContext*> sort_exprs, const std::vector<bool>& is_asc_order,
                                        const std::vector<bool>& is_null_first,
-                                       [[maybe_unused]] const std::vector<TExpr>& partition_exprs, int64_t offset,
-                                       int64_t limit, const std::string& sort_keys,
+                                       [[maybe_unused]] const std::vector<TExpr>& partition_exprs,
+                                       [[maybe_unused]] bool enable_pre_agg,
+                                       [[maybe_unused]] const std::vector<TExpr>& t_pre_agg_exprs,
+                                       [[maybe_unused]] const std::vector<TSlotId>& t_pre_agg_output_slot_id,
+                                       int64_t offset, int64_t limit, const std::string& sort_keys,
                                        const std::vector<OrderByType>& order_by_types,
                                        const std::vector<RuntimeFilterBuildDescriptor*>& build_runtime_filters)
         : _state(state),

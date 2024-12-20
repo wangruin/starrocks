@@ -22,7 +22,7 @@ namespace starrocks::pipeline {
 class EmptySetOperator final : public SourceOperator {
 public:
     EmptySetOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence)
-            : SourceOperator(factory, id, "empty_set", plan_node_id, driver_sequence) {}
+            : SourceOperator(factory, id, "empty_set", plan_node_id, false, driver_sequence) {}
 
     ~EmptySetOperator() override = default;
 
@@ -45,7 +45,7 @@ public:
         return std::make_shared<EmptySetOperator>(this, _id, _plan_node_id, driver_sequence);
     }
 
-    SourceOperatorFactory::AdaptiveState adaptive_state() const override { return AdaptiveState::ACTIVE; }
+    SourceOperatorFactory::AdaptiveState adaptive_initial_state() const override { return AdaptiveState::ACTIVE; }
 };
 
 } // namespace starrocks::pipeline

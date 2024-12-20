@@ -19,6 +19,7 @@
 #include "column/chunk.h"
 #include "common/statusor.h"
 #include "exec/pipeline/adaptive/adaptive_dop_param.h"
+#include "exec/pipeline/adaptive/event.h"
 #include "exec/pipeline/adaptive/utils.h"
 
 namespace starrocks::pipeline {
@@ -88,11 +89,15 @@ PassthroughState::PassthroughState(CollectStatsContext* const ctx)
           _unpluging_per_driver_seq(ctx->_max_dop) {}
 
 bool PassthroughState::need_input(int32_t driver_seq) const {
-    return _in_chunk_queue_per_driver_seq[driver_seq].size_approx() < MAX_PASSTHROUGH_CHUNKS_PER_DRIVER_SEQ;
+    return _in_chunk_queue_per_driver_seq[driver_seq].queue.size_approx() < MAX_PASSTHROUGH_CHUNKS_PER_DRIVER_SEQ;
 }
 
 Status PassthroughState::push_chunk(int32_t driver_seq, ChunkPtr chunk) {
-    _in_chunk_queue_per_driver_seq[driver_seq].enqueue(std::move(chunk));
+    auto& [chunk_queue, token] = _in_chunk_queue_per_driver_seq[driver_seq];
+    if (UNLIKELY(!chunk_queue.enqueue(token, std::move(chunk)))) {
+        return Status::MemoryLimitExceeded(
+                "allocation failed when enqueueing into the passthrough queue of CollectStatsSink");
+    }
     return Status::OK();
 }
 
@@ -102,7 +107,7 @@ bool PassthroughState::has_output(int32_t driver_seq) const {
         return true;
     }
 
-    size_t num_chunks = _in_chunk_queue_per_driver_seq[driver_seq].size_approx();
+    size_t num_chunks = _in_chunk_queue_per_driver_seq[driver_seq].queue.size_approx();
     auto& unpluging = _unpluging_per_driver_seq[driver_seq];
     if (unpluging) {
         if (num_chunks > 0) {
@@ -129,9 +134,11 @@ StatusOr<ChunkPtr> PassthroughState::pull_chunk(int32_t driver_seq) {
         return chunk;
     }
 
-    auto& passthrough_chunk_queue = _in_chunk_queue_per_driver_seq[driver_seq];
+    auto& passthrough_chunk_queue = _in_chunk_queue_per_driver_seq[driver_seq].queue;
     ChunkPtr chunk = nullptr;
-    passthrough_chunk_queue.try_dequeue(chunk);
+    if (UNLIKELY(!passthrough_chunk_queue.try_dequeue(chunk))) {
+        return Status::InternalError("attempt to dequeue from the empty passthrough queue of CollectStatsSource");
+    }
     return chunk;
 }
 
@@ -145,7 +152,9 @@ bool PassthroughState::is_downstream_finished(int32_t driver_seq) const {
     }
 
     const auto& buffer_chunk_queue = _ctx->_buffer_chunk_queue(driver_seq);
-    const auto& passthrough_chunk_queue = _in_chunk_queue_per_driver_seq[driver_seq];
+    const auto& passthrough_chunk_queue = _in_chunk_queue_per_driver_seq[driver_seq].queue;
+    // _is_finishing_per_driver_seq is set to true using memory_order_release after all the chunks are enqueued.
+    // Therefore, enqueueing chunk hapens before setting _is_finishing_per_driver_seq to true.
     return buffer_chunk_queue.empty() && passthrough_chunk_queue.size_approx() <= 0;
 }
 bool PassthroughState::is_upstream_finished(int32_t driver_seq) const {
@@ -190,7 +199,7 @@ StatusOr<ChunkPtr> RoundRobinState::pull_chunk(int32_t driver_seq) {
     while (buffer_idx < _ctx->_upstream_dop) {
         auto& buffer_chunk_queue = _ctx->_buffer_chunk_queue(buffer_idx);
         while (!buffer_chunk_queue.empty()) {
-            accumulator.push(std::move(buffer_chunk_queue.front()));
+            RETURN_IF_ERROR(accumulator.push(std::move(buffer_chunk_queue.front())));
             buffer_chunk_queue.pop();
             if (!accumulator.empty()) {
                 return accumulator.pull();
@@ -219,12 +228,14 @@ bool RoundRobinState::is_upstream_finished(int32_t driver_seq) const {
 CollectStatsContext::CollectStatsContext(RuntimeState* const runtime_state, size_t max_dop,
                                          const AdaptiveDopParam& param)
         : _max_dop(max_dop),
-          _max_block_rows_per_driver_seq(param.max_block_rows_per_driver_seq),
+          _max_block_rows_per_driver_seq(param.max_block_rows_per_driver_seq > 0 ? param.max_block_rows_per_driver_seq
+                                                                                 : 1),
           _max_output_amplification_factor(param.max_output_amplification_factor),
           _buffer_chunk_queue_per_driver_seq(max_dop),
           _is_finishing_per_driver_seq(max_dop),
           _is_finished_per_driver_seq(max_dop),
-          _runtime_state(runtime_state) {
+          _runtime_state(runtime_state),
+          _blocking_event(Event::create_event()) {
     _state_payloads[CollectStatsStateEnum::BLOCK] = std::make_unique<BlockState>(this);
     _state_payloads[CollectStatsStateEnum::PASSTHROUGH] = std::make_unique<PassthroughState>(this);
     _state_payloads[CollectStatsStateEnum::ROUND_ROBIN] = std::make_unique<RoundRobinState>(this);
@@ -288,6 +299,8 @@ void CollectStatsContext::_transform_state(CollectStatsStateEnum state_enum, siz
     auto* next_state = _get_state(state_enum);
     _downstream_dop = downstream_dop;
     _state = next_state;
+
+    _blocking_event->finish(_runtime_state);
 }
 
 CollectStatsContext::BufferChunkQueue& CollectStatsContext::_buffer_chunk_queue(int32_t driver_seq) {

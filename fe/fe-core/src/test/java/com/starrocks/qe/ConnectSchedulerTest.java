@@ -37,6 +37,7 @@ package com.starrocks.qe;
 import com.starrocks.analysis.AccessTestUtil;
 import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.mysql.MysqlProto;
+import com.starrocks.mysql.NegotiateState;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -67,7 +68,7 @@ public class ConnectSchedulerTest {
                 // mock negotiate
                 MysqlProto.negotiate((ConnectContext) any);
                 minTimes = 0;
-                result = true;
+                result = new MysqlProto.NegotiateResult(null, NegotiateState.OK);
 
                 MysqlProto.sendResponsePacket((ConnectContext) any);
                 minTimes = 0;
@@ -87,12 +88,6 @@ public class ConnectSchedulerTest {
 
         Thread.sleep(1000);
         Assert.assertNull(scheduler.getContext(0));
-    }
-
-    @Test
-    public void testSubmitFail() throws InterruptedException {
-        ConnectScheduler scheduler = new ConnectScheduler(10);
-        Assert.assertFalse(scheduler.submit(null));
     }
 
     @Test

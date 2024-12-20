@@ -28,18 +28,19 @@ public:
                                         const TypeDescriptor& slot_desc);
 
     ORCScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRange& scan_range,
-               starrocks::ScannerCounter* counter);
+               starrocks::ScannerCounter* counter, bool schema_only = false);
 
     ~ORCScanner() override = default;
 
     Status open() override;
 
     StatusOr<ChunkPtr> get_next() override;
+    Status get_schema(std::vector<SlotDescriptor>* schema) override;
 
     void close() override;
 
 private:
-    Status _next_orc_batch(ChunkPtr* result);
+    StatusOr<ChunkPtr> _next_orc_batch();
 
     StatusOr<ChunkPtr> _next_orc_chunk();
 
@@ -57,6 +58,7 @@ private:
     int _next_range;
     int _error_counter;
     bool _status_eof;
+    int64_t _last_file_size = 0;
 
     std::unique_ptr<OrcChunkReader> _orc_reader;
     std::vector<SlotDescriptor*> _orc_slot_descriptors;

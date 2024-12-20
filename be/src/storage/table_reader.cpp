@@ -18,20 +18,20 @@
 #include <queue>
 
 #include "exec/tablet_info.h"
-#include "gen_cpp/doris_internal_service.pb.h"
 #include "serde/protobuf_serde.h"
 #include "storage/local_tablet_reader.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
 #include "storage/tablet_reader.h"
 #include "util/brpc_stub_cache.h"
+#include "util/internal_service_recoverable_stub.h"
 #include "util/ref_count_closure.h"
 
 namespace starrocks {
 
-TableReader::TableReader() {}
+TableReader::TableReader() = default;
 
-TableReader::~TableReader() {}
+TableReader::~TableReader() = default;
 
 Status TableReader::init(const LocalTableReaderParams& local_params) {
     if (_local_params || _params) {
@@ -61,7 +61,7 @@ Status TableReader::init(const TableReaderParams& params) {
     RETURN_IF_ERROR(_partition_param->init(nullptr));
     _location_param = std::make_unique<OlapTableLocationParam>(params.location_param);
     _nodes_info = std::make_unique<StarRocksNodesInfo>(params.nodes_info);
-    _row_desc = std::make_unique<RowDescriptor>(_schema_param->tuple_desc(), false);
+    _row_desc = std::make_unique<RowDescriptor>(_schema_param->tuple_desc());
     return Status::OK();
 }
 
@@ -111,9 +111,8 @@ Status TableReader::multi_get(Chunk& keys, const std::vector<std::string>& value
     std::vector<uint8_t> validate_selection;
     std::vector<uint32_t> validate_select_idx;
     validate_selection.assign(num_rows, 1);
-    int invalid_row_index = 0;
-    RETURN_IF_ERROR(_partition_param->find_tablets(&keys, &partitions, &tablet_indexes, &validate_selection,
-                                                   &invalid_row_index, 0, nullptr));
+    RETURN_IF_ERROR(_partition_param->find_tablets(&keys, &partitions, &tablet_indexes, &validate_selection, nullptr, 0,
+                                                   nullptr));
     // Arrange selection_idx by merging _validate_selection
     // If chunk num_rows is 6
     // _validate_selection is [1, 0, 0, 0, 1, 1]
@@ -221,8 +220,7 @@ Status TableReader::_tablet_multi_get_remote(int64_t tablet_id, int64_t version,
             LOG(WARNING) << msg;
             st = Status::InternalError(msg);
         } else {
-            doris::PBackendService_Stub* stub =
-                    ExecEnv::GetInstance()->brpc_stub_cache()->get_stub(node_info->host, node_info->brpc_port);
+            auto stub = ExecEnv::GetInstance()->brpc_stub_cache()->get_stub(node_info->host, node_info->brpc_port);
             if (stub == nullptr) {
                 string msg = strings::Substitute("multi_get fail to get brpc stub for $0:$1 tablet:$2", node_info->host,
                                                  node_info->brpc_port, tablet_id);
@@ -239,14 +237,15 @@ Status TableReader::_tablet_multi_get_remote(int64_t tablet_id, int64_t version,
     return st;
 }
 
-Status TableReader::_tablet_multi_get_rpc(doris::PBackendService_Stub* stub, int64_t tablet_id, int64_t version,
-                                          Chunk& keys, const std::vector<std::string>& value_columns,
-                                          std::vector<bool>& found, Chunk& values, SchemaPtr& value_schema) {
+Status TableReader::_tablet_multi_get_rpc(const std::shared_ptr<PInternalService_RecoverableStub>& stub,
+                                          int64_t tablet_id, int64_t version, Chunk& keys,
+                                          const std::vector<std::string>& value_columns, std::vector<bool>& found,
+                                          Chunk& values, SchemaPtr& value_schema) {
     PTabletReaderMultiGetRequest request;
     request.set_tablet_id(tablet_id);
     request.set_version(version);
-    for (size_t i = 0; i < value_columns.size(); ++i) {
-        request.add_values_columns(value_columns[i]);
+    for (const auto& value_column : value_columns) {
+        request.add_values_columns(value_column);
     }
     StatusOr<ChunkPB> keys_pb;
     TRY_CATCH_BAD_ALLOC(keys_pb = serde::ProtobufChunkSerde::serialize(keys, nullptr));
@@ -260,6 +259,8 @@ Status TableReader::_tablet_multi_get_rpc(doris::PBackendService_Stub* stub, int
             closure = nullptr;
         }
     });
+    // ref count for next rpc call
+    closure->ref();
     if (_params->timeout_ms > 0) {
         closure->cntl.set_timeout_ms(_params->timeout_ms);
     }

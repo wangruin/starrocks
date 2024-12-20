@@ -16,6 +16,7 @@
 
 #include "exec/pipeline/operator.h"
 #include "exec/pipeline/set/intersect_context.h"
+#include "util/race_detect.h"
 
 namespace starrocks::pipeline {
 
@@ -27,7 +28,7 @@ public:
     IntersectProbeSinkOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence,
                                std::shared_ptr<IntersectContext> intersect_ctx,
                                const std::vector<ExprContext*>& dst_exprs, const int32_t dependency_index)
-            : Operator(factory, id, "intersect_probe_sink", plan_node_id, driver_sequence),
+            : Operator(factory, id, "intersect_probe_sink", plan_node_id, false, driver_sequence),
               _intersect_ctx(std::move(intersect_ctx)),
               _dst_exprs(dst_exprs),
               _dependency_index(dependency_index) {
@@ -51,6 +52,7 @@ public:
     }
 
     Status set_finishing(RuntimeState* state) override {
+        ONCE_DETECT(_set_finishing_once);
         _is_finished = true;
         _intersect_ctx->finish_probe_ht();
         return Status::OK();
@@ -69,6 +71,7 @@ private:
 
     bool _is_finished = false;
     const int32_t _dependency_index;
+    DECLARE_ONCE_DETECTOR(_set_finishing_once);
 };
 
 class IntersectProbeSinkOperatorFactory final : public OperatorFactory {

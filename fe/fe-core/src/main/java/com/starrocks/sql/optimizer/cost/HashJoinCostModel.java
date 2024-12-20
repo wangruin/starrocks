@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.cost;
 
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.RunMode;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.ExpressionStatisticCalculator;
@@ -69,13 +70,16 @@ public class HashJoinCostModel {
 
     private final List<BinaryPredicateOperator> eqOnPredicates;
 
+    private final Statistics joinStatistics;
+
     public HashJoinCostModel(ExpressionContext context, List<PhysicalPropertySet> inputProperties,
-                             List<BinaryPredicateOperator> eqOnPredicates) {
+                             List<BinaryPredicateOperator> eqOnPredicates, final Statistics joinStatistics) {
         this.context = context;
         this.leftStatistics = context.getChildStatistics(0);
         this.rightStatistics = context.getChildStatistics(1);
         this.inputProperties = inputProperties;
         this.eqOnPredicates = eqOnPredicates;
+        this.joinStatistics = joinStatistics;
     }
 
     public double getCpuCost() {
@@ -84,7 +88,8 @@ public class HashJoinCostModel {
         double probeCost;
         double leftOutput = leftStatistics.getOutputSize(context.getChildOutputColumns(0));
         double rightOutput = rightStatistics.getOutputSize(context.getChildOutputColumns(1));
-        int parallelFactor = Math.max(ConnectContext.get().getAliveBackendNumber(),
+        int parallelFactor = Math.max(ConnectContext.get().getAliveBackendNumber() +
+                ConnectContext.get().getGlobalStateMgr().getNodeMgr().getClusterInfo().getAliveComputeNodeNumber(),
                 ConnectContext.get().getSessionVariable().getDegreeOfParallelism());
         switch (execMode) {
             case BROADCAST:
@@ -99,14 +104,22 @@ public class HashJoinCostModel {
                 buildCost = rightOutput;
                 probeCost = leftOutput;
         }
-        return buildCost + probeCost;
+        double joinCost = buildCost + probeCost;
+        // should add output cost
+        joinCost += joinStatistics.getComputeSize();
+        return joinCost;
     }
 
     public double getMemCost() {
         JoinExecMode execMode = deriveJoinExecMode();
         double rightOutput = rightStatistics.getOutputSize(context.getChildOutputColumns(1));
         double memCost;
-        int beNum = Math.max(1, ConnectContext.get().getAliveBackendNumber());
+
+        // TODO: It may not be accurate in shared-data cluster using all alive compute nodes to
+        //  estimate the cost, ideally it should be warehouse awareness.
+        int beNum = Math.max(1, ConnectContext.get().getAliveBackendNumber() +
+                (RunMode.isSharedDataMode() ?
+                ConnectContext.get().getGlobalStateMgr().getNodeMgr().getClusterInfo().getAliveComputeNodeNumber() : 0));
 
         if (JoinExecMode.BROADCAST == execMode) {
             memCost = rightOutput * beNum;
@@ -121,7 +134,8 @@ public class HashJoinCostModel {
         double keySize = calculateKeySize();
 
         double cachePenaltyFactor;
-        int parallelFactor = Math.max(ConnectContext.get().getAliveBackendNumber(),
+        int parallelFactor = Math.max(ConnectContext.get().getAliveBackendNumber() +
+                ConnectContext.get().getGlobalStateMgr().getNodeMgr().getClusterInfo().getAliveComputeNodeNumber(),
                 ConnectContext.get().getSessionVariable().getDegreeOfParallelism()) * 2;
         double mapSize = Math.min(1, keySize) * rightStatistics.getOutputRowCount();
 
@@ -163,13 +177,20 @@ public class HashJoinCostModel {
                 buildMapOp = rightOp;
             }
 
+            ColumnStatistic keyStatistics;
             if (buildMapOp.isColumnRef()) {
-                keySize += rightTableStat.getColumnStatistics().get(buildMapOp).getAverageRowSize();
+                keyStatistics = rightTableStat.getColumnStatistic((ColumnRefOperator) buildMapOp);
             } else {
                 Statistics.Builder allBuilder = Statistics.builder();
                 allBuilder.addColumnStatistics(rightTableStat.getColumnStatistics());
-                ColumnStatistic outputStatistic = ExpressionStatisticCalculator.calculate(buildMapOp, allBuilder.build());
-                keySize += outputStatistic.getAverageRowSize();
+                keyStatistics = ExpressionStatisticCalculator.calculate(buildMapOp, allBuilder.build());
+            }
+
+            if (keyStatistics.isUnknown()) {
+                // can't trust unknown statistics, may be produced by other node
+                keySize += buildMapOp.getType().getTypeSize();
+            } else {
+                keySize += keyStatistics.getAverageRowSize();
             }
         }
         return keySize;

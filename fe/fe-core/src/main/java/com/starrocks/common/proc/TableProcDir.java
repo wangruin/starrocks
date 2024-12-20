@@ -40,7 +40,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.EsTable;
-import com.starrocks.catalog.HiveMetaStoreTable;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
@@ -99,18 +98,18 @@ public class TableProcDir implements ProcDirInterface {
         }
 
         if (entryName.equals(PARTITIONS)) {
-            if (table.isNativeTable()) {
+            if (table.isNativeTableOrMaterializedView()) {
                 return new PartitionsProcDir(db, (OlapTable) table, false);
             } else if (table.getType() == TableType.ELASTICSEARCH) {
                 return new EsPartitionsProcDir(db, (EsTable) table);
-            } else if (table instanceof HiveMetaStoreTable) {
-                return new HMSTablePartitionsProcDir((HiveMetaStoreTable) table);
+            } else if (table.isHMSTable()) {
+                return new HMSTablePartitionsProcDir(table);
             } else {
                 throw new AnalysisException(
                         "Table[" + table.getName() + "] is not a OLAP/MATERIALIZED_VIEW/ELASTICSEARCH/HIVE/HUDI table");
             }
         } else if (entryName.equals(TEMP_PARTITIONS)) {
-            if (table.isNativeTable()) {
+            if (table.isNativeTableOrMaterializedView()) {
                 return new PartitionsProcDir(db, (OlapTable) table, true);
             } else {
                 throw new AnalysisException("Table[" + table.getName() + "] does not have temp partitions");

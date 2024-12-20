@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.persist;
 
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.authentication.AuthenticationException;
 import com.starrocks.authentication.UserAuthenticationInfo;
 import com.starrocks.authentication.UserProperty;
+import com.starrocks.authorization.UserPrivilegeCollectionV2;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
-import com.starrocks.privilege.UserPrivilegeCollection;
 import com.starrocks.sql.ast.UserIdentity;
 
 import java.io.DataInput;
@@ -36,8 +35,9 @@ public class CreateUserInfo implements Writable {
     UserAuthenticationInfo authenticationInfo;
     @SerializedName(value = "p")
     UserProperty userProperty;
-    @SerializedName(value = "c")
-    UserPrivilegeCollection userPrivilegeCollection;
+
+    @SerializedName(value = "c2")
+    UserPrivilegeCollectionV2 userPrivilegeCollectionV2;
 
     @SerializedName(value = "i")
     short pluginId;
@@ -49,13 +49,13 @@ public class CreateUserInfo implements Writable {
             UserIdentity userIdentity,
             UserAuthenticationInfo authenticationInfo,
             UserProperty userProperty,
-            UserPrivilegeCollection privilegeCollection,
+            UserPrivilegeCollectionV2 privilegeCollection,
             short pluginId,
             short pluginVersion) {
         this.userIdentity = userIdentity;
         this.authenticationInfo = authenticationInfo;
         this.userProperty = userProperty;
-        this.userPrivilegeCollection = privilegeCollection;
+        this.userPrivilegeCollectionV2 = privilegeCollection;
         this.pluginId = pluginId;
         this.pluginVersion = pluginVersion;
     }
@@ -72,8 +72,8 @@ public class CreateUserInfo implements Writable {
         return userProperty;
     }
 
-    public UserPrivilegeCollection getUserPrivilegeCollection() {
-        return userPrivilegeCollection;
+    public UserPrivilegeCollectionV2 getUserPrivilegeCollection() {
+        return userPrivilegeCollectionV2;
     }
 
     public short getPluginId() {

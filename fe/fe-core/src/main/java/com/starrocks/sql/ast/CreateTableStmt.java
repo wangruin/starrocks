@@ -12,14 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.ast;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.ColumnDef;
-import com.starrocks.analysis.IndexDef;
-import com.starrocks.analysis.KeysDesc;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Index;
@@ -49,13 +45,18 @@ public class CreateTableStmt extends DdlStmt {
     private List<AlterClause> rollupAlterClauseList;
 
     // set in analyze
-    private List<Column> columns = Lists.newArrayList();
+    private List<Column> columns;
     private List<String> sortKeys = Lists.newArrayList();
 
-    private List<Index> indexes = Lists.newArrayList();
+    private List<Index> indexes;
 
     // for backup. set to -1 for normal use
     private int tableSignature;
+
+    boolean hasHll = false;
+    boolean hasBitmap = false;
+    boolean hasReplace = false;
+    boolean hasGeneratedColumn = false;
 
     public CreateTableStmt(boolean ifNotExists,
                            boolean isExternal,
@@ -179,12 +180,20 @@ public class CreateTableStmt extends DdlStmt {
         return tableName;
     }
 
+    public String getCatalogName() {
+        return tableName.getCatalog();
+    }
+
     public String getTableName() {
         return tableName.getTbl();
     }
 
     public List<Column> getColumns() {
         return this.columns;
+    }
+
+    public void setColumns(List<Column> columns) {
+        this.columns = columns;
     }
 
     public KeysDesc getKeysDesc() {
@@ -259,6 +268,10 @@ public class CreateTableStmt extends DdlStmt {
         return indexes;
     }
 
+    public void setIndexes(List<Index> indexes) {
+        this.indexes = indexes;
+    }
+
     public List<ColumnDef> getColumnDefs() {
         return columnDefs;
     }
@@ -275,17 +288,56 @@ public class CreateTableStmt extends DdlStmt {
         this.properties = properties;
     }
 
+    public void updateProperties(Map<String, String> properties) {
+        if (this.properties == null) {
+            this.properties = properties;
+        } else {
+            this.properties.putAll(properties);
+        }
+    }
+
     public void setDistributionDesc(DistributionDesc distributionDesc) {
         this.distributionDesc = distributionDesc;
     }
 
-    public static CreateTableStmt read(DataInput in) throws IOException {
-        throw new RuntimeException("CreateTableStmt serialization is not supported anymore.");
+    public void setPartitionDesc(PartitionDesc partitionDesc) {
+        this.partitionDesc = partitionDesc;
     }
 
-    @Override
-    public boolean needAuditEncryption() {
-        return !isOlapEngine();
+    public void setHasBitmap(boolean hasBitmap) {
+        this.hasBitmap = hasBitmap;
+    }
+
+    public boolean isHasBitmap() {
+        return hasBitmap;
+    }
+
+    public void setHasHll(boolean hasHll) {
+        this.hasHll = hasHll;
+    }
+
+    public boolean isHasHll() {
+        return hasHll;
+    }
+
+    public void setHasReplace(boolean hasReplace) {
+        this.hasReplace = hasReplace;
+    }
+
+    public boolean isHasReplace() {
+        return hasReplace;
+    }
+
+    public void setHasGeneratedColumn(boolean hasGeneratedColumn) {
+        this.hasGeneratedColumn = hasGeneratedColumn;
+    }
+
+    public boolean isHasGeneratedColumn() {
+        return hasGeneratedColumn;
+    }
+
+    public static CreateTableStmt read(DataInput in) throws IOException {
+        throw new RuntimeException("CreateTableStmt serialization is not supported anymore.");
     }
 
     @Override

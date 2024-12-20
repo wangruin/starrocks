@@ -45,6 +45,7 @@
 #include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "gen_cpp/Types_types.h"
+#include "runtime/base_load_path_mgr.h"
 #include "runtime/exec_env.h"
 #include "storage/olap_define.h"
 #include "storage/storage_engine.h"
@@ -69,6 +70,7 @@ Status LoadPathMgr::init() {
 
     // error log is saved in first root path
     _error_log_dir = _exec_env->store_paths()[0].path + ERROR_LOG_PREFIX;
+
     // check and make dir
     RETURN_IF_ERROR(fs::create_directories(_error_log_dir));
 
@@ -117,7 +119,7 @@ Status LoadPathMgr::allocate_dir(const std::string& db, const std::string& label
             *prefix = path;
             return Status::OK();
         } else {
-            LOG(WARNING) << "create dir failed:" << path << ", error msg:" << status.get_error_msg();
+            LOG(WARNING) << "create dir failed:" << path << ", error msg:" << status.message();
         }
     }
 
@@ -159,6 +161,23 @@ std::string LoadPathMgr::get_load_error_absolute_path(const std::string& file_pa
     path.append("/");
     path.append(file_path);
     return path;
+}
+
+std::string LoadPathMgr::get_load_rejected_record_absolute_path(const std::string& rejected_record_dir,
+                                                                const std::string& db, const std::string& label,
+                                                                const int64_t id,
+                                                                const TUniqueId& fragment_instance_id) {
+    std::string path;
+    if (rejected_record_dir.empty()) {
+        path = _exec_env->store_paths()[0].path + REJECTED_RECORD_PREFIX;
+    } else {
+        path = rejected_record_dir;
+    }
+
+    std::stringstream ss;
+    ss << path << "/" << db << "/" << label << "/" << id << "/" << std::hex << fragment_instance_id.hi << "_"
+       << fragment_instance_id.lo;
+    return ss.str();
 }
 
 void LoadPathMgr::process_path(time_t now, const std::string& path, int64_t reserve_hours) {

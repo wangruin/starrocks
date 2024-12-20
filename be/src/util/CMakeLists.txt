@@ -22,13 +22,16 @@ set(UTIL_FILES
   arrow/row_batch.cpp
   arrow/starrocks_column_to_arrow.cpp
   arrow/utils.cpp
+  await.cpp
   bfd_parser.cpp
+  base85.cpp
   compression/block_compression.cpp
   compression/compression_context_pool_singletons.cpp
   compression/stream_compression.cpp
   coding.cpp
   cpu_info.cpp
   cpu_usage_info.cpp
+  cpu_util.cpp
   crc32c.cpp
   date_func.cpp
   dynamic_util.cpp
@@ -39,10 +42,12 @@ set(UTIL_FILES
   hash_util.hpp
   json_util.cpp
   json.cpp
+  json_flattener.cpp
   json_converter.cpp
   starrocks_metrics.cpp
   mem_info.cpp
   metrics.cpp
+  misc.cpp
   murmur_hash3.cpp
   network_util.cpp
   parse_util.cpp
@@ -60,7 +65,6 @@ set(UTIL_FILES
   url_parser.cpp
   url_coding.cpp
   mysql_row_buffer.cpp
-  error_util.cc
   spinlock.cc
   file_util.cpp
   filesystem_util.cc
@@ -95,6 +99,13 @@ set(UTIL_FILES
   lru_cache.cpp
   tdigest.cpp
   debug/query_trace_impl.cpp
+  random.cc
+  stack_trace_mutex.cpp
+  failpoint/fail_point.cpp
+  bthreads/future.h
+  bthreads/future_impl.cpp
+  hash_util.cpp
+  internal_service_recoverable_stub.cpp
 )
 
 add_library(Util STATIC

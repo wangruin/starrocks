@@ -66,11 +66,13 @@ public class InPredicate extends Predicate {
         children.add(compareExpr);
         children.addAll(inList);
         this.isNotIn = isNotIn;
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     protected InPredicate(InPredicate other) {
         super(other);
         isNotIn = other.isNotIn();
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     public int getInElementNum() {
@@ -95,6 +97,7 @@ public class InPredicate extends Predicate {
         children.add(compareExpr);
         children.add(subquery);
         this.isNotIn = isNotIn;
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     /**
@@ -131,7 +134,11 @@ public class InPredicate extends Predicate {
         msg.node_type = TExprNodeType.IN_PRED;
         msg.setOpcode(opcode);
         msg.setVector_opcode(vectorOpcode);
-        msg.setChild_type(getChild(0).getType().getPrimitiveType().toThrift());
+        if (getChild(0).getType().isComplexType()) {
+            msg.setChild_type_desc(getChild(0).getType().toThrift());
+        } else {
+            msg.setChild_type(getChild(0).getType().getPrimitiveType().toThrift());
+        }
     }
 
     @Override

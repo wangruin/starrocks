@@ -15,6 +15,7 @@
 
 package com.starrocks.sql.optimizer.rewrite.scalar;
 
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
@@ -82,35 +83,45 @@ public class ReduceCastRule extends TopDownScalarOperatorRewriteRule {
             return operator;
         }
 
-        ScalarOperator castChild = child1.getChild(0);
+        ScalarOperator cast1Child = child1.getChild(0);
         // abandon cast function when cast datetime to date
-        if (castChild.getType().isDate() && child2.getType().isDatetime()) {
+        if (cast1Child.getType().isDate() && child2.getType().isDatetime()) {
             return reduceDateToDatetimeCast(operator);
         }
 
-        if (castChild.getType().isDatetime() && child2.getType().isDate()) {
+        if (cast1Child.getType().isDatetime() && child2.getType().isDate()) {
             return reduceDatetimeToDateCast(operator);
         }
 
         // BinaryPredicate involving Decimal
-        if (castChild.getType().isDecimalOfAnyVersion()
+        if (cast1Child.getType().isDecimalOfAnyVersion()
                 || child1.getType().isDecimalOfAnyVersion()
                 || child2.getType().isDecimalOfAnyVersion()) {
             Optional<ScalarOperator> resultChild2 =
                     Utils.tryDecimalCastConstant((CastOperator) child1, (ConstantOperator) child2);
             return resultChild2
-                    .map(scalarOperator -> new BinaryPredicateOperator(operator.getBinaryType(), castChild,
+                    .map(scalarOperator -> new BinaryPredicateOperator(operator.getBinaryType(), cast1Child,
                             scalarOperator))
                     .orElse(operator);
         }
 
-        if (!(castChild.getType().isNumericType() && child2.getType().isNumericType())) {
+        if (!(cast1Child.getType().isNumericType() && child2.getType().isNumericType())) {
             return operator;
         }
 
-        Optional<ScalarOperator> resultChild2 = Utils.tryCastConstant(child2, castChild.getType());
+        Type child1Type = child1.getType();
+        Type cast1ChildType = cast1Child.getType();
+
+        // if cast(cast1ChildType cast1Child) as child1Type will loss precision, we can't optimize it
+        // e.g. cast(96.1) as int = 96, we can't change it into 96.1 = cast(96) as double
+        if (!Type.isImplicitlyCastable(cast1ChildType, child1Type, true)) {
+            return operator;
+        }
+
+        Optional<ScalarOperator> resultChild2 = Utils.tryCastConstant(child2, cast1Child.getType());
         return resultChild2
-                .map(scalarOperator -> new BinaryPredicateOperator(operator.getBinaryType(), castChild, scalarOperator))
+                .map(scalarOperator -> new BinaryPredicateOperator(operator.getBinaryType(), cast1Child,
+                        scalarOperator))
                 .orElse(operator);
     }
 
@@ -152,7 +163,7 @@ public class ReduceCastRule extends TopDownScalarOperatorRewriteRule {
         LocalDateTime bottomDateTime = child2.getDatetime().truncatedTo(ChronoUnit.DAYS);
 
         LocalDateTime targetDateTime;
-        BinaryPredicateOperator.BinaryType binaryType = operator.getBinaryType();
+        BinaryType binaryType = operator.getBinaryType();
         int offset;
         BinaryPredicateOperator resultBinaryPredicateOperator;
         ConstantOperator newDate;
@@ -220,7 +231,7 @@ public class ReduceCastRule extends TopDownScalarOperatorRewriteRule {
 
         LocalDateTime originalDate = child2.getDate().truncatedTo(ChronoUnit.DAYS);
         LocalDateTime targetDate;
-        BinaryPredicateOperator.BinaryType binaryType = operator.getBinaryType();
+        BinaryType binaryType = operator.getBinaryType();
         int offset;
         ScalarOperator resultBinaryPredicateOperator;
         ConstantOperator newDatetime;

@@ -36,13 +36,7 @@
 
 #include <utility>
 
-#include "gutil/strings/substitute.h"
-#include "util/debug_util.h"
-#include "util/mem_info.h"
-#include "util/pretty_printer.h"
-#include "util/stack_util.h"
-#include "util/starrocks_metrics.h"
-#include "util/uid_util.h"
+#include "service/backend_options.h"
 
 namespace starrocks {
 
@@ -142,6 +136,7 @@ Status MemTracker::check_mem_limit(const std::string& msg) const {
 std::string MemTracker::err_msg(const std::string& msg) const {
     std::stringstream str;
     str << "Memory of " << label() << " exceed limit. " << msg << " ";
+    str << "Backend: " << BackendOptions::get_localhost() << ", ";
     str << "Used: " << consumption() << ", Limit: " << limit() << ". ";
     switch (type()) {
     case MemTracker::NO_SET:
@@ -164,6 +159,19 @@ std::string MemTracker::err_msg(const std::string& msg) const {
         break;
     case MemTracker::SCHEMA_CHANGE_TASK:
         str << "You can change the limit by modify BE config [memory_limitation_per_thread_for_schema_change]";
+        break;
+    case MemTracker::RESOURCE_GROUP:
+        // TODO: make default_wg configuable.
+        if (label() == "default_wg") {
+            str << "Mem usage has exceed the limit of query pool";
+        } else {
+            str << "Mem usage has exceed the limit of the resource group [" << label() << "]. "
+                << "You can change the limit by modifying [mem_limit] of this group";
+        }
+        break;
+    case MemTracker::RESOURCE_GROUP_BIG_QUERY:
+        str << "Mem usage has exceed the big query limit of the resource group [" << label() << "]. "
+            << "You can change the limit by modifying [big_query_mem_limit] of this group";
         break;
     default:
         break;

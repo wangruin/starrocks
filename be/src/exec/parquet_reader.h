@@ -37,11 +37,12 @@
 
 namespace starrocks {
 
+class ScannerCounter;
 using RecordBatch = ::arrow::RecordBatch;
 using RecordBatchPtr = std::shared_ptr<RecordBatch>;
 class ParquetChunkFile : public arrow::io::RandomAccessFile {
 public:
-    ParquetChunkFile(std::shared_ptr<starrocks::RandomAccessFile> file, uint64_t pos);
+    ParquetChunkFile(std::shared_ptr<starrocks::RandomAccessFile> file, uint64_t pos, ScannerCounter* counter);
     ~ParquetChunkFile() override;
     arrow::Result<int64_t> Read(int64_t nbytes, void* buffer) override;
     arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override;
@@ -56,6 +57,7 @@ public:
 private:
     std::shared_ptr<starrocks::RandomAccessFile> _file;
     uint64_t _pos = 0;
+    ScannerCounter* _counter = nullptr;
 };
 
 class ParquetReaderWrap {
@@ -66,24 +68,31 @@ public:
 
     void close();
     Status size(int64_t* size);
-    Status init_parquet_reader(const std::vector<SlotDescriptor*>& tuple_slot_descs, const std::string& timezone);
+    Status init_parquet_reader(const std::vector<SlotDescriptor*>& tuple_slot_descs);
     Status read_record_batch(const std::vector<SlotDescriptor*>& tuple_slot_descs, bool* eof);
     const std::shared_ptr<arrow::RecordBatch>& get_batch();
+    int64_t num_rows() { return _num_rows; }
+
+    Status get_schema(std::vector<SlotDescriptor>* schema);
+    void set_invalid_as_null(bool invalid_as_null) { _invalid_as_null = invalid_as_null; }
 
 private:
     Status column_indices(const std::vector<SlotDescriptor*>& tuple_slot_descs);
     Status handle_timestamp(const std::shared_ptr<arrow::TimestampArray>& ts_array, uint8_t* buf, int32_t* wbtyes);
     Status next_selected_row_group();
+    // _init_parquet_reader initializes the underlying parquets reader.
+    Status _init_parquet_reader();
 
     const int32_t _num_of_columns_from_file;
-    parquet::ReaderProperties _properties;
+    int64_t _num_rows = 0;
+    ::parquet::ReaderProperties _properties;
     std::shared_ptr<arrow::io::RandomAccessFile> _parquet;
 
     // parquet file reader object
     std::shared_ptr<::arrow::RecordBatchReader> _rb_batch;
     std::shared_ptr<arrow::RecordBatch> _batch;
-    std::unique_ptr<parquet::arrow::FileReader> _reader;
-    std::shared_ptr<parquet::FileMetaData> _file_metadata;
+    std::unique_ptr<::parquet::arrow::FileReader> _reader;
+    std::shared_ptr<::parquet::FileMetaData> _file_metadata;
 
     // For nested column type, it's consisting of multiple physical-columns
     std::map<std::string, std::vector<int>> _map_column_nested;
@@ -98,8 +107,9 @@ private:
     int64_t _read_offset;
     int64_t _read_size;
 
-    std::string _timezone;
     std::string _filename;
+
+    bool _invalid_as_null{false};
 };
 
 // Reader of broker parquet file
@@ -111,6 +121,8 @@ public:
                        const std::vector<SlotDescriptor*>& src_slot_descs, std::string time_zone);
     ~ParquetChunkReader();
     Status next_batch(RecordBatchPtr* batch);
+    int64_t total_num_rows() const;
+    Status get_schema(std::vector<SlotDescriptor>* schema);
 
 private:
     std::shared_ptr<ParquetReaderWrap> _parquet_reader;

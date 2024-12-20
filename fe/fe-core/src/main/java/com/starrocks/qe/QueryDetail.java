@@ -34,6 +34,7 @@
 
 package com.starrocks.qe;
 
+import com.starrocks.server.WarehouseManager;
 
 import java.io.Serializable;
 
@@ -47,11 +48,11 @@ public class QueryDetail implements Serializable {
 
     // When query received, FE will construct a QueryDetail
     // object. This object will set queryId, startTime, sql
-    // fields. As well state is be set as RUNNING. 
+    // fields. As well state is be set as RUNNING.
     // After query finished, endTime and latency will
     // be set and state will be updated to be FINISHED/FAILED/CANCELLED
     // according to the query execution results.
-    // So, one query will be inserted into as a item and 
+    // So, one query will be inserted into as a item and
     // be udpated upon finished. To indicate the two event,
     // a extra field named eventTime is added.
     private long eventTime;
@@ -64,6 +65,10 @@ public class QueryDetail implements Serializable {
     // default value will set to be minus one(-1).
     private long endTime;
     private long latency;
+
+    private long pendingTime = -1;
+    private long netTime = -1;
+    private long netComputeTime = -1;
     private QueryMemState state;
     private String database;
     private String sql;
@@ -72,13 +77,22 @@ public class QueryDetail implements Serializable {
     private String explain;
     private String profile;
     private String resourceGroupName;
+    private long scanRows = -1;
+    private long scanBytes = -1;
+    private long returnRows = -1;
+    private long cpuCostNs = -1;
+    private long memCostBytes = -1;
+    private long spillBytes = -1;
+    private String warehouse = WarehouseManager.DEFAULT_WAREHOUSE_NAME;
+    private String digest;
+    private String catalog;
 
     public QueryDetail() {
     }
 
     public QueryDetail(String queryId, boolean isQuery, int connId, String remoteIP,
                        long startTime, long endTime, long latency, QueryMemState state,
-                       String database, String sql, String user, String resourceGroupName) {
+                       String database, String sql, String user, String resourceGroupName, String catalog) {
         this.queryId = queryId;
         this.isQuery = isQuery;
         this.connId = connId;
@@ -99,6 +113,16 @@ public class QueryDetail implements Serializable {
         }
         this.sql = sql;
         this.user = user;
+        this.catalog = catalog;
+    }
+
+    public QueryDetail(String queryId, boolean isQuery, int connId, String remoteIP,
+                        long startTime, long endTime, long latency, QueryMemState state,
+                        String database, String sql, String user, String resourceGroupName,
+                        String warehouse, String catalog) {
+        this(queryId, isQuery, connId, remoteIP, startTime, endTime, latency,
+                state, database, sql, user, resourceGroupName, catalog);
+        this.warehouse = warehouse;
     }
 
     public QueryDetail copy() {
@@ -118,6 +142,16 @@ public class QueryDetail implements Serializable {
         queryDetail.errorMessage = this.errorMessage;
         queryDetail.explain = this.explain;
         queryDetail.profile = this.profile;
+        queryDetail.scanRows = this.scanRows;
+        queryDetail.scanBytes = this.scanBytes;
+        queryDetail.returnRows = this.returnRows;
+        queryDetail.cpuCostNs = this.cpuCostNs;
+        queryDetail.memCostBytes = this.memCostBytes;
+        queryDetail.spillBytes = this.spillBytes;
+        queryDetail.warehouse = this.warehouse;
+        queryDetail.digest = this.digest;
+        queryDetail.resourceGroupName = this.resourceGroupName;
+        queryDetail.catalog = this.catalog;
         return queryDetail;
     }
 
@@ -175,6 +209,30 @@ public class QueryDetail implements Serializable {
 
     public long getLatency() {
         return latency;
+    }
+
+    public long getPendingTime() {
+        return pendingTime;
+    }
+
+    public void setPendingTime(long pendingTime) {
+        this.pendingTime = pendingTime;
+    }
+
+    public long getNetTime() {
+        return netTime;
+    }
+
+    public void setNetTime(long netTime) {
+        this.netTime = netTime;
+    }
+
+    public long getNetComputeTime() {
+        return netComputeTime;
+    }
+
+    public void setNetComputeTime(long netComputeTime) {
+        this.netComputeTime = netComputeTime;
     }
 
     public void setState(QueryMemState state) {
@@ -239,5 +297,73 @@ public class QueryDetail implements Serializable {
 
     public void setResourceGroupName(String workGroupName) {
         this.resourceGroupName = workGroupName;
+    }
+
+    public long getScanRows() {
+        return scanRows;
+    }
+
+    public void setScanRows(long scanRows) {
+        this.scanRows = scanRows;
+    }
+
+    public long getScanBytes() {
+        return scanBytes;
+    }
+
+    public void setScanBytes(long scanBytes) {
+        this.scanBytes = scanBytes;
+    }
+
+    public long getReturnRows() {
+        return returnRows;
+    }
+
+    public void setReturnRows(long returnRows) {
+        this.returnRows = returnRows;
+    }
+
+    public long getCpuCostNs() {
+        return cpuCostNs;
+    }
+
+    public void setCpuCostNs(long cpuCostNs) {
+        this.cpuCostNs = cpuCostNs;
+    }
+
+    public long getMemCostBytes() {
+        return memCostBytes;
+    }
+
+    public void setMemCostBytes(long memCostBytes) {
+        this.memCostBytes = memCostBytes;
+    }
+
+    public void setSpillBytes(long spillBytes) {
+        this.spillBytes = spillBytes;
+    }
+
+    public void setWarehouse(String warehouse) {
+        this.warehouse = warehouse;
+    }
+
+    public String getWarehouse() {
+        return warehouse;
+    }
+
+    public String getDigest() {
+        return digest;
+    }
+
+    public void setDigest(String digest) {
+        this.digest = digest;
+    }
+
+    public String getCatalog() {
+        return catalog;
+    }
+
+    public void setCatalog(String catalog) {
+        this.catalog = catalog;
     }
 }

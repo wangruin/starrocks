@@ -18,11 +18,13 @@ package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
@@ -74,8 +76,7 @@ public class UtilsTest {
             + "DISTRIBUTED BY HASH(`table_id`, `column_name`, `db_id`) BUCKETS 2\n"
             + "PROPERTIES (\n"
             + "\"replication_num\" = \"1\",\n"
-            + "\"in_memory\" = \"false\",\n"
-            + "\"storage_format\" = \"V2\"\n"
+            + "\"in_memory\" = \"false\"\n"
             + ");";
 
     private static ConnectContext connectContext;
@@ -83,13 +84,13 @@ public class UtilsTest {
 
     protected static void setTableStatistics(OlapTable table, long rowCount) {
         for (Partition partition : table.getAllPartitions()) {
-            partition.getBaseIndex().setRowCount(rowCount);
+            partition.getDefaultPhysicalPartition().getBaseIndex().setRowCount(rowCount);
         }
     }
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        FeConstants.default_scheduler_interval_millisecond = 1;
+        Config.alter_scheduler_interval_millisecond = 1;
         UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
@@ -111,8 +112,7 @@ public class UtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t1` (\n" +
@@ -124,13 +124,12 @@ public class UtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         CreateDbStmt dbStmt = new CreateDbStmt(false, StatsConstants.STATISTICS_DB_NAME);
         try {
-            GlobalStateMgr.getCurrentState().getMetadata().createDb(dbStmt.getFullDbName());
+            GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(dbStmt.getFullDbName());
         } catch (DdlException e) {
             return;
         }
@@ -165,7 +164,7 @@ public class UtilsTest {
                 new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
                         ConstantOperator.createBoolean(false),
                         new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
-                                new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ,
+                                new BinaryPredicateOperator(BinaryType.EQ,
                                         new ColumnRefOperator(3, Type.INT, "hello", true),
                                         ConstantOperator.createInt(1)),
                                 new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
@@ -262,9 +261,9 @@ public class UtilsTest {
     public void unknownStats1() {
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
 
-        OlapTable t0 = (OlapTable) globalStateMgr.getDb("test").getTable("t0");
+        OlapTable t0 = (OlapTable) globalStateMgr.getLocalMetastore().getDb("test").getTable("t0");
         setTableStatistics(t0, 10);
-        GlobalStateMgr.getCurrentStatisticStorage().addColumnStatistic(t0, "v1",
+        GlobalStateMgr.getCurrentState().getStatisticStorage().addColumnStatistic(t0, "v1",
                 new ColumnStatistic(1, 1, 0, 1, 1));
 
         Map<ColumnRefOperator, Column> columnRefMap = new HashMap<>();
@@ -279,9 +278,9 @@ public class UtilsTest {
                 new OptExpression(new LogicalOlapScanOperator(t0, columnRefMap, Maps.newHashMap(), null, -1, null));
         Assert.assertTrue(Utils.hasUnknownColumnsStats(opt));
 
-        GlobalStateMgr.getCurrentStatisticStorage().addColumnStatistic(t0, "v2",
+        GlobalStateMgr.getCurrentState().getStatisticStorage().addColumnStatistic(t0, "v2",
                 new ColumnStatistic(1, 1, 0, 1, 1));
-        GlobalStateMgr.getCurrentStatisticStorage().addColumnStatistic(t0, "v3",
+        GlobalStateMgr.getCurrentState().getStatisticStorage().addColumnStatistic(t0, "v3",
                 new ColumnStatistic(1, 1, 0, 1, 1));
         opt = new OptExpression(new LogicalOlapScanOperator(t0, columnRefMap, Maps.newHashMap(), null, -1, null));
         Assert.assertFalse(Utils.hasUnknownColumnsStats(opt));
@@ -290,7 +289,7 @@ public class UtilsTest {
     @Test
     public void unknownStats2() {
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
-        OlapTable t1 = (OlapTable) globalStateMgr.getDb("test").getTable("t1");
+        OlapTable t1 = (OlapTable) globalStateMgr.getLocalMetastore().getDb("test").getTable("t1");
         OptExpression opt =
                 new OptExpression(
                         new LogicalOlapScanOperator(t1, Maps.newHashMap(), Maps.newHashMap(), null, -1, null));

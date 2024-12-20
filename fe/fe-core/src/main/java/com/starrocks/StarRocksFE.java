@@ -41,7 +41,6 @@ import com.starrocks.common.Config;
 import com.starrocks.common.Log4jConfig;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.Version;
-import com.starrocks.common.util.JdkUtils;
 import com.starrocks.ha.StateChangeExecutor;
 import com.starrocks.http.HttpServer;
 import com.starrocks.journal.Journal;
@@ -49,14 +48,16 @@ import com.starrocks.journal.bdbje.BDBEnvironment;
 import com.starrocks.journal.bdbje.BDBJEJournal;
 import com.starrocks.journal.bdbje.BDBTool;
 import com.starrocks.journal.bdbje.BDBToolOptions;
+import com.starrocks.lake.snapshot.RestoreClusterSnapshotMgr;
 import com.starrocks.leader.MetaHelper;
 import com.starrocks.qe.CoordinatorMonitor;
 import com.starrocks.qe.QeService;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.RunMode;
 import com.starrocks.service.ExecuteEnv;
-import com.starrocks.service.FeServer;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.service.FrontendThriftServer;
+import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlService;
 import com.starrocks.staros.StarMgrServer;
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
@@ -78,9 +79,12 @@ public class StarRocksFE {
     public static final String STARROCKS_HOME_DIR = System.getenv("STARROCKS_HOME");
     public static final String PID_DIR = System.getenv("PID_DIR");
 
+    public static volatile boolean stopped = false;
+
     public static void main(String[] args) {
         start(STARROCKS_HOME_DIR, PID_DIR, args);
     }
+
 
     // entrance for starrocks frontend
     public static void start(String starRocksDir, String pidDir, String[] args) {
@@ -105,23 +109,21 @@ public class StarRocksFE {
             // init config
             new Config().init(starRocksDir + "/conf/fe.conf");
 
-            // check it after Config is initialized, otherwise the config 'check_java_version' won't work.
-            if (!JdkUtils.checkJavaVersion()) {
-                throw new IllegalArgumentException("Java version doesn't match");
-            }
+            // check command line options
+            // NOTE: do it before init log4jConfig to avoid unnecessary stdout messages
+            checkCommandLineOptions(cmdLineOpts);
 
             Log4jConfig.initLogging();
 
             // set dns cache ttl
             java.security.Security.setProperty("networkaddress.cache.ttl", "60");
 
-            // check command line options
-            checkCommandLineOptions(cmdLineOpts);
+            RestoreClusterSnapshotMgr.init(starRocksDir + "/conf/cluster_snapshot.yaml", args);
 
             // check meta dir
             MetaHelper.checkMetaDir();
 
-            LOG.info("StarRocks FE starting...");
+            LOG.info("StarRocks FE starting, version: {}-{}", Version.STARROCKS_VERSION, Version.STARROCKS_COMMIT_HASH);
 
             FrontendOptions.init(args);
             ExecuteEnv.setup();
@@ -129,10 +131,7 @@ public class StarRocksFE {
             // init globalStateMgr
             GlobalStateMgr.getCurrentState().initialize(args);
 
-            StateChangeExecutor.getInstance().setMetaContext(
-                    GlobalStateMgr.getCurrentState().getMetaContext());
-
-            if (RunMode.allowCreateLakeTable()) {
+            if (RunMode.isSharedDataMode()) {
                 Journal journal = GlobalStateMgr.getCurrentState().getJournal();
                 if (journal instanceof BDBJEJournal) {
                     BDBEnvironment bdbEnvironment = ((BDBJEJournal) journal).getBdbEnvironment();
@@ -161,28 +160,40 @@ public class StarRocksFE {
 
             // init and start:
             // 1. QeService for MySQL Server
-            // 2. FeServer for Thrift Server
+            // 2. FrontendThriftServer for Thrift Server
             // 3. HttpServer for HTTP Server
+            // 4. ArrowFlightSqlService for Arrow Flight Sql Server
             QeService qeService = new QeService(Config.query_port, Config.mysql_service_nio_enabled,
                     ExecuteEnv.getInstance().getScheduler());
-            FeServer feServer = new FeServer(Config.rpc_port);
+            FrontendThriftServer frontendThriftServer = new FrontendThriftServer(Config.rpc_port);
             HttpServer httpServer = new HttpServer(Config.http_port);
+            ArrowFlightSqlService arrowFlightSqlService = new ArrowFlightSqlService(Config.arrow_flight_port);
+
             httpServer.setup();
 
-            feServer.start();
+            frontendThriftServer.start();
             httpServer.start();
             qeService.start();
+            arrowFlightSqlService.start();
 
             ThreadPoolManager.registerAllThreadPoolMetric();
 
             addShutdownHook();
 
-            while (true) {
+            LOG.info("FE started successfully");
+
+            RestoreClusterSnapshotMgr.finishRestoring();
+
+            while (!stopped) {
                 Thread.sleep(2000);
             }
+
         } catch (Throwable e) {
             LOG.error("StarRocksFE start failed", e);
+            System.exit(-1);
         }
+
+        System.exit(0);
     }
 
     /*
@@ -213,6 +224,7 @@ public class StarRocksFE {
         CommandLineParser commandLineParser = new BasicParser();
         Options options = new Options();
         options.addOption("ht", "host_type", false, "Specify fe start use ip or fqdn");
+        options.addOption("rs", "cluster_snapshot", false, "Specify fe start to restore from a cluster snapshot");
         options.addOption("v", "version", false, "Print the version of StarRocks Frontend");
         options.addOption("h", "helper", true, "Specify the helper node when joining a bdb je replication group");
         options.addOption("b", "bdb", false, "Run bdbje debug tools");
@@ -229,19 +241,19 @@ public class StarRocksFE {
         try {
             cmd = commandLineParser.parse(options, args);
         } catch (final ParseException e) {
-            LOG.error(e);
+            LOG.error(e.getMessage(), e);
             System.err.println("Failed to parse command line. exit now");
             System.exit(-1);
         }
 
         // version
         if (cmd.hasOption('v') || cmd.hasOption("version")) {
-            return new CommandLineOptions(true, "", null);
+            return new CommandLineOptions(true, null);
         } else if (cmd.hasOption('b') || cmd.hasOption("bdb")) {
             if (cmd.hasOption('l') || cmd.hasOption("listdb")) {
                 // list bdb je databases
                 BDBToolOptions bdbOpts = new BDBToolOptions(true, "", false, "", "", 0, 0);
-                return new CommandLineOptions(false, "", bdbOpts);
+                return new CommandLineOptions(false, bdbOpts);
             } else if (cmd.hasOption('d') || cmd.hasOption("db")) {
                 // specify a database
                 String dbName = cmd.getOptionValue("db");
@@ -252,7 +264,7 @@ public class StarRocksFE {
 
                 if (cmd.hasOption('s') || cmd.hasOption("stat")) {
                     BDBToolOptions bdbOpts = new BDBToolOptions(false, dbName, true, "", "", 0, 0);
-                    return new CommandLineOptions(false, "", bdbOpts);
+                    return new CommandLineOptions(false, bdbOpts);
                 } else {
                     String fromKey = "";
                     String endKey = "";
@@ -291,7 +303,7 @@ public class StarRocksFE {
                     BDBToolOptions bdbOpts =
                             new BDBToolOptions(false, dbName, false, fromKey, endKey, metaVersion,
                                     starrocksMetaVersion);
-                    return new CommandLineOptions(false, "", bdbOpts);
+                    return new CommandLineOptions(false, bdbOpts);
                 }
             } else {
                 System.err.println("Invalid options when running bdb je tools");
@@ -303,11 +315,10 @@ public class StarRocksFE {
                 System.err.println("Missing helper node");
                 System.exit(-1);
             }
-            return new CommandLineOptions(false, helperNode, null);
         }
 
         // helper node is null, means no helper node is specified
-        return new CommandLineOptions(false, null, null);
+        return new CommandLineOptions(false, null);
     }
 
     private static void checkCommandLineOptions(CommandLineOptions cmdLineOpts) {
@@ -316,11 +327,13 @@ public class StarRocksFE {
             System.out.println("Commit hash: " + Version.STARROCKS_COMMIT_HASH);
             System.out.println("Build type: " + Version.STARROCKS_BUILD_TYPE);
             System.out.println("Build time: " + Version.STARROCKS_BUILD_TIME);
+            System.out.println("Build distributor id: " + Version.STARROCKS_BUILD_DISTRO_ID);
+            System.out.println("Build arch: " + Version.STARROCKS_BUILD_ARCH);
             System.out.println("Build user: " + Version.STARROCKS_BUILD_USER + "@" + Version.STARROCKS_BUILD_HOST);
             System.out.println("Java compile version: " + Version.STARROCKS_JAVA_COMPILE_VERSION);
             System.exit(0);
         } else if (cmdLineOpts.runBdbTools()) {
-            
+
             BDBTool bdbTool = new BDBTool(BDBEnvironment.getBdbDir(), cmdLineOpts.getBdbToolOpts());
             if (bdbTool.run()) {
                 System.exit(0);

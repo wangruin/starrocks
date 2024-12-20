@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector;
 
-public interface Connector {
+import com.starrocks.common.Pair;
+import com.starrocks.connector.config.ConnectorConfig;
+import com.starrocks.memory.MemoryTrackable;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public interface Connector extends MemoryTrackable {
     /**
      * Get the connector meta of connector
      *
@@ -30,5 +38,24 @@ public interface Connector {
      * no methods will be called on the connector or any objects that
      * have been returned from the connector.
      */
-    default void shutdown() {}
+    default void shutdown() {
+    }
+
+    /**
+     * check connector config
+     */
+    default void bindConfig(ConnectorConfig config) {
+    }
+
+    default boolean supportMemoryTrack() {
+        return false;
+    }
+
+    default Map<String, Long> estimateCount() {
+        return new HashMap<>();
+    }
+
+    default List<Pair<List<Object>, Long>> getSamples() {
+        return new ArrayList<>();
+    }
 }

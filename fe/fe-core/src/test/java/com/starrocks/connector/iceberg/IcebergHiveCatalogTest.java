@@ -15,19 +15,15 @@
 
 package com.starrocks.connector.iceberg;
 
-import com.starrocks.connector.HdfsEnvironment;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.starrocks.connector.iceberg.hive.IcebergHiveCatalog;
 import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
 import mockit.Mocked;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.iceberg.BaseTable;
-import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.hive.HiveCatalog;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -39,68 +35,35 @@ import java.util.Map;
 public class IcebergHiveCatalogTest {
 
     @Test
-    public void testCatalogType() {
-        Map<String, String> icebergProperties = new HashMap<>();
-        IcebergHiveCatalog icebergHiveCatalog =
-                (IcebergHiveCatalog) CatalogLoader.hive("hive_native_catalog", new Configuration(), icebergProperties)
-                        .loadCatalog();
-        Assert.assertEquals(IcebergCatalogType.HIVE_CATALOG, icebergHiveCatalog.getIcebergCatalogType());
-    }
-
-    @Test
-    public void testLoadTable(@Mocked IcebergHiveCatalog hiveCatalog) {
-        TableIdentifier identifier = TableIdentifier.of("db", "table");
+    public void testListAllDatabases(@Mocked HiveCatalog hiveCatalog) {
         new Expectations() {
             {
-                hiveCatalog.loadTable(identifier);
-                result = new BaseTable(null, "test");
-                minTimes = 0;
-            }
-        };
-
-        new MockUp<CatalogUtil>() {
-            @Mock
-            public Catalog loadCatalog(String catalogImpl, String catalogName,
-                                       Map<String, String> properties,
-                                       Configuration hadoopConf) {
-                return hiveCatalog;
+                hiveCatalog.listNamespaces();
+                result = ImmutableList.of(Namespace.of("db1"), Namespace.of("db2"));
+                times = 1;
             }
         };
 
         Map<String, String> icebergProperties = new HashMap<>();
-        HdfsEnvironment hdfsEnvironment = new HdfsEnvironment();
-        IcebergHiveCatalog icebergHiveCatalog =
-                (IcebergHiveCatalog) CatalogLoader.hive("hive_native_catalog", new Configuration(), icebergProperties)
-                        .loadCatalog();
-        Table table = icebergHiveCatalog.loadTable(identifier);
-        Assert.assertEquals("test", table.name());
-    }
-
-    @Test
-    public void testInitialize() {
-        try {
-            IcebergHiveCatalog catalog = new IcebergHiveCatalog();
-            catalog.initialize("hive", Maps.newHashMap());
-        } catch (Exception e) {
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testListAllDatabases(@Mocked IcebergHiveCatalog hiveCatalog) {
-        new Expectations() {
-            {
-                hiveCatalog.listAllDatabases();
-                result = Arrays.asList("db1", "db2");
-                minTimes = 0;
-            }
-        };
-
-        Map<String, String> icebergProperties = new HashMap<>();
-        IcebergHiveCatalog icebergHiveCatalog =
-                (IcebergHiveCatalog) CatalogLoader.hive("hive_native_catalog", new Configuration(), icebergProperties)
-                        .loadCatalog();
+        icebergProperties.put("hive.metastore.uris", "thrift://129.1.2.3:9876");
+        IcebergHiveCatalog icebergHiveCatalog = new IcebergHiveCatalog(
+                "hive_native_catalog", new Configuration(), icebergProperties);
         List<String> dbs = icebergHiveCatalog.listAllDatabases();
         Assert.assertEquals(Arrays.asList("db1", "db2"), dbs);
+    }
+
+    @Test
+    public void testRenameTable(@Mocked HiveCatalog hiveCatalog) {
+        new Expectations() {
+            {
+                hiveCatalog.tableExists((TableIdentifier) any);
+                result = true;
+            }
+        };
+        IcebergHiveCatalog icebergHiveCatalog = new IcebergHiveCatalog(
+                "catalog", new Configuration(), ImmutableMap.of("hive.metastore.uris", "thrift://129.1.2.3:9876"));
+        icebergHiveCatalog.renameTable("db", "tb1", "tb2");
+        boolean exists = icebergHiveCatalog.tableExists("db", "tbl2");
+        Assert.assertTrue(exists);
     }
 }

@@ -44,7 +44,7 @@
 #include <arrow/status.h>
 #include <arrow/type.h>
 #include <arrow/visitor.h>
-#include <arrow/visitor_inline.h>
+#include <fmt/format.h>
 
 #include <memory>
 
@@ -92,6 +92,7 @@ Status convert_to_arrow_type(const TypeDescriptor& type, std::shared_ptr<arrow::
     case TYPE_LARGEINT:
     case TYPE_DATE:
     case TYPE_DATETIME:
+    case TYPE_JSON:
         *result = arrow::utf8();
         break;
     case TYPE_DECIMALV2:
@@ -102,6 +103,35 @@ Status convert_to_arrow_type(const TypeDescriptor& type, std::shared_ptr<arrow::
     case TYPE_DECIMAL128:
         *result = std::make_shared<arrow::Decimal128Type>(type.precision, type.scale);
         break;
+    case TYPE_ARRAY: {
+        std::shared_ptr<arrow::DataType> type0;
+        RETURN_IF_ERROR(convert_to_arrow_type(type.children[0], &type0));
+        *result = arrow::list(type0);
+        break;
+    }
+    case TYPE_MAP: {
+        std::shared_ptr<arrow::DataType> type0;
+        RETURN_IF_ERROR(convert_to_arrow_type(type.children[0], &type0));
+        std::shared_ptr<arrow::DataType> type1;
+        RETURN_IF_ERROR(convert_to_arrow_type(type.children[1], &type1));
+        *result = arrow::map(type0, type1);
+        break;
+    }
+    case TYPE_STRUCT: {
+        std::vector<std::shared_ptr<arrow::Field>> fields;
+        if (type.field_names.size() != type.children.size()) {
+            return Status::InternalError(
+                    fmt::format("Struct filed names' size {} mismatch children size {} in convert_to_arrow_type()",
+                                type.field_names.size(), type.children.size()));
+        }
+        for (auto i = 0; i < type.children.size(); ++i) {
+            std::shared_ptr<arrow::DataType> type0;
+            RETURN_IF_ERROR(convert_to_arrow_type(type.children[i], &type0));
+            fields.emplace_back(arrow::field(type.field_names[i], type0));
+        }
+        *result = arrow::struct_(fields);
+        break;
+    }
     default:
         return Status::InvalidArgument(strings::Substitute("Unknown logical type($0)", type.type));
     }
@@ -191,4 +221,13 @@ Status serialize_record_batch(const arrow::RecordBatch& record_batch, std::strin
     return Status::OK();
 }
 
+Status serialize_arrow_schema(std::shared_ptr<arrow::Schema>* schema, std::string* result) {
+    auto empty_arrow_record_batch = arrow::RecordBatch::MakeEmpty(*schema);
+    if (!empty_arrow_record_batch.ok()) {
+        return Status::InternalError("serialize_arrow_schema failed");
+    }
+
+    const auto record_batch = empty_arrow_record_batch.ValueOrDie();
+    return serialize_record_batch(*record_batch, result);
+}
 } // namespace starrocks

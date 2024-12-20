@@ -34,6 +34,7 @@
 
 #include "storage/task/engine_alter_tablet_task.h"
 
+#include "io/io_profiler.h"
 #include "runtime/current_thread.h"
 #include "storage/lake/schema_change.h"
 #include "storage/schema_change.h"
@@ -56,16 +57,21 @@ Status EngineAlterTabletTask::execute() {
 
     StarRocksMetrics::instance()->create_rollup_requests_total.increment(1);
 
+    auto scope = IOProfiler::scope(IOProfiler::TAG_ALTER, _alter_tablet_req.new_tablet_id);
+
     Status res;
+    std::string alter_msg_header = strings::Substitute("[Alter Job:$0, tablet:$1]: ", _alter_tablet_req.job_id,
+                                                       _alter_tablet_req.base_tablet_id);
     if (_alter_tablet_req.tablet_type == TTabletType::TABLET_TYPE_LAKE) {
         lake::SchemaChangeHandler handler(ExecEnv::GetInstance()->lake_tablet_manager());
         res = handler.process_alter_tablet(_alter_tablet_req);
     } else {
         SchemaChangeHandler handler;
-        res = handler.process_alter_tablet_v2(_alter_tablet_req);
+        handler.set_alter_msg_header(alter_msg_header);
+        res = handler.process_alter_tablet(_alter_tablet_req);
     }
     if (!res.ok()) {
-        LOG(WARNING) << "failed to do alter task. status=" << res.to_string()
+        LOG(WARNING) << alter_msg_header << "failed to do alter task. status=" << res.to_string()
                      << " base_tablet_id=" << _alter_tablet_req.base_tablet_id
                      << ", base_schema_hash=" << _alter_tablet_req.base_schema_hash
                      << ", new_tablet_id=" << _alter_tablet_req.new_tablet_id
@@ -74,7 +80,7 @@ Status EngineAlterTabletTask::execute() {
         return res;
     }
 
-    LOG(INFO) << "success to do alter task. base_tablet_id=" << _alter_tablet_req.base_tablet_id;
+    LOG(INFO) << alter_msg_header << "success to do alter task. base_tablet_id=" << _alter_tablet_req.base_tablet_id;
     return Status::OK();
 } // execute
 

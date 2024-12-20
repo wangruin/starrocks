@@ -34,6 +34,7 @@
 
 package com.starrocks.qe;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.starrocks.common.AuditLog;
 import com.starrocks.common.Config;
 import com.starrocks.common.util.DigitalVersion;
@@ -49,6 +50,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.lang.reflect.Field;
+import java.util.HashMap;
+import java.util.Map;
+
 
 // A builtin Audit plugin, registered when FE start.
 // it will receive "AFTER_QUERY" AuditEventy and print it as a log in fe.audit.log
@@ -69,24 +73,21 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
 
     @Override
     public boolean eventFilter(EventType type) {
-        return type == EventType.AFTER_QUERY;
+        return type == EventType.AFTER_QUERY || type == EventType.CONNECTION;
     }
 
     @Override
     public void exec(AuditEvent event) {
         try {
+            Map<String, Object> logMap = new HashMap<>();
             StringBuilder sb = new StringBuilder();
             long queryTime = 0;
+
             // get each field with annotation "AuditField" in AuditEvent
-            // and assemble them into a string.
             Field[] fields = event.getClass().getFields();
             for (Field f : fields) {
                 AuditField af = f.getAnnotation(AuditField.class);
                 if (af == null) {
-                    continue;
-                }
-
-                if (af.value().equals("Timestamp")) {
                     continue;
                 }
 
@@ -104,6 +105,9 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
 
                 // Ignore -1 by default, ignore 0 if annotated with ignore_zero
                 Object value = f.get(event);
+                if (af.ignore_zero() && value == null) {
+                    continue;
+                }
                 if (value instanceof Long) {
                     long longValue = (Long) value;
                     if (longValue == -1 || (longValue == 0 && af.ignore_zero())) {
@@ -122,25 +126,54 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
                         continue;
                     }
                 }
-                sb.append("|").append(af.value()).append("=").append(value);
+
+                if (Config.audit_log_json_format) {
+                    logMap.put(af.value(), value);
+                } else {
+                    sb.append("|").append(af.value()).append("=").append(value);
+                }
             }
 
-            String auditLog = sb.toString();
-            AuditLog.getQueryAudit().log(auditLog);
-            // slow query
-            if (queryTime > Config.qe_slow_log_ms) {
-                AuditLog.getSlowAudit().log(auditLog);
-            }
+            ObjectMapper objectMapper = new ObjectMapper();
 
-            if (isBigQuery(event)) {
-                sb.append("|bigQueryLogCPUSecondThreshold=").append(event.bigQueryLogCPUSecondThreshold);
-                sb.append("|bigQueryLogScanBytesThreshold=").append(event.bigQueryLogScanBytesThreshold);
-                sb.append("|bigQueryLogScanRowsThreshold=").append(event.bigQueryLogScanRowsThreshold);
-                String bigQueryLog = sb.toString();
-                AuditLog.getBigQueryAudit().log(bigQueryLog);
+            if (event.type == EventType.CONNECTION) {
+                if (Config.audit_log_json_format) {
+                    AuditLog.getConnectionAudit().log(objectMapper.writeValueAsString(logMap));
+                } else {
+                    AuditLog.getConnectionAudit().log(sb.toString());
+                }
+
+            } else {
+                if (isBigQuery(event)) {
+                    if (Config.audit_log_json_format) {
+                        logMap.put("bigQueryLogCPUSecondThreshold", event.bigQueryLogCPUSecondThreshold);
+                        logMap.put("bigQueryLogScanBytesThreshold", event.bigQueryLogScanBytesThreshold);
+                        logMap.put("bigQueryLogScanRowsThreshold", event.bigQueryLogScanRowsThreshold);
+                        AuditLog.getBigQueryAudit().log(objectMapper.writeValueAsString(logMap));
+                    } else {
+                        sb.append("|bigQueryLogCPUSecondThreshold=").append(event.bigQueryLogCPUSecondThreshold);
+                        sb.append("|bigQueryLogScanBytesThreshold=").append(event.bigQueryLogScanBytesThreshold);
+                        sb.append("|bigQueryLogScanRowsThreshold=").append(event.bigQueryLogScanRowsThreshold);
+                        AuditLog.getBigQueryAudit().log(sb.toString());
+                    }
+                }
+                if (Config.enable_qe_slow_log && queryTime > Config.qe_slow_log_ms) {
+                    if (Config.audit_log_json_format) {
+                        AuditLog.getSlowAudit().log(objectMapper.writeValueAsString(logMap));
+                    } else {
+                        AuditLog.getSlowAudit().log(sb.toString());
+                    }
+                }
+                if (Config.audit_log_json_format) {
+                    AuditLog.getQueryAudit().log(objectMapper.writeValueAsString(logMap));
+                } else {
+                    AuditLog.getQueryAudit().log(sb.toString());
+                }
+
+
             }
         } catch (Exception e) {
-            LOG.debug("failed to process audit event", e);
+            LOG.warn("failed to process audit event", e);
         }
     }
 

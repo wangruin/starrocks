@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rule.tree;
 
 import com.google.common.base.Preconditions;
@@ -27,7 +26,6 @@ import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
@@ -38,6 +36,7 @@ import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.base.DistributionCol;
 import com.starrocks.sql.optimizer.base.HashDistributionDesc;
 import com.starrocks.sql.optimizer.base.HashDistributionSpec;
 import com.starrocks.sql.optimizer.base.LogicalProperty;
@@ -60,6 +59,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LikePredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.MatchExprOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorVisitor;
 import com.starrocks.sql.optimizer.statistics.CacheDictManager;
@@ -67,6 +67,7 @@ import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.sql.optimizer.task.TaskContext;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -79,7 +80,7 @@ import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
-import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator.BinaryType.EQ_FOR_NULL;
+import static com.starrocks.analysis.BinaryType.EQ_FOR_NULL;
 
 /**
  * For a low cardinality string column with global dict, we will rewrite the plan to
@@ -97,7 +98,7 @@ import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperato
 public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
     private static final Logger LOG = LogManager.getLogger(AddDecodeNodeForDictStringRule.class);
 
-    private final Map<Long, List<Integer>> tableIdToStringColumnIds = Maps.newHashMap();
+    private final Map<Long, Set<Integer>> tableIdToStringColumnIds = Maps.newHashMap();
     private final Map<Pair<Long, String>, ColumnDict> globalDictCache = Maps.newHashMap();
 
     public static final Type ID_TYPE = Type.INT;
@@ -111,7 +112,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
         // Global DictCache
         // (TableID, ColumnName) -> ColumnDict
         final Map<Pair<Long, String>, ColumnDict> globalDictCache;
-        final Map<Long, List<Integer>> tableIdToStringColumnIds;
+        final Map<Long, Set<Integer>> tableIdToStringColumnIds;
         final Set<Integer> allStringColumnIds;
         // For the low cardinality string columns that have applied global dict optimization
         Map<Integer, Integer> stringColumnIdToDictColumnIds;
@@ -127,12 +128,12 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
         Set<Integer> needRewriteMultiCountDistinctColumns;
 
         public DecodeContext(Map<Pair<Long, String>, ColumnDict> globalDictCache,
-                             Map<Long, List<Integer>> tableIdToStringColumnIds, ColumnRefFactory columnRefFactory) {
+                             Map<Long, Set<Integer>> tableIdToStringColumnIds, ColumnRefFactory columnRefFactory) {
             this(globalDictCache, tableIdToStringColumnIds, columnRefFactory, Lists.newArrayList());
         }
 
         public DecodeContext(Map<Pair<Long, String>, ColumnDict> globalDictCache,
-                             Map<Long, List<Integer>> tableIdToStringColumnIds, ColumnRefFactory columnRefFactory,
+                             Map<Long, Set<Integer>> tableIdToStringColumnIds, ColumnRefFactory columnRefFactory,
                              List<Pair<Integer, ColumnDict>> globalDicts) {
             this.globalDictCache = globalDictCache;
             this.tableIdToStringColumnIds = tableIdToStringColumnIds;
@@ -142,8 +143,8 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             this.globalDicts = globalDicts;
             disableDictOptimizeColumns = new ColumnRefSet();
             needRewriteMultiCountDistinctColumns = Sets.newHashSet();
-            allStringColumnIds = tableIdToStringColumnIds.values().stream().flatMap(List::stream)
-                    .collect(Collectors.toSet());
+            allStringColumnIds = tableIdToStringColumnIds.values().stream()
+                    .flatMap(x -> x.stream()).collect(Collectors.toSet());
         }
 
         // if column ref is an applied optimized string column, return the dictionary column.
@@ -197,15 +198,23 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             return !couldApplyCtx.canDictOptBeApplied && couldApplyCtx.stopOptPropagateUpward;
         }
 
-        public static boolean isSimpleStrictPredicate(ScalarOperator operator) {
-            return operator.accept(new IsSimpleStrictPredicateVisitor(), null);
+        public static boolean isSimpleStrictPredicate(ScalarOperator operator, boolean enablePushdownOrPredicate) {
+            return operator.accept(new IsSimpleStrictPredicateVisitor(enablePushdownOrPredicate), null);
         }
 
         private void visitProjectionBefore(OptExpression optExpression, DecodeContext context) {
             if (optExpression.getOp().getProjection() != null) {
                 Projection projection = optExpression.getOp().getProjection();
                 context.needEncode = context.needEncode || projection.needApplyStringDict(context.allStringColumnIds);
-                if (context.needEncode) {
+                // When disableDictOptimizeColumns is not empty, we need to disable the columns
+                // that generate them for low cardinality optimization.
+                //
+                // This is because the upper-level nodes require the disabling of these
+                // columns as well as the columns that generate them.
+                // The upper-level node wants to avoid low-cardinality optimization columns
+                // to be executed in Shuffle partition by or Runtime Filter.
+
+                if (context.needEncode || !context.disableDictOptimizeColumns.isEmpty()) {
                     projection.fillDisableDictOptimizeColumns(context.disableDictOptimizeColumns,
                             context.allStringColumnIds);
                 }
@@ -216,14 +225,29 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
         // means we cannot optimize this projection and need add a decodeNode before this projection.
         // scalarOperators can be optimized are:
         // 1. if it's a pass-through entry like col1 -> col1, we don't care it.
-        // 2. scalarOperator don't ref cols from encoded string cols, we don't care it
-        // 2. scalarOperator ref cols from encoded string cols should meet these requirements:
+        // 2. scalarOperator don't ref cols from encoded string cols, we don't care it.
+        // 3. exists multiple columnRef to one dict col, we cannot rewrite this projection.
+        // 4. scalarOperator ref cols from encoded string cols should meet these requirements:
         //    a. all these dict cols of these string cols exist in the global dict
         //    b. can gain benefit from the optimization
         private boolean couldApplyStringDict(DecodeContext context, Projection projection) {
             final Set<Integer> globalDictIds =
                     context.globalDicts.stream().map(a -> a.first).collect(Collectors.toSet());
             Set<Integer> encodedStringCols = context.getEncodedStringCols();
+            Map<ColumnRefOperator, ColumnRefOperator> memo = Maps.newHashMap();
+            for (Map.Entry<ColumnRefOperator, ScalarOperator> entry : projection.getColumnRefMap().entrySet()) {
+                if (entry.getValue().isColumnRef()) {
+                    ColumnRefOperator key = entry.getKey();
+                    ColumnRefOperator value = (ColumnRefOperator) entry.getValue();
+                    if (globalDictIds.contains(context.stringColumnIdToDictColumnIds.get(value.getId()))) {
+                        if (memo.containsKey(value)) {
+                            return false;
+                        } else {
+                            memo.put(value, key);
+                        }
+                    }
+                }
+            }
 
             for (Map.Entry<ColumnRefOperator, ScalarOperator> entry : projection.getColumnRefMap().entrySet()) {
                 if (!entry.getValue().equals(entry.getKey())) {
@@ -233,7 +257,8 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                     if (!usedCols.isEmpty()) {
                         Set<Integer> dictCols = usedCols.stream().map(e -> context.stringColumnIdToDictColumnIds.get(e))
                                 .collect(Collectors.toSet());
-                        if (!(globalDictIds.containsAll(dictCols) && couldApplyDictOptimize(operator, encodedStringCols))) {
+                        if (!(globalDictIds.containsAll(dictCols) &&
+                                couldApplyDictOptimize(operator, encodedStringCols))) {
                             return false;
                         }
                     }
@@ -241,7 +266,6 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             }
             return true;
         }
-
 
         // create a new dictionary column and assign the same property except for the type and column id
         // the input column maybe a dictionary column or a string column
@@ -317,7 +341,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             // top N node
             PhysicalTopNOperator topN = (PhysicalTopNOperator) optExpression.getOp();
             context.needEncode = topN.couldApplyStringDict(context.allStringColumnIds);
-            if (context.needEncode) {
+            if (context.needEncode || !context.disableDictOptimizeColumns.isEmpty()) {
                 topN.fillDisableDictOptimizeColumns(context.disableDictOptimizeColumns, context.allStringColumnIds);
             }
 
@@ -331,11 +355,14 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             if (context.hasEncoded || needRewrite) {
                 if (needRewrite) {
                     PhysicalTopNOperator newTopN = rewriteTopNOperator(topN, context);
-                    OptExpression result = OptExpression.create(newTopN, newChildExpr);
-                    result.setStatistics(optExpression.getStatistics());
-                    result.setLogicalProperty(rewriteLogicProperty(optExpression.getLogicalProperty(),
-                            context.stringColumnIdToDictColumnIds));
-                    return visitProjectionAfter(result, context);
+                    OptExpression.Builder builder = OptExpression.builder()
+                            .setOp(newTopN)
+                            .setInputs(Lists.newArrayList(newChildExpr))
+                            .setStatistics(optExpression.getStatistics())
+                            .setLogicalProperty(rewriteLogicProperty(optExpression.getLogicalProperty(),
+                                    context.stringColumnIdToDictColumnIds))
+                            .setCost(optExpression.getCost());
+                    return visitProjectionAfter(builder.build(), context);
                 } else {
                     insertDecodeExpr(optExpression, Collections.singletonList(newChildExpr), 0, context);
                     return visitProjectionAfter(optExpression, context);
@@ -416,7 +443,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
                 // rewrite predicate
                 // get all string columns for this table
-                List<Integer> stringColumns = context.tableIdToStringColumnIds.get(tableId);
+                Set<Integer> stringColumns = context.tableIdToStringColumnIds.get(tableId);
                 // get all could apply this optimization string columns
                 ColumnRefSet applyOptCols = new ColumnRefSet();
                 stringColumns.stream().filter(cid -> context.stringColumnIdToDictColumnIds.containsKey(cid))
@@ -434,26 +461,49 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                     }
                 }
 
+                // rewrite pruned partition predicates
+                List<ScalarOperator> newPrunedPredicates = Lists.newArrayList();
+                if (CollectionUtils.isNotEmpty(scanOperator.getPrunedPartitionPredicates())) {
+                    for (ScalarOperator predicate : scanOperator.getPrunedPartitionPredicates()) {
+                        if (predicate.getUsedColumns().isIntersect(applyOptCols)) {
+                            final DictMappingRewriter rewriter = new DictMappingRewriter(context);
+                            final ScalarOperator newCallOperator = rewriter.rewrite(predicate.clone());
+                            newPrunedPredicates.add(newCallOperator);
+                        } else {
+                            newPrunedPredicates.add(predicate);
+                        }
+                    }
+                }
+
                 newPredicate = Utils.compoundAnd(predicates);
                 if (context.hasEncoded) {
+                    // TODO: maybe have to implement a clone method to create a physical node.
                     PhysicalOlapScanOperator newOlapScan =
                             new PhysicalOlapScanOperator(scanOperator.getTable(), newColRefToColumnMetaMap,
                                     scanOperator.getDistributionSpec(), scanOperator.getLimit(), newPredicate,
                                     scanOperator.getSelectedIndexId(), scanOperator.getSelectedPartitionId(),
-                                    scanOperator.getSelectedTabletId(), scanOperator.getPrunedPartitionPredicates(),
-                                    scanOperator.getProjection());
+                                    scanOperator.getSelectedTabletId(), scanOperator.getHintsReplicaId(),
+                                    newPrunedPredicates,
+                                    scanOperator.getProjection(), scanOperator.isUsePkIndex(),
+                                    scanOperator.getVectorSearchOptions());
+                    newOlapScan.setScanOptimzeOption(scanOperator.getScanOptimzeOption());
                     newOlapScan.setPreAggregation(scanOperator.isPreAggregation());
                     newOlapScan.setGlobalDicts(globalDicts);
                     // set output columns because of the projection is not encoded but the colRefToColumnMetaMap has encoded.
                     // There need to set right output columns
                     newOlapScan.setOutputColumns(newOutputColumns);
                     newOlapScan.setNeedSortedByKeyPerTablet(scanOperator.needSortedByKeyPerTablet());
+                    newOlapScan.setNeedOutputChunkByBucket(scanOperator.needOutputChunkByBucket());
+                    newOlapScan.setWithoutColocateRequirement(scanOperator.isWithoutColocateRequirement());
 
-                    OptExpression result = new OptExpression(newOlapScan);
-                    result.setLogicalProperty(rewriteLogicProperty(optExpression.getLogicalProperty(),
-                            context.stringColumnIdToDictColumnIds));
-                    result.setStatistics(optExpression.getStatistics());
-                    return visitProjectionAfter(result, context);
+                    OptExpression.Builder builder = OptExpression.builder()
+                            .setOp(newOlapScan)
+                            .setInputs(Lists.newArrayList())
+                            .setLogicalProperty(rewriteLogicProperty(optExpression.getLogicalProperty(),
+                            context.stringColumnIdToDictColumnIds))
+                            .setStatistics(optExpression.getStatistics())
+                            .setCost(optExpression.getCost());
+                    return visitProjectionAfter(builder.build(), context);
                 }
             }
             return visitProjectionAfter(optExpression, context);
@@ -467,14 +517,14 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             // For string column rewrite to dictionary column, other columns remain unchanged
             Arrays.stream(columnIds).map(cid -> stringColumnIdToDictColumnIds.getOrDefault(cid, cid))
                     .forEach(rewritesOutputColumns::union);
-            LogicalProperty newProperty =  new LogicalProperty(logicalProperty);
+            LogicalProperty newProperty = new LogicalProperty(logicalProperty);
             newProperty.setOutputColumns(rewritesOutputColumns);
             return newProperty;
         }
 
         private static LogicalProperty rewriteLogicProperty(LogicalProperty logicalProperty,
                                                             ColumnRefSet outputColumns) {
-            LogicalProperty newProperty =  new LogicalProperty(logicalProperty);
+            LogicalProperty newProperty = new LogicalProperty(logicalProperty);
             newProperty.setOutputColumns(outputColumns);
             return newProperty;
         }
@@ -492,7 +542,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             if (newStringToDicts.isEmpty()) {
                 context.hasEncoded = false;
             }
-            return new Projection(newProjectMap, projectOperator.getCommonSubOperatorMap());
+            return new Projection(newProjectMap);
         }
 
         private PhysicalTopNOperator rewriteTopNOperator(PhysicalTopNOperator operator, DecodeContext context) {
@@ -529,7 +579,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
             return new PhysicalTopNOperator(newOrderSpec, operator.getLimit(), operator.getOffset(), partitionByColumns,
                     operator.getPartitionLimit(), operator.getSortPhase(), operator.getTopNType(), operator.isSplit(),
-                    operator.isEnforced(), predicate, operator.getProjection());
+                    operator.isEnforced(), predicate, operator.getProjection(), ImmutableMap.of());
         }
 
         private void rewriteOneScalarOperatorForProjection(ColumnRefOperator keyColumn, ScalarOperator valueOperator,
@@ -585,14 +635,14 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                                                                  DecodeContext context) {
             HashDistributionSpec hashDistributionSpec = (HashDistributionSpec) exchangeOperator.getDistributionSpec();
 
-            List<Integer> shuffledColumns = Lists.newArrayList();
-            for (Integer columnId : hashDistributionSpec.getHashDistributionDesc().getColumns()) {
-                if (context.stringColumnIdToDictColumnIds.containsKey(columnId)) {
-                    Integer dictColumnId = context.stringColumnIdToDictColumnIds.get(columnId);
+            List<DistributionCol> shuffledColumns = Lists.newArrayList();
+            for (DistributionCol column : hashDistributionSpec.getHashDistributionDesc().getDistributionCols()) {
+                if (context.stringColumnIdToDictColumnIds.containsKey(column.getColId())) {
+                    Integer dictColumnId = context.stringColumnIdToDictColumnIds.get(column.getColId());
                     ColumnRefOperator dictColumn = context.columnRefFactory.getColumnRef(dictColumnId);
-                    shuffledColumns.add(dictColumn.getId());
+                    shuffledColumns.add(new DistributionCol(dictColumn.getId(), column.isNullStrict()));
                 } else {
-                    shuffledColumns.add(columnId);
+                    shuffledColumns.add(column);
                 }
             }
             exchangeOperator.setDistributionSpec(new HashDistributionSpec(new HashDistributionDesc(shuffledColumns,
@@ -614,7 +664,9 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                 if (canApplyDictDecodeOpt) {
                     CallOperator oldCall = kv.getValue();
                     int columnId = kv.getValue().getUsedColumns().getFirstId();
-                    if (context.needRewriteMultiCountDistinctColumns.contains(columnId)) {
+                    final String fnName = kv.getValue().getFnName();
+                    if (context.needRewriteMultiCountDistinctColumns.contains(columnId)
+                            && fnName.equals(FunctionSet.MULTI_DISTINCT_COUNT)) {
                         // we only need rewrite TFunction
                         Type[] newTypes = new Type[] {ID_TYPE};
                         AggregateFunction newFunction =
@@ -631,7 +683,6 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
                         List<ScalarOperator> newArguments = Collections.singletonList(dictColumn);
                         Type[] newTypes = newArguments.stream().map(ScalarOperator::getType).toArray(Type[]::new);
-                        String fnName = kv.getValue().getFnName();
                         AggregateFunction newFunction =
                                 (AggregateFunction) Expr.getBuiltinFunction(kv.getValue().getFnName(), newTypes,
                                         Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
@@ -673,7 +724,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
                         CallOperator newCall =
                                 new CallOperator(oldCall.getFnName(), newReturnType, newArguments, newFunction,
-                                        oldCall.isDistinct());
+                                        oldCall.isDistinct(), oldCall.isRemovedDistinct());
 
                         newAggMapEntry.add(Maps.immutableEntry(outputColumn, newCall));
                     } else {
@@ -723,9 +774,12 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             }
             final PhysicalHashAggregateOperator newHashAggregator =
                     new PhysicalHashAggregateOperator(aggOperator.getType(), newGroupBys, newPartitionsBy, newAggMap,
-                            aggOperator.getSingleDistinctFunctionPos(), aggOperator.isSplit(), aggOperator.getLimit(),
+                            aggOperator.isSplit(), aggOperator.getLimit(),
                             aggOperator.getPredicate(), aggOperator.getProjection());
+            newHashAggregator.setMergedLocalAgg(aggOperator.isMergedLocalAgg());
             newHashAggregator.setUseSortAgg(aggOperator.isUseSortAgg());
+            newHashAggregator.setUsePerBucketOptmize(aggOperator.isUsePerBucketOptmize());
+            newHashAggregator.setWithoutColocateRequirement(aggOperator.isWithoutColocateRequirement());
             return newHashAggregator;
         }
 
@@ -793,7 +847,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                 return aggExpr;
             }
             context.needEncode = aggOperator.couldApplyStringDict(context.allStringColumnIds);
-            if (context.needEncode) {
+            if (context.needEncode || !context.disableDictOptimizeColumns.isEmpty()) {
                 aggOperator.fillDisableDictOptimizeColumns(context.disableDictOptimizeColumns,
                         context.allStringColumnIds);
             }
@@ -813,11 +867,14 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             if (context.hasEncoded || needRewrite) {
                 if (needRewrite && unsupportedAggs.isEmpty()) {
                     PhysicalHashAggregateOperator newAggOper = rewriteAggOperator(aggOperator, context);
-                    OptExpression result = OptExpression.create(newAggOper, newChildExpr);
-                    result.setStatistics(aggExpr.getStatistics());
-                    result.setLogicalProperty(
-                            rewriteLogicProperty(aggExpr.getLogicalProperty(), context.stringColumnIdToDictColumnIds));
-                    return visitProjectionAfter(result, context);
+                    OptExpression.Builder builder = OptExpression.builder()
+                            .setOp(newAggOper)
+                            .setInputs(Lists.newArrayList(newChildExpr))
+                            .setStatistics(aggExpr.getStatistics())
+                            .setCost(aggExpr.getCost())
+                            .setLogicalProperty(rewriteLogicProperty(aggExpr.getLogicalProperty(),
+                                    context.stringColumnIdToDictColumnIds));
+                    return visitProjectionAfter(builder.build(), context);
                 } else {
                     insertDecodeExpr(aggExpr, Collections.singletonList(newChildExpr), 0, context);
                     return visitProjectionAfter(aggExpr, context);
@@ -845,11 +902,14 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                 if (exchangeOperator.couldApplyStringDict(context.getEncodedStringCols())) {
                     PhysicalDistributionOperator newExchangeOper = rewriteDistribution(exchangeOperator, context);
 
-                    OptExpression result = OptExpression.create(newExchangeOper, newChildExpr);
-                    result.setStatistics(exchangeExpr.getStatistics());
-                    result.setLogicalProperty(rewriteLogicProperty(exchangeExpr.getLogicalProperty(),
-                            context.stringColumnIdToDictColumnIds));
-                    return visitProjectionAfter(result, context);
+                    OptExpression.Builder builder = OptExpression.builder()
+                            .setOp(newExchangeOper)
+                            .setInputs(Lists.newArrayList(newChildExpr))
+                            .setStatistics(exchangeExpr.getStatistics())
+                            .setCost(exchangeExpr.getCost())
+                            .setLogicalProperty(rewriteLogicProperty(exchangeExpr.getLogicalProperty(),
+                                    context.stringColumnIdToDictColumnIds));
+                    return visitProjectionAfter(builder.build(), context);
                 } else {
                     insertDecodeExpr(exchangeExpr, Collections.singletonList(newChildExpr), 0, context);
                     return visitProjectionAfter(exchangeExpr, context);
@@ -862,7 +922,8 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
     @Override
     public OptExpression rewrite(OptExpression root, TaskContext taskContext) {
-        if (!ConnectContext.get().getSessionVariable().isEnableLowCardinalityOptimize()) {
+        if (!ConnectContext.get().getSessionVariable().isEnableLowCardinalityOptimize()
+                || taskContext.getOptimizerContext().getSessionVariable().isUseLowCardinalityOptimizeV2()) {
             return root;
         }
 
@@ -870,13 +931,18 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
 
         for (PhysicalOlapScanOperator scanOperator : scanOperators) {
             OlapTable table = (OlapTable) scanOperator.getTable();
-            long version = table.getPartitions().stream().map(Partition::getVisibleVersionTime).max(Long::compareTo)
-                    .orElse(0L);
+            long version = table.getPartitions().stream().map(p -> p.getDefaultPhysicalPartition().getVisibleVersionTime())
+                    .max(Long::compareTo).orElse(0L);
 
             if ((table.getKeysType().equals(KeysType.PRIMARY_KEYS))) {
                 continue;
             }
-            if (table.hasForbitGlobalDict()) {
+            if (table.hasForbiddenGlobalDict()) {
+                continue;
+            }
+            // skip low-cardinality optimize for temp partition
+            // our dict collection won't collect temp partition we could support it later
+            if (table.inputHasTempPartition(scanOperator.getSelectedPartitionId())) {
                 continue;
             }
             for (ColumnRefOperator column : scanOperator.getColRefToColumnMetaMap().keySet()) {
@@ -886,7 +952,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                 }
 
                 ColumnStatistic columnStatistic =
-                        GlobalStateMgr.getCurrentStatisticStorage().getColumnStatistic(table, column.getName());
+                        GlobalStateMgr.getCurrentState().getStatisticStorage().getColumnStatistic(table, column.getName());
                 // Condition 2: the varchar column is low cardinality string column
                 if (!FeConstants.USE_MOCK_DICT_MANAGER && (columnStatistic.isUnknown() ||
                         columnStatistic.getDistinctValuesCount() > CacheDictManager.LOW_CARDINALITY_THRESHOLD)) {
@@ -895,9 +961,11 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                 }
 
                 // Condition 3: the varchar column has collected global dict
-                if (IDictManager.getInstance().hasGlobalDict(table.getId(), column.getName(), version)) {
+                Column columnObj = table.getColumn(column.getName());
+                if (columnObj != null
+                        && IDictManager.getInstance().hasGlobalDict(table.getId(), columnObj.getColumnId(), version)) {
                     Optional<ColumnDict> dict =
-                            IDictManager.getInstance().getGlobalDict(table.getId(), column.getName());
+                            IDictManager.getInstance().getGlobalDict(table.getId(), columnObj.getColumnId());
                     // cache reaches capacity limit, randomly eliminate some keys
                     // then we will get an empty dictionary.
                     if (!dict.isPresent()) {
@@ -905,7 +973,7 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
                     }
                     globalDictCache.put(new Pair<>(table.getId(), column.getName()), dict.get());
                     if (!tableIdToStringColumnIds.containsKey(table.getId())) {
-                        List<Integer> integers = Lists.newArrayList();
+                        Set<Integer> integers = Sets.newHashSet();
                         integers.add(column.getId());
                         tableIdToStringColumnIds.put(table.getId(), integers);
                     } else {
@@ -938,19 +1006,23 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
     }
 
     private static OptExpression generateDecodeOExpr(DecodeContext context, List<OptExpression> childExpr) {
-        Map<Integer, Integer> dictToStrings = Maps.newHashMap();
+        Map<ColumnRefOperator, ColumnRefOperator> dictToStrings = Maps.newHashMap();
         for (Map.Entry<Integer, Integer> entry : context.stringColumnIdToDictColumnIds.entrySet()) {
-            dictToStrings.put(entry.getValue(), entry.getKey());
+            dictToStrings.put(context.columnRefFactory.getColumnRef(entry.getValue()),
+                    context.columnRefFactory.getColumnRef(entry.getKey()));
         }
         PhysicalDecodeOperator decodeOperator = new PhysicalDecodeOperator(ImmutableMap.copyOf(dictToStrings),
                 Maps.newHashMap(context.stringFunctions));
-        OptExpression result = OptExpression.create(decodeOperator, childExpr);
-        result.setStatistics(childExpr.get(0).getStatistics());
 
         LogicalProperty decodeProperty = new LogicalProperty(childExpr.get(0).getLogicalProperty());
-        result.setLogicalProperty(DecodeVisitor.rewriteLogicProperty(decodeProperty, dictToStrings));
+        OptExpression.Builder builder = OptExpression.builder()
+                .setOp(decodeOperator)
+                .setInputs(Lists.newArrayList(childExpr))
+                .setStatistics(childExpr.get(0).getStatistics())
+                .setCost(childExpr.get(0).getCost())
+                .setLogicalProperty(DecodeVisitor.rewriteLogicProperty(decodeProperty, decodeOperator.getDictIdToStringsId()));
         context.clear();
-        return result;
+        return builder.build();
     }
 
     // Check if an expression can be optimized using a dictionary
@@ -1135,12 +1207,28 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
     // The predicate no function all, this implementation is consistent with BE olap scan node
     private static class IsSimpleStrictPredicateVisitor extends ScalarOperatorVisitor<Boolean, Void> {
 
-        public IsSimpleStrictPredicateVisitor() {
+        private final boolean enablePushDownOrPredicate;
+
+        public IsSimpleStrictPredicateVisitor(boolean enablePushDownOrPredicate) {
+            this.enablePushDownOrPredicate = enablePushDownOrPredicate;
         }
 
         @Override
         public Boolean visit(ScalarOperator scalarOperator, Void context) {
             return false;
+        }
+
+        @Override
+        public Boolean visitCompoundPredicate(CompoundPredicateOperator predicate, Void context) {
+            if (!enablePushDownOrPredicate) {
+                return false;
+            }
+
+            if (!predicate.isAnd() && !predicate.isOr()) {
+                return false;
+            }
+
+            return predicate.getChildren().stream().allMatch(child -> child.accept(this, context));
         }
 
         @Override
@@ -1178,6 +1266,13 @@ public class AddDecodeNodeForDictStringRule implements TreeRewriteRule {
             }
 
             return predicate.getChild(0).isColumnRef();
+        }
+
+        @Override
+        public Boolean visitMatchExprOperator(MatchExprOperator predicate, Void context) {
+            // match expression is always satisfy the following format:
+            // SlotRef MATCH StringLiteral which is always SimpleStrictPredicate
+            return true;
         }
 
         // These type predicates couldn't be pushed down to storage engine,

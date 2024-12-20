@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.persist;
 
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.authorization.RolePrivilegeCollectionV2;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
-import com.starrocks.privilege.RolePrivilegeCollection;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -32,20 +31,20 @@ public class RolePrivilegeCollectionInfo implements Writable {
     private short pluginId;
     @SerializedName(value = "v")
     private short pluginVersion;
-    @SerializedName(value = "r")
-    private Map<Long, RolePrivilegeCollection> rolePrivCollectionModified;
+    @SerializedName(value = "r2")
+    private Map<Long, RolePrivilegeCollectionV2> rolePrivCollectionModifiedV2;
 
     public RolePrivilegeCollectionInfo(
-            Map<Long, RolePrivilegeCollection> rolePrivCollectionModified,
+            Map<Long, RolePrivilegeCollectionV2> rolePrivCollectionModified,
             short pluginId,
             short pluginVersion) {
-        this.rolePrivCollectionModified = rolePrivCollectionModified;
+        this.rolePrivCollectionModifiedV2 = rolePrivCollectionModified;
         this.pluginId = pluginId;
         this.pluginVersion = pluginVersion;
     }
 
-    public Map<Long, RolePrivilegeCollection> getRolePrivCollectionModified() {
-        return rolePrivCollectionModified;
+    public Map<Long, RolePrivilegeCollectionV2> getRolePrivCollectionModified() {
+        return rolePrivCollectionModifiedV2;
     }
 
     public short getPluginId() {

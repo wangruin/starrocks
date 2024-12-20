@@ -32,38 +32,39 @@ public:
 
     using Offset = T;
     using Offsets = Buffer<T>;
-
-    using Bytes = starrocks::raw::RawVectorPad16<uint8_t>;
-
-    using Container = Buffer<Slice>;
+    using Byte = uint8_t;
+    using Bytes = starrocks::raw::RawVectorPad16<uint8_t, ColumnAllocator<uint8_t>>;
 
     struct BinaryDataProxyContainer {
         BinaryDataProxyContainer(const BinaryColumnBase& column) : _column(column) {}
 
         Slice operator[](size_t index) const { return _column.get_slice(index); }
 
-        size_t size() { return _column.size(); }
+        size_t size() const { return _column.size(); }
 
     private:
         const BinaryColumnBase& _column;
     };
 
+    using Container = Buffer<Slice>;
+    using ProxyContainer = BinaryDataProxyContainer;
+
     // TODO(kks): when we create our own vector, we could let vector[-1] = 0,
     // and then we don't need explicitly emplace_back zero value
-    BinaryColumnBase<T>() { _offsets.emplace_back(0); }
+    BinaryColumnBase() { _offsets.emplace_back(0); }
     // Default value is empty string
-    explicit BinaryColumnBase<T>(size_t size) : _offsets(size + 1, 0) {}
-    BinaryColumnBase<T>(Bytes bytes, Offsets offsets) : _bytes(std::move(bytes)), _offsets(std::move(offsets)) {
+    explicit BinaryColumnBase(size_t size) : _offsets(size + 1, 0) {}
+    BinaryColumnBase(Bytes bytes, Offsets offsets) : _bytes(std::move(bytes)), _offsets(std::move(offsets)) {
         if (_offsets.empty()) {
             _offsets.emplace_back(0);
         }
     }
 
     // NOTE: do *NOT* copy |_slices|
-    BinaryColumnBase<T>(const BinaryColumnBase<T>& rhs) : _bytes(rhs._bytes), _offsets(rhs._offsets) {}
+    BinaryColumnBase(const BinaryColumnBase<T>& rhs) : _bytes(rhs._bytes), _offsets(rhs._offsets) {}
 
     // NOTE: do *NOT* copy |_slices|
-    BinaryColumnBase<T>(BinaryColumnBase<T>&& rhs) noexcept
+    BinaryColumnBase(BinaryColumnBase<T>&& rhs) noexcept
             : _bytes(std::move(rhs._bytes)), _offsets(std::move(rhs._offsets)) {}
 
     BinaryColumnBase<T>& operator=(const BinaryColumnBase<T>& rhs) {
@@ -84,7 +85,15 @@ public:
 
     bool has_large_column() const override;
 
-    ~BinaryColumnBase<T>() override {
+    ~BinaryColumnBase() override {
+#ifndef NDEBUG
+        // sometimes we may fill _bytes and _offsets separately and resize them in the final stage,
+        // if an exception is thrown in the middle process, _offsets maybe inconsistent with _bytes,
+        // we should skip the check.
+        if (std::uncaught_exception()) {
+            return;
+        }
+#endif
         if (!_offsets.empty()) {
             DCHECK_EQ(_bytes.size(), _offsets.back());
         } else {
@@ -92,7 +101,6 @@ public:
         }
     }
 
-    bool low_cardinality() const override { return false; }
     bool is_binary() const override { return std::is_same_v<T, uint32_t> != 0; }
     bool is_large_binary() const override { return std::is_same_v<T, uint64_t> != 0; }
 
@@ -164,11 +172,7 @@ public:
     // No complain about the overloaded-virtual for this function
     DIAGNOSTIC_PUSH
     DIAGNOSTIC_IGNORE("-Woverloaded-virtual")
-    void append(const Slice& str) {
-        _bytes.insert(_bytes.end(), str.data, str.data + str.size);
-        _offsets.emplace_back(_bytes.size());
-        _slices_cache = false;
-    }
+    void append(const Slice& str);
     DIAGNOSTIC_POP
 
     void append_datum(const Datum& datum) override {
@@ -190,11 +194,11 @@ public:
         _slices_cache = false;
     }
 
-    bool append_strings(const Buffer<Slice>& strs) override;
+    bool append_strings(const Slice* data, size_t size) override;
 
-    bool append_strings_overflow(const Buffer<Slice>& strs, size_t max_length) override;
+    bool append_strings_overflow(const Slice* data, size_t size, size_t max_length) override;
 
-    bool append_continuous_strings(const Buffer<Slice>& strs) override;
+    bool append_continuous_strings(const Slice* data, size_t size) override;
 
     bool append_continuous_fixed_length_strings(const char* data, size_t size, int fixed_length) override;
 
@@ -212,11 +216,11 @@ public:
         _slices_cache = false;
     }
 
-    ColumnPtr replicate(const std::vector<uint32_t>& offsets) override;
+    ColumnPtr replicate(const Buffer<uint32_t>& offsets) override;
 
     void fill_default(const Filter& filter) override;
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t max_one_element_serialize_size() const override;
 
@@ -249,7 +253,7 @@ public:
 
     int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
-    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override;
+    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol = false) const override;
 
     std::string get_name() const override {
         static_assert(std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>);
@@ -315,6 +319,8 @@ public:
 
     std::string debug_item(size_t idx) const override;
 
+    std::string raw_item_value(size_t idx) const override;
+
     std::string debug_string() const override {
         std::stringstream ss;
         size_t size = this->size();
@@ -329,7 +335,7 @@ public:
         return ss.str();
     }
 
-    bool capacity_limit_reached(std::string* msg = nullptr) const override;
+    Status capacity_limit_reached() const override;
 
 private:
     void _build_slices() const;

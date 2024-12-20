@@ -15,37 +15,35 @@
 
 package com.starrocks.sql.ast;
 
-import com.google.common.base.Function;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.BinaryPredicate;
-import com.starrocks.analysis.BinaryPredicate.Operator;
-import com.starrocks.analysis.ColumnDef;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
-import com.starrocks.analysis.TableName;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.ObjectType;
+import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.CsvFormat;
-import com.starrocks.common.ErrorCode;
-import com.starrocks.common.ErrorReport;
 import com.starrocks.common.Pair;
-import com.starrocks.mysql.privilege.PrivPredicate;
-import com.starrocks.privilege.PrivilegeActions;
-import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.common.MetaUtils;
+import com.starrocks.sql.analyzer.AstToSQLBuilder;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TNetworkAddress;
 import org.apache.logging.log4j.LogManager;
@@ -56,6 +54,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 // used to describe data info which is needed to import.
 //
 //      data_desc:
@@ -383,7 +382,7 @@ public class DataDescription implements ParseNode {
                         + "Expr: " + columnExpr.toSql());
             }
             BinaryPredicate predicate = (BinaryPredicate) columnExpr;
-            if (predicate.getOp() != Operator.EQ) {
+            if (predicate.getOp() != BinaryType.EQ) {
                 throw new AnalysisException("Mapping function expr only support the column or eq binary predicate. "
                         + "The mapping operator error, op: " + predicate.getOp());
             }
@@ -644,38 +643,25 @@ public class DataDescription implements ParseNode {
             throw new AnalysisException("No table name in load statement.");
         }
 
-        if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-            if (!PrivilegeActions.checkTableAction(ConnectContext.get(), fullDbName,
-                    tableName, PrivilegeType.INSERT)) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "INSERT",
-                        ConnectContext.get().getQualifiedUser(),
-                        ConnectContext.get().getRemoteIP(), tableName);
-            }
-        } else {
-            // check auth
-            if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, tableName,
-                    PrivPredicate.LOAD)) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
-                        ConnectContext.get().getQualifiedUser(),
-                        ConnectContext.get().getRemoteIP(), tableName);
-            }
+        try {
+            Authorizer.checkTableAction(ConnectContext.get().getCurrentUserIdentity(),
+                    ConnectContext.get().getCurrentRoleIds(), fullDbName, tableName, PrivilegeType.INSERT);
+        } catch (AccessDeniedException e) {
+            AccessDeniedException.reportAccessDenied(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                    ConnectContext.get().getCurrentUserIdentity(),
+                    ConnectContext.get().getCurrentRoleIds(),
+                    PrivilegeType.INSERT.name(), ObjectType.TABLE.name(), tableName);
         }
-        // check hive table auth
+
         if (isLoadFromTable()) {
-            if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-                if (!PrivilegeActions.checkTableAction(ConnectContext.get(), fullDbName,
-                        srcTableName, PrivilegeType.SELECT)) {
-                    ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "SELECT",
-                            ConnectContext.get().getQualifiedUser(),
-                            ConnectContext.get().getRemoteIP(), srcTableName);
-                }
-            } else {
-                if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(), fullDbName, srcTableName,
-                        PrivPredicate.SELECT)) {
-                    ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "SELECT",
-                            ConnectContext.get().getQualifiedUser(),
-                            ConnectContext.get().getRemoteIP(), srcTableName);
-                }
+            try {
+                Authorizer.checkTableAction(ConnectContext.get().getCurrentUserIdentity(),
+                        ConnectContext.get().getCurrentRoleIds(), fullDbName, srcTableName, PrivilegeType.SELECT);
+            } catch (AccessDeniedException e) {
+                AccessDeniedException.reportAccessDenied(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                        ConnectContext.get().getCurrentUserIdentity(),
+                        ConnectContext.get().getCurrentRoleIds(),
+                        PrivilegeType.SELECT.name(), ObjectType.TABLE.name(), srcTableName);
             }
         }
     }
@@ -687,7 +673,11 @@ public class DataDescription implements ParseNode {
     }
 
     public void analyzeTable(String fullDbName) throws AnalysisException {
-        Table table = MetaUtils.getTable(ConnectContext.get(), new TableName(fullDbName, tableName));
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(fullDbName, tableName);
+        if (table == null) {
+            throw new SemanticException("Table %s is not found", tableName.toString());
+        }
+
         if (table instanceof MaterializedView) {
             throw new AnalysisException(String.format(
                     "The data of '%s' cannot be inserted because '%s' is a materialized view," +
@@ -720,7 +710,9 @@ public class DataDescription implements ParseNode {
             sb.append("DATA FROM TABLE ").append(srcTableName);
         } else {
             sb.append("DATA INFILE (");
-            Joiner.on(", ").appendTo(sb, Lists.transform(filePaths, s -> "'" + s + "'")).append(")");
+            assert filePaths != null;
+            Joiner.on(", ").appendTo(sb, filePaths.stream().map(s -> "'" + s + "'")
+                    .collect(Collectors.toList())).append(")");
         }
         if (isNegative) {
             sb.append(" NEGATIVE");
@@ -742,11 +734,15 @@ public class DataDescription implements ParseNode {
         }
         if (fileFieldNames != null && !fileFieldNames.isEmpty()) {
             sb.append(" (");
-            Joiner.on(", ").appendTo(sb, fileFieldNames).append(")");
+            sb.append(Joiner.on(", ").join(
+                    fileFieldNames.stream().map(f -> "`" + f + "`").collect(Collectors.toList())));
+            sb.append(")");
         }
         if (columnMappingList != null && !columnMappingList.isEmpty()) {
             sb.append(" SET (");
-            Joiner.on(", ").appendTo(sb, Lists.transform(columnMappingList, (Function<Expr, Object>) Expr::toSql)).append(")");
+            sb.append(Joiner.on(", ").join(columnMappingList.stream()
+                    .map(AstToSQLBuilder::toSQL).collect(Collectors.toList())));
+            sb.append(")");
         }
         return sb.toString();
     }

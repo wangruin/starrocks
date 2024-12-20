@@ -178,14 +178,14 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_notnull_test) {
             ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
             ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, 1024);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(1024));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(1024)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             ASSERT_EQ(chunk->num_rows(), 1024);
             auto column = chunk->get_column_by_slot_id(0);
             auto* i32_col = ColumnHelper::cast_to_raw<TYPE_INT>(column);
@@ -199,21 +199,21 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_notnull_test) {
             ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
             ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, 1024);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(1023));
-            sorter.update(nullptr, fake_chunks.next_chunk(1023));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(1023)));
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(1023)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             ASSERT_EQ(chunk->num_rows(), 1024);
             auto column = chunk->get_column_by_slot_id(0);
             auto* i32_col = ColumnHelper::cast_to_raw<TYPE_INT>(column);
             const auto& i32_data = i32_col->get_data();
             ASSERT_TRUE(std::is_sorted(i32_data.begin(), i32_data.end()));
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             ASSERT_TRUE(eos);
         }
         // Test sort by VARCHAR
@@ -223,15 +223,15 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_notnull_test) {
             ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
             ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, 1024);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(1024));
-            sorter.update(nullptr, fake_chunks.next_chunk(1023));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(1024)));
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(1023)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             auto column = chunk->get_column_by_slot_id(1);
             auto* slice_col = ColumnHelper::cast_to_raw<TYPE_VARCHAR>(column);
             const auto& slice_data = slice_col->get_data();
@@ -259,14 +259,14 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_nullable_test) {
             // limit 5
             int limit_sz = 5;
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, limit_sz);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(10));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(10)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             auto column = chunk->get_column_by_slot_id(0);
             ColumnViewer<TYPE_INT> viewer(column);
             ASSERT_TRUE(viewer.is_null(0));
@@ -285,14 +285,14 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_nullable_test) {
             // limit 5
             int limit_sz = 10;
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, limit_sz);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(10));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(10)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             auto column = chunk->get_column_by_slot_id(0);
             ColumnViewer<TYPE_INT> viewer(column);
             ASSERT_TRUE(viewer.is_null(viewer.size() - 1));
@@ -312,14 +312,14 @@ TEST_F(ChunksSorterHeapSortTest, single_column_order_by_nullable_test) {
             // limit 5
             int limit_sz = 5;
             ChunksSorterHeapSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &null_first, "", 0, limit_sz);
-            sorter.setup_runtime(_pool.add(new RuntimeProfile("")),
+            sorter.setup_runtime(_runtime_state.get(), _pool.add(new RuntimeProfile("")),
                                  _pool.add(new MemTracker(1L << 62, "parent", nullptr)));
-            sorter.update(nullptr, fake_chunks.next_chunk(10));
-            sorter.done(nullptr);
+            ASSERT_OK(sorter.update(nullptr, fake_chunks.next_chunk(10)));
+            ASSERT_OK(sorter.done(nullptr));
 
             ChunkPtr chunk;
             bool eos = false;
-            sorter.get_next(&chunk, &eos);
+            ASSERT_OK(sorter.get_next(&chunk, &eos));
             auto column = chunk->get_column_by_slot_id(0);
             ColumnViewer<TYPE_INT> viewer(column);
             ASSERT_TRUE(viewer.is_null(0));

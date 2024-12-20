@@ -39,6 +39,7 @@ import com.starrocks.analysis.BrokerDesc;
 import com.starrocks.analysis.LabelName;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.util.LoadPriority;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.load.EtlJobType;
 import com.starrocks.load.Load;
@@ -99,12 +100,19 @@ public class LoadStmt extends DdlStmt {
     public static final String PRIORITY = "priority";
     public static final String MERGE_CONDITION = "merge_condition";
     public static final String CASE_SENSITIVE = "case_sensitive";
+    public static final String LOG_REJECTED_RECORD_NUM = "log_rejected_record_num";
+    public static final String SPARK_LOAD_SUBMIT_TIMEOUT = "spark_load_submit_timeout";
 
+    public static final String PARTIAL_UPDATE_MODE = "partial_update_mode";
 
     // for load data from Baidu Object Store(BOS)
     public static final String BOS_ENDPOINT = "bos_endpoint";
     public static final String BOS_ACCESSKEY = "bos_accesskey";
     public static final String BOS_SECRET_ACCESSKEY = "bos_secret_accesskey";
+
+    public static final String STRIP_OUTER_ARRAY = "strip_outer_array";
+    public static final String JSONPATHS = "jsonpaths";
+    public static final String JSONROOT = "json_root";
 
     // mini load params
     public static final String KEY_IN_PARAM_COLUMNS = "columns";
@@ -138,6 +146,14 @@ public class LoadStmt extends DdlStmt {
             .add(PARTIAL_UPDATE)
             .add(PRIORITY)
             .add(CASE_SENSITIVE)
+            .add(LOG_REJECTED_RECORD_NUM)
+            .add(PARTIAL_UPDATE_MODE)
+            .add(SPARK_LOAD_SUBMIT_TIMEOUT)
+            .add(MERGE_CONDITION)
+            .add(STRIP_OUTER_ARRAY)
+            .add(JSONPATHS)
+            .add(JSONROOT)
+            .add(PropertyAnalyzer.PROPERTIES_WAREHOUSE)
             .build();
 
     public LoadStmt(LabelName label, List<DataDescription> dataDescriptions, BrokerDesc brokerDesc,
@@ -250,6 +266,19 @@ public class LoadStmt extends DdlStmt {
             }
         }
 
+        // spark load wait yarn timeout
+        final String sparkLoadSubmitTimeoutProperty = properties.get(SPARK_LOAD_SUBMIT_TIMEOUT);
+        if (sparkLoadSubmitTimeoutProperty != null) {
+            try {
+                final long sparkLoadSubmitTimeout = Long.parseLong(sparkLoadSubmitTimeoutProperty);
+                if (sparkLoadSubmitTimeout < 0) {
+                    throw new DdlException(SPARK_LOAD_SUBMIT_TIMEOUT + " must be greater than 0");
+                }
+            } catch (NumberFormatException e) {
+                throw new DdlException(SPARK_LOAD_SUBMIT_TIMEOUT + " is not a number.");
+            }
+        }
+
         // max filter ratio
         final String maxFilterRadioProperty = properties.get(MAX_FILTER_RATIO_PROPERTY);
         if (maxFilterRadioProperty != null) {
@@ -294,14 +323,19 @@ public class LoadStmt extends DdlStmt {
                 throw new DdlException(PRIORITY + " should in HIGHEST/HIGH/NORMAL/LOW/LOWEST");
             }
         }
-    }
 
-    @Override
-    public boolean needAuditEncryption() {
-        if (brokerDesc != null || resourceDesc != null) {
-            return true;
+        // log rejected record num
+        final String logRejectedRecordNumProperty = properties.get(LOG_REJECTED_RECORD_NUM);
+        if (logRejectedRecordNumProperty != null) {
+            try {
+                final long logRejectedRecordNum = Long.parseLong(logRejectedRecordNumProperty);
+                if (logRejectedRecordNum < -1) {
+                    throw new DdlException(LOG_REJECTED_RECORD_NUM + " must be equal or greater than -1");
+                }
+            } catch (NumberFormatException e) {
+                throw new DdlException(LOG_REJECTED_RECORD_NUM + " is not a number.");
+            }
         }
-        return false;
     }
 
     public String getVersion() {

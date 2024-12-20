@@ -17,16 +17,21 @@ package com.starrocks.sql;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.SlotDescriptor;
+import com.starrocks.analysis.TableName;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.FeConstants;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.load.Load;
 import com.starrocks.planner.DataSink;
 import com.starrocks.planner.OlapTableSink;
 import com.starrocks.planner.PlanFragment;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.QueryRelation;
@@ -53,7 +58,7 @@ public class DeletePlanner {
         QueryRelation query = deleteStatement.getQueryStatement().getQueryRelation();
         List<String> colNames = query.getColumnOutputNames();
         ColumnRefFactory columnRefFactory = new ColumnRefFactory();
-        LogicalPlan logicalPlan = new RelationTransformer(columnRefFactory, session).transformWithSelectLimit(query);
+        LogicalPlan logicalPlan = new RelationTransformer(columnRefFactory, session).transform(query);
 
         // TODO: remove forceDisablePipeline when all the operators support pipeline engine.
         boolean isEnablePipeline = session.getSessionVariable().isEnablePipelineEngine();
@@ -81,12 +86,8 @@ public class DeletePlanner {
             TupleDescriptor olapTuple = descriptorTable.createTupleDescriptor();
 
             OlapTable table = (OlapTable) deleteStatement.getTable();
-            if (table.isAbortDelete()) {
-                throw new SemanticException(
-                    "Delete statement is forbidden when auto increment column is not the Key for Primary Key table.");
-            }
             for (Column column : table.getBaseSchema()) {
-                if (column.isKey()) {
+                if (column.isKey() || column.isNameWithPrefix(FeConstants.GENERATED_PARTITION_COLUMN_PREFIX)) {
                     SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(olapTuple);
                     slotDescriptor.setIsMaterialized(true);
                     slotDescriptor.setType(column.getType());
@@ -108,8 +109,24 @@ public class DeletePlanner {
                 partitionIds.add(partition.getId());
             }
             DataSink dataSink = new OlapTableSink(table, olapTuple, partitionIds, table.writeQuorum(),
-                    table.enableReplicatedStorage(), false);
+                    table.enableReplicatedStorage(), false, false,
+                    session.getCurrentWarehouseId());
             execPlan.getFragments().get(0).setSink(dataSink);
+
+            // if sink is OlapTableSink Assigned to Be execute this sql [cn execute OlapTableSink will crash]
+            session.getSessionVariable().setPreferComputeNode(false);
+            session.getSessionVariable().setUseComputeNodes(0);
+            OlapTableSink olapTableSink = (OlapTableSink) dataSink;
+            TableName catalogDbTable = deleteStatement.getTableName();
+            Database db = GlobalStateMgr.getCurrentState().getMetadataMgr().getDb(catalogDbTable.getCatalog(),
+                    catalogDbTable.getDb());
+            try {
+                olapTableSink.init(session.getExecutionId(), deleteStatement.getTxnId(), db.getId(), session.getExecTimeout());
+                olapTableSink.complete();
+            } catch (StarRocksException e) {
+                throw new SemanticException(e.getMessage());
+            }
+
             if (canUsePipeline) {
                 PlanFragment sinkFragment = execPlan.getFragments().get(0);
                 if (ConnectContext.get().getSessionVariable().getEnableAdaptiveSinkDop()) {

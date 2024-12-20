@@ -15,21 +15,23 @@
 #pragma once
 
 #include <memory>
-#include <tuple>
-#include <unordered_map>
 
 #include "column/type_traits.h"
 #include "exprs/agg/aggregate.h"
 #include "exprs/agg/aggregate_factory.h"
 #include "exprs/agg/any_value.h"
+#include "exprs/agg/approx_top_k.h"
 #include "exprs/agg/array_agg.h"
 #include "exprs/agg/avg.h"
+#include "exprs/agg/bitmap_agg.h"
 #include "exprs/agg/bitmap_intersect.h"
 #include "exprs/agg/bitmap_union.h"
 #include "exprs/agg/bitmap_union_count.h"
 #include "exprs/agg/bitmap_union_int.h"
 #include "exprs/agg/count.h"
+#include "exprs/agg/covariance.h"
 #include "exprs/agg/distinct.h"
+#include "exprs/agg/ds_hll_count_distinct.h"
 #include "exprs/agg/exchange_perf.h"
 #include "exprs/agg/group_concat.h"
 #include "exprs/agg/histogram.h"
@@ -37,6 +39,8 @@
 #include "exprs/agg/hll_union.h"
 #include "exprs/agg/hll_union_count.h"
 #include "exprs/agg/intersect_count.h"
+#include "exprs/agg/mann_whitney.h"
+#include "exprs/agg/map_agg.h"
 #include "exprs/agg/maxmin.h"
 #include "exprs/agg/maxmin_by.h"
 #include "exprs/agg/nullable_aggregate.h"
@@ -76,6 +80,9 @@ public:
 
     static AggregateFunctionPtr MakeBitmapUnionAggregateFunction();
 
+    template <LogicalType LT>
+    static AggregateFunctionPtr MakeBitmapAggAggregateFunction();
+
     static AggregateFunctionPtr MakeBitmapIntersectAggregateFunction();
 
     static AggregateFunctionPtr MakeBitmapUnionCountAggregateFunction();
@@ -105,17 +112,25 @@ public:
         return std::make_shared<ExchangePerfAggregateFunction<PerfType>>();
     }
 
-    static AggregateFunctionPtr MakeArrayAggAggregateFunction() {
-        return std::make_shared<ArrayAggAggregateFunction>();
+    static AggregateFunctionPtr MakeArrayAggAggregateFunctionV2() {
+        return std::make_shared<ArrayAggAggregateFunctionV2>();
+    }
+
+    static AggregateFunctionPtr MakeGroupConcatAggregateFunctionV2() {
+        return std::make_shared<GroupConcatAggregateFunctionV2>();
+    }
+
+    static auto MakeMannWhitneyUTestAggregateFunction() {
+        return std::make_shared<MannWhitneyUTestAggregateFunction>();
     }
 
     template <LogicalType LT>
     static auto MakeMaxAggregateFunction();
 
-    template <LogicalType LT>
+    template <LogicalType LT, bool not_filter_nulls>
     static auto MakeMaxByAggregateFunction();
 
-    template <LogicalType LT>
+    template <LogicalType LT, bool not_filter_nulls>
     static auto MakeMinByAggregateFunction();
 
     template <LogicalType LT>
@@ -124,12 +139,19 @@ public:
     template <LogicalType LT>
     static AggregateFunctionPtr MakeAnyValueAggregateFunction();
 
-    template <typename NestedState, bool IsWindowFunc, bool IgnoreNull = true,
-              typename NestedFunctionPtr = AggregateFunctionPtr>
-    static AggregateFunctionPtr MakeNullableAggregateFunctionUnary(NestedFunctionPtr nested_function);
+    static AggregateFunctionPtr MakeAnyValueSemiAggregateFunction() {
+        return std::make_shared<AnyValueSemiAggregateFunction>();
+    }
 
-    template <typename NestedState>
-    static AggregateFunctionPtr MakeNullableAggregateFunctionVariadic(AggregateFunctionPtr nested_function);
+    template <typename NestedState, bool IsWindowFunc, bool IgnoreNull = true,
+              typename NestedFunctionPtr = AggregateFunctionPtr,
+              IsAggNullPred<NestedState> AggNullPred = AggNonNullPred<NestedState>>
+    static AggregateFunctionPtr MakeNullableAggregateFunctionUnary(NestedFunctionPtr nested_function,
+                                                                   AggNullPred null_pred = AggNullPred());
+
+    template <typename NestedState, IsAggNullPred<NestedState> AggNullPred = AggNonNullPred<NestedState>>
+    static AggregateFunctionPtr MakeNullableAggregateFunctionVariadic(AggregateFunctionPtr nested_function,
+                                                                      AggNullPred null_pred = AggNullPred());
 
     template <LogicalType LT>
     static auto MakeSumAggregateFunction();
@@ -138,10 +160,16 @@ public:
     static auto MakeDecimalSumAggregateFunction();
 
     template <LogicalType LT, bool is_sample>
-    static AggregateFunctionPtr MakeVarianceAggregateFunction();
+    static auto MakeVarianceAggregateFunction();
 
     template <LogicalType LT, bool is_sample>
-    static AggregateFunctionPtr MakeStddevAggregateFunction();
+    static auto MakeStddevAggregateFunction();
+
+    template <LogicalType LT, bool is_sample>
+    static auto MakeCovarianceAggregateFunction();
+
+    template <LogicalType LT>
+    static auto MakeCorelationAggregateFunction();
 
     template <LogicalType LT>
     static auto MakeSumDistinctAggregateFunction();
@@ -162,6 +190,9 @@ public:
     static AggregateFunctionPtr MakeHllNdvAggregateFunction();
 
     template <LogicalType T>
+    static AggregateFunctionPtr MakeHllSketchAggregateFunction();
+
+    template <LogicalType T>
     static AggregateFunctionPtr MakeHllRawAggregateFunction();
 
     static AggregateFunctionPtr MakePercentileApproxAggregateFunction();
@@ -174,12 +205,22 @@ public:
     template <LogicalType PT>
     static AggregateFunctionPtr MakePercentileDiscAggregateFunction();
 
+    template <LogicalType LT>
+    static AggregateFunctionPtr MakeLowCardPercentileBinAggregateFunction();
+
+    template <LogicalType PT>
+    static AggregateFunctionPtr MakeLowCardPercentileCntAggregateFunction();
+
     // Windows functions:
     static AggregateFunctionPtr MakeDenseRankWindowFunction();
 
     static AggregateFunctionPtr MakeRankWindowFunction();
 
     static AggregateFunctionPtr MakeRowNumberWindowFunction();
+
+    static AggregateFunctionPtr MakeCumeDistWindowFunction();
+
+    static AggregateFunctionPtr MakePercentRankWindowFunction();
 
     static AggregateFunctionPtr MakeNtileWindowFunction();
 
@@ -196,6 +237,16 @@ public:
     template <LogicalType LT, bool ignoreNulls, bool isLag>
     static AggregateFunctionPtr MakeLeadLagWindowFunction() {
         return std::make_shared<LeadLagWindowFunction<LT, ignoreNulls, isLag>>();
+    }
+
+    template <LogicalType LT>
+    static AggregateFunctionPtr MakeSessionNumberWindowFunction() {
+        return std::make_shared<SessionNumberWindowFunction<LT>>();
+    }
+
+    template <LogicalType LT>
+    static AggregateFunctionPtr MakeApproxTopKAggregateFunction() {
+        return std::make_shared<ApproxTopKAggregateFunction<LT>>();
     }
 
     template <LogicalType LT>
@@ -253,16 +304,16 @@ auto AggregateFactory::MakeMaxAggregateFunction() {
     return std::make_shared<MaxMinAggregateFunction<LT, MaxAggregateData<LT>, MaxElement<LT, MaxAggregateData<LT>>>>();
 }
 
-template <LogicalType LT>
+template <LogicalType LT, bool not_filter_nulls>
 auto AggregateFactory::MakeMaxByAggregateFunction() {
-    return std::make_shared<
-            MaxMinByAggregateFunction<LT, MaxByAggregateData<LT>, MaxByElement<LT, MaxByAggregateData<LT>>>>();
+    using AggData = MaxByAggregateData<LT, not_filter_nulls>;
+    return std::make_shared<MaxMinByAggregateFunction<LT, AggData, MaxByElement<LT, AggData>>>();
 }
 
-template <LogicalType LT>
+template <LogicalType LT, bool not_filter_nulls>
 auto AggregateFactory::MakeMinByAggregateFunction() {
-    return std::make_shared<
-            MaxMinByAggregateFunction<LT, MinByAggregateData<LT>, MinByElement<LT, MinByAggregateData<LT>>>>();
+    using AggData = MinByAggregateData<LT, not_filter_nulls>;
+    return std::make_shared<MaxMinByAggregateFunction<LT, AggData, MinByElement<LT, AggData>>>();
 }
 
 template <LogicalType LT>
@@ -276,18 +327,22 @@ AggregateFunctionPtr AggregateFactory::MakeAnyValueAggregateFunction() {
             AnyValueAggregateFunction<LT, AnyValueAggregateData<LT>, AnyValueElement<LT, AnyValueAggregateData<LT>>>>();
 }
 
-template <typename NestedState, bool IsWindowFunc, bool IgnoreNull, typename NestedFunctionPtr>
-AggregateFunctionPtr AggregateFactory::MakeNullableAggregateFunctionUnary(NestedFunctionPtr nested_function) {
+template <typename NestedState, bool IsWindowFunc, bool IgnoreNull, typename NestedFunctionPtr,
+          IsAggNullPred<NestedState> AggNullPred>
+AggregateFunctionPtr AggregateFactory::MakeNullableAggregateFunctionUnary(NestedFunctionPtr nested_function,
+                                                                          AggNullPred null_pred) {
     using AggregateDataType = NullableAggregateFunctionState<NestedState, IsWindowFunc>;
-    return std::make_shared<
-            NullableAggregateFunctionUnary<NestedFunctionPtr, AggregateDataType, IsWindowFunc, IgnoreNull>>(
-            nested_function);
+    return std::make_shared<NullableAggregateFunctionUnary<NestedFunctionPtr, AggregateDataType, IsWindowFunc,
+                                                           IgnoreNull, AggNullPred>>(nested_function,
+                                                                                     std::move(null_pred));
 }
 
-template <typename NestedState>
-AggregateFunctionPtr AggregateFactory::MakeNullableAggregateFunctionVariadic(AggregateFunctionPtr nested_function) {
+template <typename NestedState, IsAggNullPred<NestedState> AggNullPred>
+AggregateFunctionPtr AggregateFactory::MakeNullableAggregateFunctionVariadic(AggregateFunctionPtr nested_function,
+                                                                             AggNullPred null_pred) {
     using AggregateDataType = NullableAggregateFunctionState<NestedState, false>;
-    return std::make_shared<NullableAggregateFunctionVariadic<AggregateDataType>>(nested_function);
+    return std::make_shared<NullableAggregateFunctionVariadic<AggregateDataType, AggNullPred>>(nested_function,
+                                                                                               std::move(null_pred));
 }
 
 template <LogicalType LT>
@@ -301,13 +356,23 @@ auto AggregateFactory::MakeDecimalSumAggregateFunction() {
 }
 
 template <LogicalType LT, bool is_sample>
-AggregateFunctionPtr AggregateFactory::MakeVarianceAggregateFunction() {
+auto AggregateFactory::MakeVarianceAggregateFunction() {
     return std::make_shared<VarianceAggregateFunction<LT, is_sample>>();
 }
 
 template <LogicalType LT, bool is_sample>
-AggregateFunctionPtr AggregateFactory::MakeStddevAggregateFunction() {
+auto AggregateFactory::MakeStddevAggregateFunction() {
     return std::make_shared<StddevAggregateFunction<LT, is_sample>>();
+}
+
+template <LogicalType LT, bool is_sample>
+auto AggregateFactory::MakeCovarianceAggregateFunction() {
+    return std::make_shared<CorVarianceAggregateFunction<LT, is_sample>>();
+}
+
+template <LogicalType LT>
+auto AggregateFactory::MakeCorelationAggregateFunction() {
+    return std::make_shared<CorelationAggregateFunction<LT>>();
 }
 
 template <LogicalType LT>
@@ -331,6 +396,11 @@ AggregateFunctionPtr AggregateFactory::MakeHllNdvAggregateFunction() {
 }
 
 template <LogicalType LT>
+AggregateFunctionPtr AggregateFactory::MakeHllSketchAggregateFunction() {
+    return std::make_shared<HllSketchAggregateFunction<LT>>();
+}
+
+template <LogicalType LT>
 AggregateFunctionPtr AggregateFactory::MakeHllRawAggregateFunction() {
     return std::make_shared<HllNdvAggregateFunction<LT, true>>();
 }
@@ -343,6 +413,21 @@ AggregateFunctionPtr AggregateFactory::MakePercentileContAggregateFunction() {
 template <LogicalType PT>
 AggregateFunctionPtr AggregateFactory::MakePercentileDiscAggregateFunction() {
     return std::make_shared<PercentileDiscAggregateFunction<PT>>();
+}
+
+template <LogicalType PT>
+AggregateFunctionPtr AggregateFactory::MakeLowCardPercentileBinAggregateFunction() {
+    return std::make_shared<LowCardPercentileBinAggregateFunction<PT>>();
+}
+
+template <LogicalType PT>
+AggregateFunctionPtr AggregateFactory::MakeLowCardPercentileCntAggregateFunction() {
+    return std::make_shared<LowCardPercentileCntAggregateFunction<PT>>();
+}
+
+template <LogicalType LT>
+AggregateFunctionPtr AggregateFactory::MakeBitmapAggAggregateFunction() {
+    return std::make_shared<BitmapAggAggregateFunction<LT>>();
 }
 
 // Stream MV Retractable Aggregate Functions

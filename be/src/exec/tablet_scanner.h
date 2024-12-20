@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "column/chunk.h"
+#include "column/column_access_path.h"
 #include "common/status.h"
 #include "exec/olap_utils.h"
 #include "exprs/expr.h"
@@ -39,9 +40,11 @@ struct TabletScannerParams {
     const std::vector<ExprContext*>* conjunct_ctxs = nullptr;
 
     const std::vector<std::string>* unused_output_columns = nullptr;
+    const std::vector<ColumnAccessPathPtr>* column_access_paths = nullptr;
 
     bool skip_aggregation = false;
     bool need_agg_finalize = true;
+    bool update_num_scan_range = false;
 };
 
 class TabletScanner {
@@ -57,7 +60,7 @@ public:
     Status init(RuntimeState* runtime_state, const TabletScannerParams& params);
     Status open([[maybe_unused]] RuntimeState* runtime_state);
     Status get_chunk([[maybe_unused]] RuntimeState* state, Chunk* chunk);
-    Status close(RuntimeState* state);
+    void close(RuntimeState* state);
 
     RuntimeState* runtime_state() { return _runtime_state; }
     int64_t raw_rows_read() const { return _raw_rows_read; }
@@ -81,13 +84,13 @@ private:
     RuntimeState* _runtime_state = nullptr;
     OlapScanNode* _parent = nullptr;
 
-    using PredicatePtr = std::unique_ptr<ColumnPredicate>;
     ObjectPool _pool;
     std::vector<ExprContext*> _conjunct_ctxs;
-    ConjunctivePredicates _predicates;
-    std::vector<uint8_t> _selection;
+    PredicateTree _pred_tree;
+    Filter _selection;
 
     // for release memory.
+    using PredicatePtr = std::unique_ptr<ColumnPredicate>;
     std::vector<PredicatePtr> _predicate_free_pool;
 
     bool _is_open = false;
@@ -95,11 +98,13 @@ private:
     bool _skip_aggregation = false;
     bool _need_agg_finalize = false;
     bool _has_update_counter = false;
+    bool _update_num_scan_range = false;
 
     TabletReaderParams _params;
     std::shared_ptr<TabletReader> _reader;
 
     TabletSharedPtr _tablet;
+    TabletSchemaCSPtr _tablet_schema;
     int64_t _version = 0;
 
     // output columns of `this` TabletScanner, i.e, the final output columns of `get_chunk`.

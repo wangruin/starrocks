@@ -49,6 +49,7 @@
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_executor.h"
 #include "service/backend_options.h"
+#include "util/concurrent_limiter.h"
 #include "util/string_util.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -88,8 +89,10 @@ public:
 
     // partition -> begin offset, inclusive.
     std::map<int32_t, int64_t> begin_offset;
-    // partiton -> commit offset, inclusive.
+    // partition -> commit offset, inclusive.
     std::map<int32_t, int64_t> cmt_offset;
+    // partition -> commit offset timestamp, inclusive.
+    std::map<int32_t, int64_t> cmt_offset_timestamp;
     //custom kafka property key -> value
     std::map<std::string, std::string> properties;
 };
@@ -150,7 +153,7 @@ public:
 
     ~StreamLoadContext() noexcept {
         if (need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(this);
+            (void)_exec_env->stream_load_executor()->rollback_txn(this);
             need_rollback = false;
         }
 
@@ -168,6 +171,12 @@ public:
     void ref() { _refs.fetch_add(1); }
     // If unref() returns true, this object should be delete
     bool unref() { return _refs.fetch_sub(1) == 1; }
+
+    int num_refs() { return _refs.load(); }
+
+    bool check_and_set_http_limiter(ConcurrentLimiter* limiter);
+
+    static void release(StreamLoadContext* context);
 
 public:
     // 1) Before the stream load receiving thread exits, Fragment may have been destructed.
@@ -193,11 +202,16 @@ public:
 
     std::string db;
     std::string table;
+    // if enable_batch_write is false, the label represents the txn
+    // otherwise, it just represents the request id of the load, and
+    // the batch_write_label represents the txn
     std::string label;
     // optional
     double max_filter_ratio = 0.0;
     int32_t timeout_second = -1;
     AuthInfo auth;
+
+    int64_t log_rejected_record_num = 0;
 
     // the following members control the max progress of a consuming
     // process. if any of them reach, the consuming will finish.
@@ -235,6 +249,7 @@ public:
     int64_t last_active_ts = 0;
 
     std::string error_url;
+    std::string rejected_record_path;
     // if label already be used, set existing job's status here
     // should be RUNNING or FINISHED
     std::string existing_job_status;
@@ -266,6 +281,18 @@ public:
     ByteBufferPtr buffer = nullptr;
 
     TStreamLoadPutRequest request;
+
+    int64_t load_deadline_sec = -1;
+    std::unique_ptr<ConcurrentLimiterGuard> _http_limiter_guard;
+
+    // for batch write
+    bool enable_batch_write = false;
+    std::map<std::string, std::string> load_parameters;
+    // the txn for the data belongs to. put the txn id into `txn_id`,
+    // and put label in this `batch_write_label`
+    std::string batch_write_label;
+    // A hint for the left time of this batch to finish
+    int64_t batch_left_time_nanos = -1;
 
 public:
     bool is_channel_stream_load_context() { return channel_id != -1; }

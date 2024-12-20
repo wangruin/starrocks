@@ -14,8 +14,7 @@
 
 #pragma once
 
-#include "exec/hash_joiner.h"
-#include "exec/pipeline/hashjoin/hash_joiner_factory.h"
+#include "exec/pipeline/hashjoin/hash_joiner_fwd.h"
 #include "exec/pipeline/operator.h"
 #include "exec/pipeline/operator_with_dependency.h"
 #include "exec/pipeline/pipeline_fwd.h"
@@ -24,7 +23,7 @@ namespace starrocks::pipeline {
 
 using HashJoiner = starrocks::HashJoiner;
 
-class HashJoinProbeOperator final : public OperatorWithDependency {
+class HashJoinProbeOperator : public OperatorWithDependency {
 public:
     HashJoinProbeOperator(OperatorFactory* factory, int32_t id, const string& name, int32_t plan_node_id,
                           int32_t driver_sequence, HashJoinerPtr join_prober, HashJoinerPtr join_builder);
@@ -51,12 +50,13 @@ public:
     StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
 
     Status reset_state(starrocks::RuntimeState* state, const std::vector<ChunkPtr>& refill_chunks) override;
+    void update_exec_stats(RuntimeState* state) override;
 
-private:
+protected:
     /// Reference the read-only hash table from builder in the first pull_chunk.
     Status _reference_builder_hash_table_once();
 
-private:
+protected:
     const HashJoinerPtr _join_prober;
     // For non-broadcast join, _join_builder is identical to _join_prober.
     // For broadcast join, _join_prober references the hash table owned by _join_builder,
@@ -64,18 +64,19 @@ private:
     const HashJoinerPtr _join_builder;
 };
 
-class HashJoinProbeOperatorFactory final : public OperatorFactory {
+class HashJoinProbeOperatorFactory : public OperatorFactory {
 public:
     HashJoinProbeOperatorFactory(int32_t id, int32_t plan_node_id, HashJoinerFactoryPtr hash_joiner);
 
     ~HashJoinProbeOperatorFactory() override = default;
 
     Status prepare(RuntimeState* state) override;
+
     void close(RuntimeState* state) override;
 
     OperatorPtr create(int32_t degree_of_parallelism, int32_t driver_sequence) override;
 
-private:
+protected:
     HashJoinerFactoryPtr _hash_joiner_factory;
 };
 

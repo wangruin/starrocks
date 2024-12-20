@@ -15,6 +15,7 @@
 
 package com.starrocks.sql.optimizer.rewrite.scalar;
 
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.operator.OperatorType;
@@ -32,6 +33,7 @@ import java.math.BigInteger;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -145,7 +147,7 @@ public class ReduceCastRuleTest {
             ScalarOperator castChild = createConstOperatorFromType(types[1]);
             CastOperator binPredLhs = new CastOperator(types[2], castChild);
             BinaryPredicateOperator binPred = new BinaryPredicateOperator(
-                    BinaryPredicateOperator.BinaryType.GE, binPredLhs, binPredRhs);
+                    BinaryType.GE, binPredLhs, binPredRhs);
             ScalarOperator result = reduceCastRule.apply(binPred, null);
             result = foldConstantsRule.apply(result, null);
             Assert.assertTrue(result instanceof ConstantOperator);
@@ -157,9 +159,6 @@ public class ReduceCastRuleTest {
         Type[][] typeListList = new Type[][] {
                 {Type.TINYINT, Type.SMALLINT, ScalarType.createDecimalV3NarrowestType(13, 9)},
                 {Type.INT, Type.SMALLINT, ScalarType.createDecimalV3NarrowestType(9, 0)},
-                {ScalarType.createDecimalV3NarrowestType(6, 0), Type.SMALLINT, Type.BIGINT},
-                {ScalarType.createDecimalV3NarrowestType(19, 0), Type.BIGINT, Type.LARGEINT},
-                {ScalarType.createDecimalV3NarrowestType(10, 0), Type.TINYINT, Type.INT},
         };
 
         ScalarOperatorRewriteRule reduceCastRule = new ReduceCastRule();
@@ -169,10 +168,27 @@ public class ReduceCastRuleTest {
             ScalarOperator castChild = createConstOperatorFromType(types[1]);
             CastOperator binPredLhs = new CastOperator(types[2], castChild);
             BinaryPredicateOperator binPred = new BinaryPredicateOperator(
-                    BinaryPredicateOperator.BinaryType.GE, binPredLhs, binPredRhs);
+                    BinaryType.GE, binPredLhs, binPredRhs);
             ScalarOperator result = reduceCastRule.apply(binPred, null);
             result = foldConstantsRule.apply(result, null);
-            Assert.assertTrue(!(result instanceof ConstantOperator));
+            Assert.assertFalse(Arrays.toString(types), result instanceof ConstantOperator);
+        }
+
+        typeListList = new Type[][] {
+                {ScalarType.createDecimalV3NarrowestType(6, 0), Type.SMALLINT, Type.BIGINT},
+                {ScalarType.createDecimalV3NarrowestType(19, 0), Type.BIGINT, Type.LARGEINT},
+                {ScalarType.createDecimalV3NarrowestType(10, 0), Type.TINYINT, Type.INT},
+        };
+
+        for (Type[] types : typeListList) {
+            ScalarOperator binPredRhs = createConstOperatorFromType(types[0]);
+            ScalarOperator castChild = createConstOperatorFromType(types[1]);
+            CastOperator binPredLhs = new CastOperator(types[2], castChild);
+            BinaryPredicateOperator binPred = new BinaryPredicateOperator(
+                    BinaryType.GE, binPredLhs, binPredRhs);
+            ScalarOperator result = reduceCastRule.apply(binPred, null);
+            result = foldConstantsRule.apply(result, null);
+            Assert.assertTrue(Arrays.toString(types), result instanceof ConstantOperator);
         }
     }
 
@@ -188,13 +204,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 11:11:11", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GE, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.GE, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.GE,
+            Assert.assertEquals(BinaryType.GE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -207,13 +223,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 00:00:00", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GE, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.GE, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.GE,
+            Assert.assertEquals(BinaryType.GE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -226,13 +242,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 00:00:00", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LE, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.LE, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LE,
+            Assert.assertEquals(BinaryType.LE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -245,13 +261,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 11:11:11", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LT, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.LT, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LE,
+            Assert.assertEquals(BinaryType.LE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -264,13 +280,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 00:00:00", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LT, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.LT, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LE,
+            Assert.assertEquals(BinaryType.LE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -283,13 +299,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-28 00:00:00", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.EQ, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.EQ,
+            Assert.assertEquals(BinaryType.EQ,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -302,7 +318,7 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDatetime(LocalDateTime.parse("2021-12-29 11:11:11", dateTimeFormatter));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.EQ, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
@@ -332,13 +348,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDate(LocalDate.parse("2021-12-28").atTime(0, 0, 0, 0));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GE, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.GE, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.GE,
+            Assert.assertEquals(BinaryType.GE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -351,13 +367,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDate(LocalDate.parse("2021-12-28").atTime(0, 0, 0, 0));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GT, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.GT, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.GE,
+            Assert.assertEquals(BinaryType.GE,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -370,13 +386,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDate(LocalDate.parse("2021-12-28").atTime(0, 0, 0, 0));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LE, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.LE, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LT,
+            Assert.assertEquals(BinaryType.LT,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -389,13 +405,13 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDate(LocalDate.parse("2021-12-28").atTime(0, 0, 0, 0));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LT, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.LT, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
 
             Assert.assertTrue(afterOptimize instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LT,
+            Assert.assertEquals(BinaryType.LT,
                     ((BinaryPredicateOperator) afterOptimize).getBinaryType());
             Assert.assertTrue(afterOptimize.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(afterOptimize.getChild(1) instanceof ConstantOperator);
@@ -408,7 +424,7 @@ public class ReduceCastRuleTest {
             ConstantOperator constantOperator =
                     ConstantOperator.createDate(LocalDate.parse("2021-12-28").atTime(0, 0, 0, 0));
             BinaryPredicateOperator beforeOptimize =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, castOperator, constantOperator);
+                    new BinaryPredicateOperator(BinaryType.EQ, castOperator, constantOperator);
             ScalarOperator afterOptimize = reduceCastRule.apply(
                     beforeOptimize,
                     null);
@@ -419,13 +435,13 @@ public class ReduceCastRuleTest {
             ScalarOperator right = afterOptimize.getChild(1);
             Assert.assertTrue(left instanceof BinaryPredicateOperator);
             Assert.assertTrue(right instanceof BinaryPredicateOperator);
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.GE,
+            Assert.assertEquals(BinaryType.GE,
                     ((BinaryPredicateOperator) left).getBinaryType());
             Assert.assertTrue(left.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(left.getChild(1) instanceof ConstantOperator);
             Assert.assertEquals("2021-12-28 00:00:00",
                     ((ConstantOperator) left.getChild(1)).getDatetime().format(formatter));
-            Assert.assertEquals(BinaryPredicateOperator.BinaryType.LT,
+            Assert.assertEquals(BinaryType.LT,
                     ((BinaryPredicateOperator) right).getBinaryType());
             Assert.assertTrue(right.getChild(0) instanceof ColumnRefOperator);
             Assert.assertTrue(right.getChild(1) instanceof ConstantOperator);
@@ -440,5 +456,16 @@ public class ReduceCastRuleTest {
             ScalarOperator afterOptimize = reduceCastRule.apply(beforeOptimize, null);
             Assert.assertSame(beforeOptimize, afterOptimize);
         }
+    }
+
+    @Test
+    public void testPrecisionLoss() {
+        ReduceCastRule rule = new ReduceCastRule();
+        // cast(96.1) as int = 96, we can't change it into 96.1 = cast(96) as double
+        ScalarOperator castOperator = new CastOperator(Type.INT, ConstantOperator.createDouble(96.1));
+        BinaryPredicateOperator beforeOptimize =
+                BinaryPredicateOperator.eq(castOperator, ConstantOperator.createInt(96));
+        ScalarOperator result = rule.apply(beforeOptimize, null);
+        Assert.assertTrue(result.getChild(0) instanceof CastOperator);
     }
 }

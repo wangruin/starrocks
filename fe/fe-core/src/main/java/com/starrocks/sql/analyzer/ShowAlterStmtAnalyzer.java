@@ -18,6 +18,7 @@ package com.starrocks.sql.analyzer;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.OrderByElement;
@@ -47,7 +48,7 @@ public class ShowAlterStmtAnalyzer {
         new ShowAlterStmtAnalyzerVisitor().visit(statement, context);
     }
 
-    static class ShowAlterStmtAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class ShowAlterStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
 
         private final HashMap<String, Expr> filterMap = new HashMap<>();
 
@@ -67,7 +68,7 @@ public class ShowAlterStmtAnalyzer {
 
         private void handleShowAlterTable(ShowAlterStmt statement, ConnectContext context) throws SemanticException {
             // build proc path
-            @Nonnull Database db = context.getGlobalStateMgr().getDb(statement.getDbName());
+            @Nonnull Database db = context.getGlobalStateMgr().getLocalMetastore().getDb(statement.getDbName());
             ShowAlterStmt.AlterType type = statement.getType();
             StringBuilder sb = new StringBuilder();
             sb.append("/jobs/");
@@ -76,6 +77,8 @@ public class ShowAlterStmtAnalyzer {
                 sb.append("/schema_change");
             } else if (type == ShowAlterStmt.AlterType.ROLLUP || type == ShowAlterStmt.AlterType.MATERIALIZED_VIEW) {
                 sb.append("/rollup");
+            } else if (type == ShowAlterStmt.AlterType.OPTIMIZE) {
+                sb.append("/optimize");
             }
 
             // create show proc stmt
@@ -99,7 +102,7 @@ public class ShowAlterStmtAnalyzer {
             }
             statement.setDbName(dbName);
             // Check db.
-            if (context.getGlobalStateMgr().getDb(dbName) == null) {
+            if (context.getGlobalStateMgr().getLocalMetastore().getDb(dbName) == null) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
             }
 
@@ -147,7 +150,7 @@ public class ShowAlterStmtAnalyzer {
             String leftKey = ((SlotRef) subExpr.getChild(0)).getColumnName().toLowerCase();
             if (leftKey.equals("tablename") || leftKey.equals("state")) {
                 if (!(subExpr.getChild(1) instanceof StringLiteral) ||
-                        binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+                        binaryPredicate.getOp() != BinaryType.EQ) {
                     ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
                             "Where clause : TableName = \"table1\" or "
                                     + "State = \"FINISHED|CANCELLED|RUNNING|PENDING|WAITING_TXN\"");

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.logical;
 
 import com.google.common.base.Preconditions;
@@ -30,6 +29,7 @@ import java.util.Map;
 public class LogicalDeltaLakeScanOperator extends LogicalScanOperator {
     private ScanOperatorPredicates predicates = new ScanOperatorPredicates();
 
+    private boolean hasUnknownColumn = true;
     public LogicalDeltaLakeScanOperator(Table table,
                                         Map<ColumnRefOperator, Column> colRefToColumnMetaMap,
                                         Map<Column, ColumnRefOperator> columnMetaToColRefMap,
@@ -39,16 +39,8 @@ public class LogicalDeltaLakeScanOperator extends LogicalScanOperator {
         Preconditions.checkState(table instanceof DeltaLakeTable);
     }
 
-    private LogicalDeltaLakeScanOperator(LogicalDeltaLakeScanOperator.Builder builder) {
-        super(OperatorType.LOGICAL_DELTALAKE_SCAN,
-                builder.table,
-                builder.colRefToColumnMetaMap,
-                builder.columnMetaToColRefMap,
-                builder.getLimit(),
-                builder.getPredicate(),
-                builder.getProjection());
-
-        this.predicates = builder.predicates;
+    private LogicalDeltaLakeScanOperator() {
+        super(OperatorType.LOGICAL_DELTALAKE_SCAN);
     }
 
     @Override
@@ -56,6 +48,13 @@ public class LogicalDeltaLakeScanOperator extends LogicalScanOperator {
         return visitor.visitLogicalDeltaLakeScan(this, context);
     }
 
+    public boolean hasUnknownColumn() {
+        return hasUnknownColumn;
+    }
+
+    public void setHasUnknownColumn(boolean hasUnknownColumn) {
+        this.hasUnknownColumn = hasUnknownColumn;
+    }
     @Override
     public ScanOperatorPredicates getScanOperatorPredicates() {
         return this.predicates;
@@ -68,18 +67,16 @@ public class LogicalDeltaLakeScanOperator extends LogicalScanOperator {
 
     public static class Builder
             extends LogicalScanOperator.Builder<LogicalDeltaLakeScanOperator, LogicalDeltaLakeScanOperator.Builder> {
-        private ScanOperatorPredicates predicates = new ScanOperatorPredicates();
 
         @Override
-        public LogicalDeltaLakeScanOperator build() {
-            return new LogicalDeltaLakeScanOperator(this);
+        protected LogicalDeltaLakeScanOperator newInstance() {
+            return new LogicalDeltaLakeScanOperator();
         }
 
         @Override
         public LogicalDeltaLakeScanOperator.Builder withOperator(LogicalDeltaLakeScanOperator scanOperator) {
             super.withOperator(scanOperator);
-
-            this.predicates = scanOperator.predicates.clone();
+            builder.predicates = scanOperator.predicates.clone();
             return this;
         }
     }

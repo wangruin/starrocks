@@ -15,10 +15,6 @@
 
 package com.starrocks.connector.hive.glue;
 
-import com.amazonaws.AmazonServiceException;
-import com.amazonaws.services.glue.AWSGlue;
-import com.amazonaws.services.glue.model.EntityNotFoundException;
-import com.amazonaws.services.glue.model.GetDatabaseRequest;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -129,8 +125,13 @@ import org.apache.hadoop.hive.metastore.api.WMTrigger;
 import org.apache.hadoop.hive.metastore.api.WMValidateResourcePlanResponse;
 import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
+import software.amazon.awssdk.services.glue.model.GetDatabaseRequest;
 
 import java.io.IOException;
 import java.net.URI;
@@ -153,10 +154,10 @@ import static org.apache.hadoop.hive.metastore.Warehouse.DEFAULT_DATABASE_NAME;
 
 public class AWSCatalogMetastoreClient implements IMetaStoreClient {
     // TODO "hook" into Hive logging (hive or hive.metastore)
-    private static final Logger LOGGER = Logger.getLogger(AWSCatalogMetastoreClient.class);
+    private static final Logger LOGGER = LogManager.getLogger(AWSCatalogMetastoreClient.class);
 
     private final HiveConf conf;
-    private final AWSGlue glueClient;
+    private final GlueClient glueClient;
     private final Warehouse wh;
     private final GlueMetastoreClientDelegate glueMetastoreClientDelegate;
     private final String catalogId;
@@ -191,16 +192,16 @@ public class AWSCatalogMetastoreClient implements IMetaStoreClient {
 
     private boolean doesDefaultDBExist() throws MetaException {
         try {
-            GetDatabaseRequest getDatabaseRequest =
-                    new GetDatabaseRequest().withName(DEFAULT_DATABASE_NAME).withCatalogId(
+            GetDatabaseRequest.Builder getDatabaseRequest =
+                    GetDatabaseRequest.builder().name(DEFAULT_DATABASE_NAME).catalogId(
                             catalogId);
-            glueClient.getDatabase(getDatabaseRequest);
+            glueClient.getDatabase(getDatabaseRequest.build());
         } catch (EntityNotFoundException e) {
             return false;
-        } catch (AmazonServiceException e) {
+        } catch (SdkException e) {
             String msg = "Unable to verify existence of default database: ";
             LOGGER.error(msg, e);
-            throw new MetaException(msg + e.getErrorMessage());
+            throw new MetaException(msg + e.getMessage());
         }
         return true;
     }

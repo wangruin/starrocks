@@ -16,6 +16,7 @@
 
 #include "exec/partition/chunks_partitioner.h"
 #include "storage/chunk_helper.h"
+#include "util/runtime_profile.h"
 
 namespace starrocks::pipeline {
 
@@ -29,7 +30,7 @@ class HashPartitionContext {
 public:
     HashPartitionContext(const std::vector<TExpr>& t_partition_exprs) : _t_partition_exprs(t_partition_exprs) {}
 
-    Status prepare(RuntimeState* state);
+    Status prepare(RuntimeState* state, RuntimeProfile* profile);
 
     // Add one chunk to partitioner
     Status push_one_chunk_to_partitioner(RuntimeState* state, const ChunkPtr& chunk);
@@ -46,6 +47,8 @@ public:
     // Return true if sink completed and all the data in the chunks_sorters has been pulled out
     bool is_finished();
 
+    int32_t num_partitions() const { return _chunks_partitioner->num_partitions(); }
+
 private:
     const std::vector<TExpr>& _t_partition_exprs;
     std::vector<ExprContext*> _partition_exprs;
@@ -56,6 +59,7 @@ private:
     bool _is_sink_complete = false;
 
     ChunksPartitionerPtr _chunks_partitioner;
+    std::unique_ptr<MemPool> _mem_pool;
 
     ChunkPipelineAccumulator _acc;
 };

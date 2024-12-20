@@ -14,11 +14,13 @@
 
 #pragma once
 
+#include <functional>
+
 #include "column/vectorized_fwd.h"
 #include "common/statusor.h"
 #include "exec/pipeline/runtime_filter_types.h"
+#include "exec/spill/operator_mem_resource_manager.h"
 #include "exprs/runtime_filter_bank.h"
-#include "gutil/casts.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/mem_tracker.h"
 #include "util/runtime_profile.h"
@@ -42,7 +44,8 @@ class Operator {
     friend class StreamPipelineDriver;
 
 public:
-    Operator(OperatorFactory* factory, int32_t id, std::string name, int32_t plan_node_id, int32_t driver_sequence);
+    Operator(OperatorFactory* factory, int32_t id, std::string name, int32_t plan_node_id, bool is_subordinate,
+             int32_t driver_sequence);
     virtual ~Operator() = default;
 
     // prepare is used to do the initialization work
@@ -90,6 +93,9 @@ public:
     // Whether we could pull chunk from this operator
     virtual bool has_output() const = 0;
 
+    // return true if operator should ignore eos chunk
+    virtual bool ignore_empty_eos() const { return true; }
+
     // Whether we could push chunk to this operator
     virtual bool need_input() const = 0;
 
@@ -130,6 +136,10 @@ public:
     // 3. operators decorated by MultilaneOperator except case 2: e.g. ProjectOperator, Chunk AccumulateOperator and etc.
     virtual Status reset_state(RuntimeState* state, const std::vector<ChunkPtr>& refill_chunks) { return Status::OK(); }
 
+    // Some operator's metrics are updated in the finishing stage, which is not suitable to the runtime profile mechanism.
+    // So we add this function for manual updation of metrics when reporting the runtime profile.
+    virtual void update_metrics(RuntimeState* state) {}
+
     virtual size_t output_amplification_factor() const { return 1; }
     enum class OutputAmplificationType { ADD, MAX };
     virtual OutputAmplificationType intra_pipeline_amplification_type() const { return OutputAmplificationType::MAX; }
@@ -146,14 +156,14 @@ public:
 
     std::string get_raw_name() const { return _name; }
 
-    const LocalRFWaitingSet& rf_waiting_set() const;
+    virtual const LocalRFWaitingSet& rf_waiting_set() const;
 
     RuntimeFilterHub* runtime_filter_hub();
 
     std::vector<ExprContext*>& runtime_in_filters();
 
-    RuntimeFilterProbeCollector* runtime_bloom_filters();
-    const RuntimeFilterProbeCollector* runtime_bloom_filters() const;
+    virtual RuntimeFilterProbeCollector* runtime_bloom_filters();
+    virtual const RuntimeFilterProbeCollector* runtime_bloom_filters() const;
 
     virtual int64_t global_rf_wait_timeout_ns() const;
 
@@ -162,6 +172,10 @@ public:
     // equal to ExecNode::eval_conjuncts(_conjunct_ctxs, chunk), is used to apply in-filters to Operators.
     Status eval_conjuncts_and_in_filters(const std::vector<ExprContext*>& conjuncts, Chunk* chunk,
                                          FilterPtr* filter = nullptr, bool apply_filter = true);
+    // evaluate no eq join runtime in filters
+    // The no-eq join runtime filter does not have a companion bloom filter.
+    // This function only executes these filters to avoid the overhead of executing an additional runtime in filter.
+    Status eval_no_eq_join_runtime_in_filters(Chunk* chunk);
 
     // Evaluate conjuncts without cache
     Status eval_conjuncts(const std::vector<ExprContext*>& conjuncts, Chunk* chunk, FilterPtr* filter = nullptr);
@@ -169,15 +183,8 @@ public:
     // equal to ExecNode::eval_join_runtime_filters, is used to apply bloom-filters to Operators.
     void eval_runtime_bloom_filters(Chunk* chunk);
 
-    // 1. (-∞, s_pseudo_plan_node_id_upper_bound] is for operator which is not in the query's plan
-    // for example, LocalExchangeSinkOperator, LocalExchangeSourceOperator
-    // 2. (s_pseudo_plan_node_id_upper_bound, -1] is for operator which is in the query's plan
-    // for example, ResultSink
-    static const int32_t s_pseudo_plan_node_id_for_memory_scratch_sink;
-    static const int32_t s_pseudo_plan_node_id_for_export_sink;
-    static const int32_t s_pseudo_plan_node_id_for_olap_table_sink;
-    static const int32_t s_pseudo_plan_node_id_for_result_sink;
-    static const int32_t s_pseudo_plan_node_id_upper_bound;
+    // Pseudo plan_node_id for final sink, such as result_sink, table_sink
+    static const int32_t s_pseudo_plan_node_id_for_final_sink;
 
     RuntimeProfile* runtime_profile() { return _runtime_profile.get(); }
     RuntimeProfile* common_metrics() { return _common_metrics.get(); }
@@ -221,12 +228,46 @@ public:
     // Called when the new Epoch starts at first to reset operator's internal state.
     virtual Status reset_epoch(RuntimeState* state) { return Status::OK(); }
 
-    // it means this operator need spill
-    virtual void mark_need_spill() { _marked_need_spill = true; }
-    bool need_mark_spill() { return _marked_need_spill; }
+    // Adjusts the execution mode of the operator (will only be called by the OperatorMemoryResourceManager component)
+    virtual void set_execute_mode(int performance_level) {}
+    // @TODO(silverbullet233): for an operator, the way to reclaim memory is either spill
+    // or push the buffer data to the downstream operator.
+    // Maybe we don’t need to have the concepts of spillable and releasable, and we can use reclaimable instead.
+    // Later, we need to refactor here.
+    virtual bool spillable() const { return false; }
+    // Operator can free memory/buffer early
+    virtual bool releaseable() const { return false; }
+    virtual void enter_release_memory_mode() {}
+    spill::OperatorMemoryResourceManager& mem_resource_manager() { return _mem_resource_manager; }
+
     // the memory that can be freed by the current operator
     size_t revocable_mem_bytes() { return _revocable_mem_bytes; }
-    void set_revocable_mem_bytes(size_t bytes) { _revocable_mem_bytes = bytes; }
+    void set_revocable_mem_bytes(size_t bytes) {
+        _revocable_mem_bytes = bytes;
+        if (_peak_revocable_mem_bytes) {
+            COUNTER_SET(_peak_revocable_mem_bytes, _revocable_mem_bytes);
+        }
+    }
+    int32_t get_driver_sequence() const { return _driver_sequence; }
+    OperatorFactory* get_factory() const { return _factory; }
+
+    // memory to be reserved before executing push_chunk
+    virtual size_t estimated_memory_reserved(const ChunkPtr& chunk) {
+        if (chunk && !chunk->is_empty()) {
+            return chunk->memory_usage();
+        }
+        return 0;
+    }
+
+    // memory to be reserved before executing set_finishing
+    virtual size_t estimated_memory_reserved() { return 0; }
+
+    // if return true it means the operator has child operators
+    virtual bool is_combinatorial_operator() const { return false; }
+    // apply operation for each child operator
+    virtual void for_each_child_operator(const std::function<void(Operator*)>& apply) {}
+
+    virtual void update_exec_stats(RuntimeState* state);
 
 protected:
     OperatorFactory* _factory;
@@ -234,6 +275,7 @@ protected:
     const std::string _name;
     // Which plan node this operator belongs to
     const int32_t _plan_node_id;
+    const bool _is_subordinate;
     const int32_t _driver_sequence;
     // _common_metrics and _unique_metrics are the only children of _runtime_profile
     // _common_metrics contains the common metrics of Operator, including counters and sub profiles,
@@ -249,8 +291,8 @@ protected:
 
     RuntimeBloomFilterEvalContext _bloom_filter_eval_context;
 
-    // if _need_spill is true. reserved data in this operator need spill
-    bool _marked_need_spill = false;
+    spill::OperatorMemoryResourceManager _mem_resource_manager;
+
     // the memory that can be released by this operator
     size_t _revocable_mem_bytes = 0;
 
@@ -273,6 +315,10 @@ protected:
     RuntimeProfile::Counter* _conjuncts_input_counter = nullptr;
     RuntimeProfile::Counter* _conjuncts_output_counter = nullptr;
 
+    // only used in spillable operator to record peak revocable memory bytes,
+    // each operator should initialize it before use
+    RuntimeProfile::HighWaterMarkCounter* _peak_revocable_mem_bytes = nullptr;
+
     // Some extra cpu cost of this operator that not accounted by pipeline driver,
     // such as OlapScanOperator( use separated IO thread to execute the IO task)
     std::atomic_int64_t _last_growth_cpu_time_ns = 0;
@@ -281,9 +327,8 @@ private:
     void _init_rf_counters(bool init_bloom);
     void _init_conjuct_counters();
 
-    // All the memory usage will be automatically added to this MemTracker by memory allocate hook
-    // Do not use this MemTracker manually
-    std::shared_ptr<MemTracker> _mem_tracker = nullptr;
+    std::shared_ptr<MemTracker> _mem_tracker;
+    std::vector<ExprContext*> _runtime_in_filters;
 };
 
 class OperatorFactory {
@@ -298,7 +343,7 @@ public:
     int32_t plan_node_id() const { return _plan_node_id; }
     virtual Status prepare(RuntimeState* state);
     virtual void close(RuntimeState* state);
-    std::string get_name() const { return _name + "_" + std::to_string(_plan_node_id); }
+    std::string get_name() const { return _name + "_(" + std::to_string(_plan_node_id) + ")"; }
     std::string get_raw_name() const { return _name; }
     // Local rf that take effects on this operator, and operator must delay to schedule to execution on core
     // util the corresponding local rf generated.
@@ -330,6 +375,8 @@ public:
     RuntimeFilterHub* runtime_filter_hub() { return _runtime_filter_hub; }
 
     std::vector<ExprContext*>& get_runtime_in_filters() { return _runtime_in_filters; }
+    // acquire local colocate runtime filter
+    std::vector<ExprContext*> get_colocate_runtime_in_filters(size_t driver_sequence);
     RuntimeFilterProbeCollector* get_runtime_bloom_filters() {
         if (_runtime_filter_collector == nullptr) {
             return nullptr;
@@ -358,8 +405,13 @@ public:
     // Whether it has any runtime filter built by TopN node.
     bool has_topn_filter() const;
 
+    // try to get runtime filter from cache
+    void acquire_runtime_filter(RuntimeState* state);
+
 protected:
     void _prepare_runtime_in_filters(RuntimeState* state);
+    void _prepare_runtime_holders(const std::vector<RuntimeFilterHolder*>& holders,
+                                  std::vector<ExprContext*>* runtime_in_filters);
 
     const int32_t _id;
     const std::string _name;

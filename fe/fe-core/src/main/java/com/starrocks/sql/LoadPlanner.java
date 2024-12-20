@@ -14,6 +14,8 @@
 
 package com.starrocks.sql;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.Analyzer;
@@ -36,11 +38,12 @@ import com.starrocks.common.DdlException;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.Pair;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.load.BrokerFileGroup;
 import com.starrocks.load.EtlJobType;
 import com.starrocks.load.Load;
+import com.starrocks.load.loadv2.LoadJob;
 import com.starrocks.load.streamload.StreamLoadInfo;
 import com.starrocks.planner.DataPartition;
 import com.starrocks.planner.DataSink;
@@ -54,12 +57,15 @@ import com.starrocks.planner.ScanNode;
 import com.starrocks.planner.StreamLoadScanNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.ImportColumnDesc;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
+import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.thrift.TBrokerFileStatus;
+import com.starrocks.thrift.TPartialUpdateMode;
 import com.starrocks.thrift.TPartitionType;
 import com.starrocks.thrift.TResultSinkType;
 import com.starrocks.thrift.TRoutineLoadTask;
@@ -69,6 +75,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -127,8 +134,21 @@ public class LoadPlanner {
     private String label;
     // Routine load related structs
     TRoutineLoadTask routineLoadTask;
+    private TPartialUpdateMode partialUpdateMode = TPartialUpdateMode.ROW_MODE;
+
+    private long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
+
+    private LoadJob.JSONOptions jsonOptions = new LoadJob.JSONOptions();
 
     private Boolean missAutoIncrementColumn = Boolean.FALSE;
+
+    private String mergeConditionStr;
+
+    // Only valid for stream load
+    private boolean enableBatchWrite = false;
+    private int batchWriteIntervalMs;
+    private ImmutableMap<String, String> batchWriteParameters;
+    private Set<Long> batchWriteBackendIds;
 
     public LoadPlanner(long loadJobId, TUniqueId loadId, long txnId, long dbId, OlapTable destTable,
                        boolean strictMode, String timezone, long timeoutS,
@@ -216,17 +236,46 @@ public class LoadPlanner {
         this.label = label;
         this.timeoutS = timeoutS;
         this.etlJobType = EtlJobType.STREAM_LOAD;
-        this.context.getSessionVariable().setEnableResourceGroup(false);
-        if (Config.enable_pipeline_load) {
-            this.context.getSessionVariable().setEnablePipelineEngine(true);
-        }
+        this.context.getSessionVariable().setEnablePipelineEngine(true);
     }
 
-    public void plan() throws UserException {
+    public void setWarehouseId(long warehouseId) {
+        this.warehouseId = warehouseId;
+    }
+
+    public long getWarehouseId() {
+        return warehouseId;
+    }
+
+    public void setBatchWrite(
+            int batchWriteIntervalMs, ImmutableMap<String, String> loadParameters, Set<Long> batchWriteBackendIds) {
+        this.enableBatchWrite = true;
+        this.batchWriteIntervalMs = batchWriteIntervalMs;
+        this.batchWriteParameters = loadParameters;
+        this.batchWriteBackendIds = new HashSet<>(batchWriteBackendIds);
+    }
+
+    public void setPartialUpdateMode(TPartialUpdateMode mode) {
+        this.partialUpdateMode = mode;
+    }
+
+    public void setMergeConditionStr(String mergeConditionStr) {
+        this.mergeConditionStr = mergeConditionStr;
+    }
+
+    public void setJsonOptions(LoadJob.JSONOptions options) {
+        this.jsonOptions = options;
+    }
+
+    public void plan() throws StarRocksException {
         // 1. Generate tuple descriptor
         OlapTable olapDestTable = (OlapTable) destTable;
         List<Column> destColumns = Lists.newArrayList();
         if (isPrimaryKey && partialUpdate) {
+            if (((OlapTable) destTable).hasRowStorageType() && partialUpdate &&
+                    partialUpdateMode != TPartialUpdateMode.ROW_MODE) {
+                throw new DdlException("column with row table only support row mode partial update");
+            }
             if (this.etlJobType == EtlJobType.BROKER) {
                 if (fileGroups.size() != 1) {
                     throw new DdlException("partial update only support single filegroup.");
@@ -247,7 +296,7 @@ public class LoadPlanner {
         if (partialUpdate) {
             if (this.etlJobType == EtlJobType.BROKER) {
                 destColumns = Load.getPartialUpateColumns(destTable, fileGroups.get(0).getColumnExprList(),
-                    isMissAutoIncrementColumn);
+                        isMissAutoIncrementColumn);
             } else {
                 destColumns = Load.getPartialUpateColumns(destTable, columnDescs, isMissAutoIncrementColumn);
             }
@@ -267,32 +316,36 @@ public class LoadPlanner {
         // 3. Exchange node for primary table
         PlanFragment sinkFragment = null;
         boolean needShufflePlan = false;
+        boolean forceReplicatedStorage = false;
         if (Config.enable_shuffle_load && needShufflePlan()) {
+            if (!Config.eliminate_shuffle_load_by_replicated_storage) {
+                // scan fragment
+                PlanFragment scanFragment = new PlanFragment(new PlanFragmentId(0), scanNode, DataPartition.RANDOM);
+                scanFragment.setParallelExecNum(parallelInstanceNum);
 
-            // scan fragment
-            PlanFragment scanFragment = new PlanFragment(new PlanFragmentId(0), scanNode, DataPartition.RANDOM);
-            scanFragment.setParallelExecNum(parallelInstanceNum);
+                fragments.add(scanFragment);
 
-            fragments.add(scanFragment);
+                // Exchange node
+                List<Column> keyColumns = olapDestTable.getKeyColumnsByIndexId(olapDestTable.getBaseIndexId());
+                List<Expr> partitionExprs = Lists.newArrayList();
+                keyColumns.forEach(column -> {
+                    partitionExprs.add(new SlotRef(tupleDesc.getColumnSlot(column.getName())));
+                });
 
-            // Exchange node
-            List<Column> keyColumns = olapDestTable.getKeyColumnsByIndexId(olapDestTable.getBaseIndexId());
-            List<Expr> partitionExprs = Lists.newArrayList();
-            keyColumns.forEach(column -> {
-                partitionExprs.add(new SlotRef(tupleDesc.getColumnSlot(column.getName())));
-            });
+                DataPartition dataPartition = new DataPartition(TPartitionType.HASH_PARTITIONED, partitionExprs);
+                ExchangeNode exchangeNode = new ExchangeNode(new PlanNodeId(planNodeGenerator.getNextId().asInt()),
+                        scanFragment.getPlanRoot(), dataPartition);
 
-            DataPartition dataPartition = new DataPartition(TPartitionType.HASH_PARTITIONED, partitionExprs);
-            ExchangeNode exchangeNode = new ExchangeNode(new PlanNodeId(planNodeGenerator.getNextId().asInt()),
-                    scanFragment.getPlanRoot(), dataPartition);
+                // add exchange node to scan fragment and sink fragment
+                sinkFragment = new PlanFragment(new PlanFragmentId(1), exchangeNode, dataPartition);
+                exchangeNode.setFragment(sinkFragment);
+                scanFragment.setDestination(exchangeNode);
+                scanFragment.setOutputPartition(dataPartition);
 
-            // add exchange node to scan fragment and sink fragment
-            sinkFragment = new PlanFragment(new PlanFragmentId(1), exchangeNode, dataPartition);
-            exchangeNode.setFragment(sinkFragment);
-            scanFragment.setDestination(exchangeNode);
-            scanFragment.setOutputPartition(dataPartition);
-
-            needShufflePlan = true;
+                needShufflePlan = true;
+            } else {
+                forceReplicatedStorage = true;
+            }
         }
 
         // 4. Prepare sink fragment
@@ -300,26 +353,29 @@ public class LoadPlanner {
         if (!needShufflePlan) {
             sinkFragment = new PlanFragment(new PlanFragmentId(0), scanNode, DataPartition.RANDOM);
         }
-        prepareSinkFragment(sinkFragment, partitionIds, true, true);
+        prepareSinkFragment(sinkFragment, partitionIds, true, forceReplicatedStorage);
         if (this.context != null) {
-            if (this.context.getSessionVariable().isEnablePipelineEngine() && Config.enable_pipeline_load) {
-                if (needShufflePlan) {
-                    sinkFragment.setPipelineDop(1);
-                    sinkFragment.setParallelExecNum(parallelInstanceNum);
-                    sinkFragment.setForceSetTableSinkDop();
-                } else {
-                    sinkFragment.setPipelineDop(parallelInstanceNum);
-                    sinkFragment.setParallelExecNum(1);
-                }
-                sinkFragment.setHasOlapTableSink();
-                sinkFragment.setForceAssignScanRangesPerDriverSeq();
-            } else {
+            if (needShufflePlan) {
                 sinkFragment.setPipelineDop(1);
                 sinkFragment.setParallelExecNum(parallelInstanceNum);
+                sinkFragment.setForceSetTableSinkDop();
+            } else {
+                sinkFragment.setPipelineDop(parallelInstanceNum);
+                sinkFragment.setParallelExecNum(1);
             }
+            sinkFragment.setHasOlapTableSink();
+            sinkFragment.setForceAssignScanRangesPerDriverSeq();
         } else {
             sinkFragment.setPipelineDop(1);
             sinkFragment.setParallelExecNum(parallelInstanceNum);
+        }
+        // load from local file does not require too much concurrency to maximize disk performance.
+        // Too much concurrency can easily lead to performance degradation and long tail.
+        if (fileGroups != null && !fileGroups.isEmpty()
+                && fileGroups.get(0).getFilePaths() != null
+                && fileGroups.get(0).getFilePaths().get(0).toLowerCase().startsWith("file:")) {
+            sinkFragment.setPipelineDop(1);
+            sinkFragment.setParallelExecNum(1);
         }
         fragments.add(sinkFragment);
 
@@ -330,7 +386,7 @@ public class LoadPlanner {
         Collections.reverse(fragments);
     }
 
-    private void generateTupleDescriptor(List<Column> destColumns, boolean isPrimaryKey) throws UserException {
+    private void generateTupleDescriptor(List<Column> destColumns, boolean isPrimaryKey) throws StarRocksException {
         this.tupleDesc = descTable.createTupleDescriptor("DestTableTupleDescriptor");
         // Add column slotDesc for dest table
         for (Column col : destColumns) {
@@ -345,8 +401,8 @@ public class LoadPlanner {
 
             if (col.getType().isVarchar() && enableDictOptimize
                     && IDictManager.getInstance().hasGlobalDict(destTable.getId(),
-                    col.getName())) {
-                Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(destTable.getId(), col.getName());
+                    col.getColumnId())) {
+                Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(destTable.getId(), col.getColumnId());
                 dict.ifPresent(columnDict -> globalDicts.add(new Pair<>(slotDesc.getId().asInt(), columnDict)));
             }
         }
@@ -360,22 +416,26 @@ public class LoadPlanner {
         descTable.computeMemLayout();
     }
 
-    private ScanNode prepareScanNodes() throws UserException {
+    private ScanNode prepareScanNodes() throws StarRocksException {
         ScanNode scanNode = null;
         if (this.etlJobType == EtlJobType.BROKER) {
             FileScanNode fileScanNode = new FileScanNode(new PlanNodeId(planNodeGenerator.getNextId().asInt()),
                     tupleDesc,
-                    "FileScanNode", fileStatusesList, filesAdded);
+                    "FileScanNode", fileStatusesList, filesAdded, warehouseId);
             fileScanNode.setLoadInfo(loadJobId, txnId, destTable, brokerDesc, fileGroups, strictMode,
                     parallelInstanceNum);
             fileScanNode.setUseVectorizedLoad(true);
+            fileScanNode.setJSONOptions(jsonOptions);
             fileScanNode.init(analyzer);
             fileScanNode.finalizeStats(analyzer);
             scanNode = fileScanNode;
         } else if (this.etlJobType == EtlJobType.STREAM_LOAD || this.etlJobType == EtlJobType.ROUTINE_LOAD) {
             StreamLoadScanNode streamScanNode = new StreamLoadScanNode(loadId, new PlanNodeId(0), tupleDesc,
-                    destTable, streamLoadInfo, dbName, label, parallelInstanceNum, txnId);
+                    destTable, streamLoadInfo, dbName, label, parallelInstanceNum, txnId, warehouseId);
             streamScanNode.setNeedAssignBE(true);
+            if (enableBatchWrite) {
+                streamScanNode.setBatchWrite(batchWriteIntervalMs, batchWriteParameters, batchWriteBackendIds);
+            }
             streamScanNode.setUseVectorizedLoad(true);
             streamScanNode.init(analyzer);
             streamScanNode.finalizeStats(analyzer);
@@ -406,20 +466,33 @@ public class LoadPlanner {
         return nullExprInAutoIncrement;
     }
 
-    private void prepareSinkFragment(PlanFragment sinkFragment, List<Long> partitionIds, boolean canUsePipeLine,
-                                     boolean completeTabletSink) throws UserException {
+    private void prepareSinkFragment(PlanFragment sinkFragment, List<Long> partitionIds,
+                                     boolean completeTabletSink, boolean forceReplicatedStorage) throws
+            StarRocksException {
         DataSink dataSink = null;
         if (destTable instanceof OlapTable) {
             // 4. Olap table sink
-            dataSink = new OlapTableSink((OlapTable) destTable, tupleDesc, partitionIds, canUsePipeLine,
-                    ((OlapTable) destTable).writeQuorum(), ((OlapTable) destTable).enableReplicatedStorage(),
-                    checkNullExprInAutoIncrement());
+            OlapTable olapTable = (OlapTable) destTable;
+            boolean enableAutomaticPartition;
+            if (fileGroups != null && fileGroups.stream().anyMatch(BrokerFileGroup::isSpecifyPartition)) {
+                enableAutomaticPartition = false;
+            } else {
+                enableAutomaticPartition = olapTable.supportedAutomaticPartition();
+            }
+            Preconditions.checkState(!CollectionUtils.isEmpty(partitionIds));
+            dataSink = new OlapTableSink(olapTable, tupleDesc, partitionIds,
+                    olapTable.writeQuorum(), forceReplicatedStorage ? true : ((OlapTable) destTable).enableReplicatedStorage(),
+                    checkNullExprInAutoIncrement(), enableAutomaticPartition, warehouseId);
             if (this.missAutoIncrementColumn == Boolean.TRUE) {
                 ((OlapTableSink) dataSink).setMissAutoIncrementColumn();
             }
+            if (olapTable.getAutomaticBucketSize() > 0) {
+                ((OlapTableSink) dataSink).setAutomaticBucketSize(olapTable.getAutomaticBucketSize());
+            }
             if (completeTabletSink) {
                 ((OlapTableSink) dataSink).init(loadId, txnId, dbId, timeoutS);
-                ((OlapTableSink) dataSink).complete();
+                ((OlapTableSink) dataSink).setPartialUpdateMode(partialUpdateMode);
+                ((OlapTableSink) dataSink).complete(mergeConditionStr);
             }
             // if sink is OlapTableSink Assigned to Be execute this sql [cn execute OlapTableSink will crash]
             context.getSessionVariable().setPreferComputeNode(false);
@@ -434,11 +507,12 @@ public class LoadPlanner {
         sinkFragment.setLoadGlobalDicts(globalDicts);
     }
 
-    public void completeTableSink(long txnId) throws AnalysisException, UserException {
+    public void completeTableSink(long txnId) throws AnalysisException, StarRocksException {
         if (destTable instanceof OlapTable) {
             OlapTableSink dataSink = (OlapTableSink) fragments.get(0).getSink();
             dataSink.init(loadId, txnId, dbId, timeoutS);
-            dataSink.complete();
+            dataSink.setPartialUpdateMode(partialUpdateMode);
+            dataSink.complete(mergeConditionStr);
         }
         this.txnId = txnId;
     }
@@ -558,6 +632,10 @@ public class LoadPlanner {
 
     public List<PlanFragment> getFragments() {
         return fragments;
+    }
+
+    public ExecPlan getExecPlan() {
+        return new ExecPlan(context, fragments);
     }
 
     public List<ScanNode> getScanNodes() {

@@ -34,12 +34,12 @@
 
 package com.starrocks.http.rest;
 
+import com.starrocks.authorization.AccessDeniedException;
 import com.starrocks.common.DdlException;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.UserIdentity;
@@ -63,13 +63,9 @@ public class MetaReplayerCheckAction extends RestBaseAction {
     }
 
     @Override
-    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException {
+    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException, AccessDeniedException {
         UserIdentity currentUser = ConnectContext.get().getCurrentUserIdentity();
-        if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-            checkUserOwnsAdminRole(currentUser);
-        } else {
-            checkGlobalAuth(currentUser, PrivPredicate.ADMIN);
-        }
+        checkUserOwnsAdminRole(currentUser);
 
         Map<String, String> resultMap = GlobalStateMgr.getCurrentState().getMetaReplayState().getInfo();
 

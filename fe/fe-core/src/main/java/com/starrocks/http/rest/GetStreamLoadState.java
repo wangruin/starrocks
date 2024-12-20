@@ -76,14 +76,14 @@ public class GetStreamLoadState extends RestBaseAction {
         // FIXME(cmy)
         // checkReadPriv(authInfo.fullUserName, fullDbName);
 
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
         if (db == null) {
             throw new DdlException("unknown database, database=" + dbName);
         }
 
-        String state = GlobalStateMgr.getCurrentGlobalTransactionMgr().getLabelState(db.getId(), label).toString();
+        String status = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getLabelStatus(db.getId(), label).toString();
 
-        sendResult(request, response, new Result(state));
+        sendResult(request, response, new Result(status));
     }
 
     private static class Result extends RestBaseResult {

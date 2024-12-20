@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.statistics;
 
 import com.github.benmanes.caffeine.cache.AsyncCacheLoader;
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
 import com.starrocks.common.Status;
+import com.starrocks.memory.MemoryTrackable;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.base.ColumnIdentifier;
@@ -34,7 +36,9 @@ import org.apache.logging.log4j.Logger;
 import org.checkerframework.checker.nullness.qual.NonNull;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -43,7 +47,7 @@ import java.util.concurrent.Executor;
 
 import static com.starrocks.statistic.StatisticExecutor.queryDictSync;
 
-public class CacheDictManager implements IDictManager {
+public class CacheDictManager implements IDictManager, MemoryTrackable {
     private static final Logger LOG = LogManager.getLogger(CacheDictManager.class);
     private static final Set<ColumnIdentifier> NO_DICT_STRING_COLUMNS = Sets.newConcurrentHashSet();
     private static final Set<Long> FORBIDDEN_DICT_TABLE_IDS = Sets.newConcurrentHashSet();
@@ -69,7 +73,7 @@ public class CacheDictManager implements IDictManager {
                     return CompletableFuture.supplyAsync(() -> {
                         try {
                             long tableId = columnIdentifier.getTableId();
-                            String columnName = columnIdentifier.getColumnName();
+                            ColumnId columnName = columnIdentifier.getColumnName();
                             Pair<List<TStatisticData>, Status> result = queryDictSync(columnIdentifier.getDbId(),
                                     tableId, columnName);
                             if (result.second.isGlobalDictError()) {
@@ -105,7 +109,7 @@ public class CacheDictManager implements IDictManager {
             .maximumSize(Config.statistic_dict_columns)
             .buildAsync(dictLoader);
 
-    private Optional<ColumnDict> deserializeColumnDict(long tableId, String columnName, TStatisticData statisticData) {
+    private Optional<ColumnDict> deserializeColumnDict(long tableId, ColumnId columnName, TStatisticData statisticData) {
         if (statisticData.dict == null) {
             throw new RuntimeException("Collect dict error in BE");
         }
@@ -142,11 +146,13 @@ public class CacheDictManager implements IDictManager {
         for (int i = 0; i < dictSize; ++i) {
             dicts.put(tGlobalDict.strings.get(i), tGlobalDict.ids.get(i));
         }
+        LOG.info("collected dictionary table:{} column:{}, version:{} size:{}",
+                tableId, columnName, statisticData.meta_version, dictSize);
         return Optional.of(new ColumnDict(dicts.build(), statisticData.meta_version));
     }
 
     @Override
-    public boolean hasGlobalDict(long tableId, String columnName, long versionTime) {
+    public boolean hasGlobalDict(long tableId, ColumnId columnName, long versionTime) {
         ColumnIdentifier columnIdentifier = new ColumnIdentifier(tableId, columnName);
         if (NO_DICT_STRING_COLUMNS.contains(columnIdentifier)) {
             LOG.debug("{}-{} isn't low cardinality string column", tableId, columnName);
@@ -160,8 +166,8 @@ public class CacheDictManager implements IDictManager {
 
         Set<Long> dbIds = ConnectContext.get().getCurrentSqlDbIds();
         for (Long id : dbIds) {
-            Database db = GlobalStateMgr.getCurrentState().getDb(id);
-            if (db != null && db.getTable(tableId) != null) {
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(id);
+            if (db != null && GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId) != null) {
                 columnIdentifier.setDbId(db.getId());
                 break;
             }
@@ -196,7 +202,7 @@ public class CacheDictManager implements IDictManager {
     }
 
     @Override
-    public boolean hasGlobalDict(long tableId, String columnName) {
+    public boolean hasGlobalDict(long tableId, ColumnId columnName) {
         ColumnIdentifier columnIdentifier = new ColumnIdentifier(tableId, columnName);
         if (NO_DICT_STRING_COLUMNS.contains(columnIdentifier)) {
             LOG.debug("{} isn't low cardinality string column", columnName);
@@ -212,15 +218,25 @@ public class CacheDictManager implements IDictManager {
     }
 
     @Override
-    public void removeGlobalDict(long tableId, String columnName) {
-        LOG.debug("remove dict for column {}", columnName);
+    public void removeGlobalDict(long tableId, ColumnId columnName) {
         ColumnIdentifier columnIdentifier = new ColumnIdentifier(tableId, columnName);
+
+        // skip dictionary operator in checkpoint thread
+        if (GlobalStateMgr.isCheckpointThread()) {
+            return;
+        }
+
+        if (!dictStatistics.asMap().containsKey(columnIdentifier)) {
+            return;
+        }
+
+        LOG.info("remove dict for table:{} column:{}", tableId, columnName);
         dictStatistics.synchronous().invalidate(columnIdentifier);
     }
 
     @Override
     public void disableGlobalDict(long tableId) {
-        LOG.debug("remove dict for table {}", tableId);
+        LOG.debug("disable dict optimize for table {}", tableId);
         FORBIDDEN_DICT_TABLE_IDS.add(tableId);
     }
 
@@ -230,21 +246,34 @@ public class CacheDictManager implements IDictManager {
     }
 
     @Override
-    public void updateGlobalDict(long tableId, String columnName, long versionTime) {
+    public void updateGlobalDict(long tableId, ColumnId columnName, long collectVersion, long versionTime) {
+        // skip dictionary operator in checkpoint thread
+        if (GlobalStateMgr.isCheckpointThread()) {
+            return;
+        }
+
         ColumnIdentifier columnIdentifier = new ColumnIdentifier(tableId, columnName);
         if (!dictStatistics.asMap().containsKey(columnIdentifier)) {
             return;
         }
 
-        CompletableFuture<Optional<ColumnDict>> columnFuture = dictStatistics.get(columnIdentifier);
-        if (columnFuture.isDone()) {
+        CompletableFuture<Optional<ColumnDict>> future = dictStatistics.getIfPresent(columnIdentifier);
+
+        if (future != null && future.isDone()) {
             try {
-                Optional<ColumnDict> columnOptional = columnFuture.get();
+                Optional<ColumnDict> columnOptional = future.get();
                 if (columnOptional.isPresent()) {
                     ColumnDict columnDict = columnOptional.get();
-                    ColumnDict newColumnDict = new ColumnDict(columnDict.getDict(), versionTime);
-                    dictStatistics.put(columnIdentifier, CompletableFuture.completedFuture(Optional.of(newColumnDict)));
-                    LOG.debug("update dict for column {}, version {}", columnName, versionTime);
+                    long lastVersion = columnDict.getVersionTime();
+                    long dictCollectVersion = columnDict.getCollectedVersionTime();
+                    if (collectVersion != dictCollectVersion) {
+                        LOG.info("remove dict by unmatched version {}:{}", collectVersion, dictCollectVersion);
+                        removeGlobalDict(tableId, columnName);
+                        return;
+                    }
+                    columnDict.updateVersionTime(versionTime);
+                    LOG.info("update dict for table {} column {} from version {} to {}", tableId, columnName,
+                            lastVersion, versionTime);
                 }
             } catch (Exception e) {
                 LOG.warn(String.format("update dict cache for %d: %s failed", tableId, columnName), e);
@@ -253,7 +282,7 @@ public class CacheDictManager implements IDictManager {
     }
 
     @Override
-    public Optional<ColumnDict> getGlobalDict(long tableId, String columnName) {
+    public Optional<ColumnDict> getGlobalDict(long tableId, ColumnId columnName) {
         ColumnIdentifier columnIdentifier = new ColumnIdentifier(tableId, columnName);
         CompletableFuture<Optional<ColumnDict>> columnFuture = dictStatistics.get(columnIdentifier);
         if (columnFuture.isDone()) {
@@ -264,5 +293,40 @@ public class CacheDictManager implements IDictManager {
             }
         }
         return Optional.empty();
+    }
+
+    @Override
+    public Map<String, Long> estimateCount() {
+        return ImmutableMap.of("ColumnDict", (long) dictStatistics.asMap().size());
+    }
+
+    @Override
+    public List<Pair<List<Object>, Long>> getSamples() {
+        List<Object> samples = new ArrayList<>();
+        dictStatistics.asMap().values().stream().findAny().ifPresent(future -> {
+            if (future.isDone()) {
+                try {
+                    future.get().ifPresent(samples::add);
+                } catch (Exception e) {
+                    LOG.warn("get samples failed", e);
+                }
+            }
+        });
+
+        return Lists.newArrayList(Pair.create(samples, (long) dictStatistics.asMap().size()));
+    }
+
+    private List<ColumnDict> getSamplesForMemoryTracker() {
+        List<ColumnDict> result = new ArrayList<>();
+        dictStatistics.asMap().values().stream().findAny().ifPresent(future -> {
+            if (future.isDone()) {
+                try {
+                    future.get().ifPresent(result::add);
+                } catch (Exception e) {
+                    LOG.warn("get samples failed", e);
+                }
+            }
+        });
+        return result;
     }
 }

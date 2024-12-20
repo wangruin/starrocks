@@ -62,9 +62,11 @@ std::string print_plan_node_type(const TPlanNodeType::type& type) {
 
 std::string get_build_version(bool compact) {
     std::stringstream ss;
-    ss << STARROCKS_VERSION << " " << STARROCKS_BUILD_TYPE << " (build " << STARROCKS_COMMIT_HASH << ")";
+    ss << STARROCKS_VERSION << "-" << STARROCKS_COMMIT_HASH << std::endl << "BuildType: " << STARROCKS_BUILD_TYPE;
     if (!compact) {
         ss << std::endl
+           << "Build distributor id: " << STARROCKS_BUILD_DISTRO_ID << std::endl
+           << "Build arch: " << STARROCKS_BUILD_ARCH << std::endl
            << "Built on " << STARROCKS_BUILD_TIME << " by " << STARROCKS_BUILD_USER << "@" << STARROCKS_BUILD_HOST;
     }
 

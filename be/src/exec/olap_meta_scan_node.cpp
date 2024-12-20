@@ -28,6 +28,8 @@ OlapMetaScanNode::OlapMetaScanNode(ObjectPool* pool, const TPlanNode& tnode, con
 }
 
 Status OlapMetaScanNode::open(RuntimeState* state) {
+    SCOPED_TIMER(_runtime_profile->total_time_counter());
+
     if (!_is_init) {
         return Status::InternalError("Open before Init.");
     }
@@ -54,6 +56,8 @@ Status OlapMetaScanNode::open(RuntimeState* state) {
 }
 
 Status OlapMetaScanNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
+    SCOPED_TIMER(_runtime_profile->total_time_counter());
+
     DCHECK(state != nullptr && chunk != nullptr && eos != nullptr);
     RETURN_IF_CANCELLED(state);
 
@@ -73,14 +77,15 @@ Status OlapMetaScanNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eo
 
 std::vector<std::shared_ptr<pipeline::OperatorFactory>> OlapMetaScanNode::decompose_to_pipeline(
         pipeline::PipelineBuilderContext* context) {
+    auto exec_group = context->find_exec_group_by_plan_node_id(_id);
+    context->set_current_execution_group(exec_group);
     auto* morsel_queue_factory = context->morsel_queue_factory_of_source_operator(id());
     size_t dop = morsel_queue_factory->size();
     bool shared_morsel_queue = morsel_queue_factory->is_shared();
 
     size_t buffer_capacity = pipeline::ScanOperator::max_buffer_capacity() * dop;
-    int64_t mem_limit = runtime_state()->query_mem_tracker_ptr()->limit() * config::scan_use_query_mem_ratio;
     pipeline::ChunkBufferLimiterPtr buffer_limiter = std::make_unique<pipeline::DynamicChunkBufferLimiter>(
-            buffer_capacity, buffer_capacity, mem_limit, runtime_state()->chunk_size());
+            buffer_capacity, buffer_capacity, _mem_limit, runtime_state()->chunk_size());
 
     auto scan_ctx_factory = std::make_shared<pipeline::MetaScanContextFactory>(this, dop, shared_morsel_queue,
                                                                                std::move(buffer_limiter));

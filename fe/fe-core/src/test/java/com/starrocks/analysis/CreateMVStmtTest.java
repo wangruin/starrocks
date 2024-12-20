@@ -104,8 +104,7 @@ public class CreateMVStmtTest {
                         "DISTRIBUTED BY HASH(`c_1_3`, `c_1_2`, `c_1_0`) BUCKETS 10 \n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");");
     }
 
@@ -387,6 +386,23 @@ public class CreateMVStmtTest {
             } catch (Exception ex) {
                 Assert.assertTrue(ex.getMessage()
                         .contains("Any single column should be before agg column"));
+            }
+        }
+    }
+
+    @Test
+    public void testCreateMVWithAggFunctionAndOtherExprs() {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        List<String> invalidSqls = Lists.newArrayList();
+        invalidSqls.add("create materialized view mv_01 as select c_1_2, cast(sum(c_1_4) as string) from t1 group by " +
+                "c_1_2");
+        for (String sql : invalidSqls) {
+            try {
+                UtFrameUtils.parseStmtWithNewParser(sql, ctx);
+                fail("wrong sql, should fail");
+            } catch (Exception ex) {
+                Assert.assertTrue(ex.getMessage()
+                        .contains("Aggregate function with function expr is not supported yet"));
             }
         }
     }

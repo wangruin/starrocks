@@ -16,6 +16,7 @@
 
 #include "exec/pipeline/operator.h"
 #include "exec/pipeline/set/except_context.h"
+#include "util/race_detect.h"
 
 namespace starrocks::pipeline {
 
@@ -39,7 +40,7 @@ class ExceptBuildSinkOperator final : public Operator {
 public:
     ExceptBuildSinkOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence,
                             std::shared_ptr<ExceptContext> except_ctx, const std::vector<ExprContext*>& dst_exprs)
-            : Operator(factory, id, "except_build_sink", plan_node_id, driver_sequence),
+            : Operator(factory, id, "except_build_sink", plan_node_id, false, driver_sequence),
               _except_ctx(std::move(except_ctx)),
               _buffer_state(std::make_unique<ExceptBufferState>()),
               _dst_exprs(dst_exprs) {
@@ -53,6 +54,7 @@ public:
     bool is_finished() const override { return _is_finished || _except_ctx->is_finished(); }
 
     Status set_finishing(RuntimeState* state) override {
+        ONCE_DETECT(_set_finishing_once);
         _is_finished = true;
         _except_ctx->finish_build_ht();
         return Status::OK();
@@ -72,6 +74,7 @@ private:
     const std::vector<ExprContext*>& _dst_exprs;
 
     bool _is_finished = false;
+    DECLARE_ONCE_DETECTOR(_set_finishing_once);
 };
 
 class ExceptBuildSinkOperatorFactory final : public OperatorFactory {

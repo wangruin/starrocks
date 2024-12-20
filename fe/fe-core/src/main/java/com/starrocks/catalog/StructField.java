@@ -20,36 +20,54 @@ import com.google.gson.annotations.SerializedName;
 import com.starrocks.thrift.TStructField;
 import com.starrocks.thrift.TTypeDesc;
 import com.starrocks.thrift.TTypeNode;
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.StringJoiner;
 
 /**
  * TODO: Support comments for struct fields. The Metastore does not properly store
  * comments of struct fields. We set comment to null to avoid compatibility issues.
  */
 public class StructField {
-    // If name is null, that means this StructFiled is unnamed.
     @SerializedName(value = "name")
-    private final String name;
+    private String name;
     @SerializedName(value = "type")
-    private final Type type;
+    private Type type;
 
     // comment is not used now, it's always null.
     @SerializedName(value = "comment")
-    private final String comment;
+    private String comment;
     private int position;  // in struct
 
-    public StructField(String name, Type type, String comment) {
+    @SerializedName(value = "fieldId")
+    private int fieldId = -1;
+
+    // fieldPhysicalName is used to store the physical name of the field in the storage layer.
+    // for example, the physical name of a struct field in a parquet file.
+    // used in delta lake column mapping name mode
+    @SerializedName(value = "fieldPhysicalName")
+    private String fieldPhysicalName = "";
+
+    public StructField() {}
+
+    public StructField(String name, int fieldId, Type type, String comment) {
+        this(name, fieldId, "", type, comment);
+    }
+
+    public StructField(String name, int fieldId, String fieldPhysicalName, Type type, String comment) {
         this.name = name;
         this.type = type;
         this.comment = comment;
+        this.fieldId = fieldId;
+        this.fieldPhysicalName = fieldPhysicalName;
+    }
+
+    public StructField(String name, Type type, String comment) {
+        this(name, -1, type, comment);
     }
 
     public StructField(String name, Type type) {
         this(name, type, null);
-    }
-
-    // Unnamed struct field
-    public StructField(Type type) {
-        this(null, type, null);
     }
 
     public String getComment() {
@@ -68,14 +86,18 @@ public class StructField {
         return position;
     }
 
+    public int getFieldId() {
+        return fieldId;
+    }
+
     public void setPosition(int position) {
         this.position = position;
     }
 
-    public String toSql(int depth) {
+    public String toSql(int depth, boolean printName) {
         String typeSql = (depth < Type.MAX_NESTING_DEPTH) ? type.toSql(depth) : "...";
         StringBuilder sb = new StringBuilder();
-        if (name != null) {
+        if (printName) {
             sb.append(name).append(' ');
         }
         sb.append(typeSql);
@@ -85,14 +107,22 @@ public class StructField {
         return sb.toString();
     }
 
+    public String toTypeString(int depth) {
+        String typeSql = (depth < Type.MAX_NESTING_DEPTH) ? type.toTypeString(depth) : "...";
+        StringBuilder sb = new StringBuilder();
+        sb.append(name).append(' ');
+        sb.append(typeSql);
+        return sb.toString();
+    }
+
     /**
      * Pretty prints this field with lpad number of leading spaces.
      * Calls prettyPrint(lpad) on this field's type.
      */
-    public String prettyPrint(int lpad) {
+    public String prettyPrint(int lpad, boolean printName) {
         String leftPadding = Strings.repeat(" ", lpad);
         StringBuilder sb = new StringBuilder(leftPadding);
-        if (name != null) {
+        if (printName) {
             sb.append(name).append(' ');
         }
 
@@ -112,44 +142,46 @@ public class StructField {
         TStructField field = new TStructField();
         field.setName(name);
         field.setComment(comment);
+        field.setId(fieldId);
+        field.setPhysical_name(fieldPhysicalName);
         node.struct_fields.add(field);
         type.toThrift(container);
     }
 
     @Override
     public int hashCode() {
-        if (name != null) {
-            return Objects.hashCode(name, type);
-        } else {
-            return Objects.hashCode(type);
-        }
+        return Objects.hashCode(name.toLowerCase(), type, fieldId, fieldPhysicalName);
     }
 
-    // [Named vs Named] struct<a: INT, b: STRING> is equal to struct<a: INT, b: STRING>
-    // [Unnamed vs Unnamed] struct<INT, STRING> is equal to struct<INT, STRING>
-    // [Named vs Unnamed][Always false] struct<a: INT, b: STRING> is not equal to struct<INT, STRING>
     @Override
     public boolean equals(Object other) {
         if (!(other instanceof StructField)) {
             return false;
         }
         StructField otherStructField = (StructField) other;
-        if (name == null) {
-            // If this() is unnamed struct field, other struct field must also be an unnamed struct field.
-            return otherStructField.name == null && type.equals(otherStructField.type);
-        }
-
-        if (otherStructField.name == null) {
-            // If other struct field is not named struct field, return false directly.
-            return false;
-        }
         // Both are named struct field
-        return otherStructField.name.equals(name) && otherStructField.type.equals(type);
+        return StringUtils.equalsIgnoreCase(name, otherStructField.name) && Objects.equal(type, otherStructField.type) &&
+                    (fieldId == otherStructField.fieldId) && Objects.equal(fieldPhysicalName, otherStructField.fieldPhysicalName);
+    }
+
+    @Override
+    public String toString() {
+        return new StringJoiner(", ", StructField.class.getSimpleName() + "[", "]")
+                .add("name='" + (Strings.isNullOrEmpty(name) ? "" : name) + "'")
+                .add("type=" + type)
+                .add("position=" + position)
+                .add("fieldId=" + fieldId)
+                .add("fieldPhysicalName='" + (Strings.isNullOrEmpty(fieldPhysicalName) ? "" : fieldPhysicalName) + "'")
+                .toString();
     }
 
     @Override
     public StructField clone() {
-        return new StructField(name, type.clone(), comment);
+        return new StructField(name, fieldId, fieldPhysicalName, type.clone(), comment);
+    }
+
+    public int getMaxUniqueId() {
+        return Math.max(fieldId, type.getMaxUniqueId());
     }
 }
 

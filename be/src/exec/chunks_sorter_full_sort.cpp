@@ -37,8 +37,9 @@ ChunksSorterFullSort::ChunksSorterFullSort(RuntimeState* state, const std::vecto
           _early_materialized_slots(early_materialized_slots.begin(), early_materialized_slots.end()) {}
 
 ChunksSorterFullSort::~ChunksSorterFullSort() = default;
-void ChunksSorterFullSort::setup_runtime(starrocks::RuntimeProfile* profile, MemTracker* parent_mem_tracker) {
-    ChunksSorter::setup_runtime(profile, parent_mem_tracker);
+
+void ChunksSorterFullSort::setup_runtime(RuntimeState* state, RuntimeProfile* profile, MemTracker* parent_mem_tracker) {
+    ChunksSorter::setup_runtime(state, profile, parent_mem_tracker);
     _runtime_profile = profile;
     _parent_mem_tracker = parent_mem_tracker;
     _object_pool = std::make_unique<ObjectPool>();
@@ -46,6 +47,7 @@ void ChunksSorterFullSort::setup_runtime(starrocks::RuntimeProfile* profile, Mem
     _runtime_profile->add_info_string("MaxBufferedBytes", strings::Substitute("$0", max_buffered_bytes));
     _profiler = _object_pool->add(new ChunksSorterFullSortProfiler(profile, parent_mem_tracker));
 }
+
 Status ChunksSorterFullSort::update(RuntimeState* state, const ChunkPtr& chunk) {
     RETURN_IF_ERROR(_merge_unsorted(state, chunk));
     RETURN_IF_ERROR(_partial_sort(state, false));
@@ -103,6 +105,7 @@ Status ChunksSorterFullSort::_partial_sort(RuntimeState* state, bool done) {
         _max_num_rows = std::max<int>(_max_num_rows, _staging_unsorted_rows);
         _profiler->input_required_memory->update(_staging_unsorted_bytes);
         concat_chunks(_unsorted_chunk, _staging_unsorted_chunks, _staging_unsorted_rows);
+        _staging_unsorted_chunks.clear();
         RETURN_IF_ERROR(_unsorted_chunk->upgrade_if_overflow());
 
         SCOPED_TIMER(_sort_timer);
@@ -119,7 +122,6 @@ Status ChunksSorterFullSort::_partial_sort(RuntimeState* state, bool done) {
         _unsorted_chunk->reset();
         _staging_unsorted_rows = 0;
         _staging_unsorted_bytes = 0;
-        _staging_unsorted_chunks.clear();
     }
 
     return Status::OK();
@@ -134,10 +136,10 @@ Status ChunksSorterFullSort::_merge_sorted(RuntimeState* state) {
     // columns's permutation in multiple passes.
     if (_early_materialized_slots.empty() || _sorted_chunks.size() < 3) {
         _early_materialized_slots.clear();
-        _runtime_profile->add_info_string("LateMaterialization", "false");
+        _runtime_profile->add_info_string("LateMaterialization", "False");
         RETURN_IF_ERROR(merge_sorted_chunks(_sort_desc, _sort_exprs, _sorted_chunks, &_merged_runs));
     } else {
-        _runtime_profile->add_info_string("LateMaterialization", "true");
+        _runtime_profile->add_info_string("LateMaterialization", "True");
         _split_late_and_early_chunks();
         _assign_ordinals();
         RETURN_IF_ERROR(merge_sorted_chunks(_sort_desc, _sort_exprs, _early_materialized_chunks, &_merged_runs));
@@ -185,7 +187,7 @@ void ChunksSorterFullSort::_assign_ordinals_tmpl() {
         for (T offset = 0; offset < num_rows; ++offset) {
             ordinal_data[offset] = static_cast<T>((chunk_idx << _offset_in_chunk_bits) | offset);
         }
-        partial_sort_chunk->append_column(ordinal_column, ORDINAL_COLUMN_SLOT_ID);
+        partial_sort_chunk->append_column(ordinal_column, Chunk::SORT_ORDINAL_COLUMN_SLOT_ID);
         ++chunk_idx;
     }
 }
@@ -230,7 +232,7 @@ starrocks::ChunkPtr ChunksSorterFullSort::_late_materialize_tmpl(const starrocks
     static_assert(type_is_ordinal<T>, "T must be uint32_t or uint64_t");
     const auto num_rows = sorted_eager_chunk->num_rows();
     auto sorted_lazy_chunk = _late_materialized_chunks[0]->clone_empty(num_rows);
-    auto ordinal_column = sorted_eager_chunk->get_column_by_slot_id(ORDINAL_COLUMN_SLOT_ID);
+    auto ordinal_column = sorted_eager_chunk->get_column_by_slot_id(Chunk::SORT_ORDINAL_COLUMN_SLOT_ID);
     auto& ordinal_data = down_cast<OrdinalColumn<T>*>(ordinal_column.get())->get_data();
     T _offset_in_chunk_mask = static_cast<T>((1L << _offset_in_chunk_bits) - 1);
     for (auto i = 0; i < num_rows; ++i) {
@@ -249,7 +251,7 @@ starrocks::ChunkPtr ChunksSorterFullSort::_late_materialize_tmpl(const starrocks
     }
     return final_chunk;
 }
-Status ChunksSorterFullSort::done(RuntimeState* state) {
+Status ChunksSorterFullSort::do_done(RuntimeState* state) {
     RETURN_IF_ERROR(_partial_sort(state, true));
     {
         _sort_permutation = {};

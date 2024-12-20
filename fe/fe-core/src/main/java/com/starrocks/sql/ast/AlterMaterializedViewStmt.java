@@ -24,44 +24,21 @@ import com.starrocks.sql.parser.NodePosition;
  * 3.SYNC is not supported and ASYNC is not allow changed to SYNC
  */
 public class AlterMaterializedViewStmt extends DdlStmt {
-
     private final TableName mvName;
-    private final String newMvName;
-    private final RefreshSchemeDesc refreshSchemeDesc;
+    private final AlterTableClause alterTableClause;
 
-    private final ModifyTablePropertiesClause modifyTablePropertiesClause;
-
-    public AlterMaterializedViewStmt(TableName mvName, String newMvName,
-                                     RefreshSchemeDesc refreshSchemeDesc,
-                                     ModifyTablePropertiesClause modifyTablePropertiesClause) {
-        this(mvName, newMvName, refreshSchemeDesc, modifyTablePropertiesClause, NodePosition.ZERO);
-    }
-
-    public AlterMaterializedViewStmt(TableName mvName, String newMvName,
-                                     RefreshSchemeDesc refreshSchemeDesc,
-                                     ModifyTablePropertiesClause modifyTablePropertiesClause,
-                                     NodePosition pos) {
+    public AlterMaterializedViewStmt(TableName mvName, AlterTableClause alterTableClause, NodePosition pos) {
         super(pos);
         this.mvName = mvName;
-        this.newMvName = newMvName;
-        this.refreshSchemeDesc = refreshSchemeDesc;
-        this.modifyTablePropertiesClause = modifyTablePropertiesClause;
+        this.alterTableClause = alterTableClause;
     }
 
     public TableName getMvName() {
         return mvName;
     }
 
-    public String getNewMvName() {
-        return newMvName;
-    }
-
-    public RefreshSchemeDesc getRefreshSchemeDesc() {
-        return refreshSchemeDesc;
-    }
-
-    public ModifyTablePropertiesClause getModifyTablePropertiesClause() {
-        return modifyTablePropertiesClause;
+    public AlterTableClause getAlterTableClause() {
+        return alterTableClause;
     }
 
     @Override

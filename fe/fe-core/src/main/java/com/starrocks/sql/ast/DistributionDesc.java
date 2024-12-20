@@ -47,6 +47,10 @@ public class DistributionDesc implements ParseNode, Writable {
         throw new NotImplementedException();
     }
 
+    public DistributionInfoType getType() {
+        return type;
+    }
+
     public int getBuckets() {
         throw new NotImplementedException();
     }
@@ -61,8 +65,12 @@ public class DistributionDesc implements ParseNode, Writable {
             DistributionDesc desc = new HashDistributionDesc();
             desc.readFields(in);
             return desc;
+        } else if (type == DistributionInfoType.RANDOM) {
+            DistributionDesc desc = new RandomDistributionDesc();
+            desc.readFields(in);
+            return desc;
         } else {
-            throw new IOException("Unknow distribution type: " + type);
+            throw new IOException("Unknown distribution type: " + type);
         }
     }
 

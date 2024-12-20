@@ -34,7 +34,8 @@ static inline std::string base_name_of_conjugate_op(const std::string& s) {
 
 ConjugateOperator::ConjugateOperator(pipeline::OperatorFactory* factory, int32_t driver_sequence,
                                      pipeline::OperatorPtr sink_op, pipeline::OperatorPtr source_op)
-        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), driver_sequence),
+        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), true,
+                             driver_sequence),
           _sink_op(std::move(sink_op)),
           _source_op(std::move(source_op)) {}
 
@@ -85,6 +86,18 @@ Status ConjugateOperator::set_cancelled(RuntimeState* state) {
     } else {
         return sink_status;
     }
+}
+
+const pipeline::LocalRFWaitingSet& ConjugateOperator::rf_waiting_set() const {
+    return _source_op->rf_waiting_set();
+}
+
+RuntimeFilterProbeCollector* ConjugateOperator::runtime_bloom_filters() {
+    return _source_op->runtime_bloom_filters();
+}
+
+const RuntimeFilterProbeCollector* ConjugateOperator::runtime_bloom_filters() const {
+    return _source_op->runtime_bloom_filters();
 }
 
 void ConjugateOperator::set_precondition_ready(RuntimeState* state) {

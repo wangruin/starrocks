@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.warehouse;
 
+import com.staros.proto.ShardInfo;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.ExceptionChecker;
-import com.starrocks.lake.StarOSAgent;
+import com.starrocks.common.ErrorReportException;
+import com.starrocks.lake.LakeTablet;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.analyzer.AnalyzeTestUtil;
-import com.starrocks.sql.ast.AlterWarehouseStmt;
 import com.starrocks.utframe.StarRocksAssert;
-import com.starrocks.utframe.UtFrameUtils;
-import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
@@ -40,75 +38,42 @@ public class WarehouseTest {
     public static void beforeClass() throws Exception {
         AnalyzeTestUtil.init();
         connectContext = AnalyzeTestUtil.getConnectContext();
-        // create warehouse
-        String createWarehouse = "CREATE WAREHOUSE test";
         starRocksAssert = new StarRocksAssert();
-        starRocksAssert.withWarehouse(createWarehouse);
-    }
-
-    private static void addCluster(String sql) throws Exception {
-        AlterWarehouseStmt addClusterStmt = (AlterWarehouseStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
-        GlobalStateMgr.getCurrentState().getWarehouseMgr().alterWarehouse(addClusterStmt);
-    }
-
-    private static void removeCluster(String sql) throws Exception {
-        AlterWarehouseStmt removeClusterStmt = (AlterWarehouseStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
-        GlobalStateMgr.getCurrentState().getWarehouseMgr().alterWarehouse(removeClusterStmt);
-    }
-
-    private static void modifyWarehouseProperty(String sql) throws Exception {
-        AlterWarehouseStmt modifyWarehousePropertyStmt = (AlterWarehouseStmt)
-                UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
-        GlobalStateMgr.getCurrentState().getWarehouseMgr().alterWarehouse(modifyWarehousePropertyStmt);
     }
 
     @Test
-    public void testNormal(@Mocked StarOSAgent starOSAgent) throws DdlException {
-        new MockUp<GlobalStateMgr>() {
+    public void testNormal() throws DdlException {
+        WarehouseManager warehouseMgr = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+        Assert.assertTrue(warehouseMgr.warehouseExists(WarehouseManager.DEFAULT_WAREHOUSE_NAME));
+        Assert.assertTrue(warehouseMgr.warehouseExists(WarehouseManager.DEFAULT_WAREHOUSE_ID));
+    }
+
+    @Test
+    public void testGetComputeNodeAssignedToTablet(@Mocked ShardInfo shardInfo) {
+        WarehouseManager warehouseManager = new WarehouseManager();
+        warehouseManager.initDefaultWarehouse();
+
+        new MockUp<WarehouseManager>() {
             @Mock
-            public StarOSAgent getCurrentStarOSAgent() {
-                return starOSAgent;
+            public Long getComputeNodeId(Long warehouseId, LakeTablet tablet) {
+                return null;
             }
         };
+        try {
+            warehouseManager.getComputeNodeAssignedToTablet(0L, new LakeTablet(0));
+            Assert.fail();
+        } catch (ErrorReportException e) {
+            Assert.assertTrue(e.getMessage().contains("No alive backend or compute node in warehouse"));
+        }
+    }
 
-        new Expectations() {
-            {
-                starOSAgent.deleteWorkerGroup(anyLong);
-                result = null;
-                minTimes = 0;
-
-                starOSAgent.createWorkerGroup(anyString);
-                result = -1L;
-                minTimes = 0;
-            }
-        };
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> addCluster("alter warehouse test add cluster")
-        );
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> addCluster("alter warehouse test add cluster")
-        );
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> removeCluster("alter warehouse test remove cluster")
-        );
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> modifyWarehouseProperty("alter warehouse test  set(\"size\"=\"medium\");")
-        );
-        Assert.assertEquals("medium",
-                GlobalStateMgr.getCurrentState().getWarehouseMgr().getWarehouse("test").getSize());
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> modifyWarehouseProperty("alter warehouse test set(\"min_cluster\"=\"2\");")
-        );
-        Assert.assertEquals(2, GlobalStateMgr.getCurrentState().getWarehouseMgr().getWarehouse("test").getMinCluster());
-
-        ExceptionChecker.expectThrowsNoException(
-                () -> modifyWarehouseProperty("alter warehouse test set(\"max_cluster\"=\"4\");")
-        );
-        Assert.assertEquals(4, GlobalStateMgr.getCurrentState().getWarehouseMgr().getWarehouse("test").getMaxCluster());
+    @Test
+    public void testGetWarehouse() {
+        WarehouseManager warehouseManager = new WarehouseManager();
+        warehouseManager.initDefaultWarehouse();
+        Assert.assertNotNull(warehouseManager.getWarehouseAllowNull(WarehouseManager.DEFAULT_WAREHOUSE_ID));
+        Assert.assertNotNull(warehouseManager.getWarehouseAllowNull(WarehouseManager.DEFAULT_WAREHOUSE_NAME));
+        Assert.assertNull(warehouseManager.getWarehouseAllowNull("w"));
+        Assert.assertNull(warehouseManager.getWarehouseAllowNull(-1));
     }
 }

@@ -25,10 +25,10 @@
 namespace starrocks {
 
 SchemaScanner::ColumnDesc SchemaBeMetricsScanner::_s_columns[] = {
-        {"BE_ID", TYPE_BIGINT, sizeof(int64_t), false},
-        {"NAME", TYPE_VARCHAR, sizeof(StringValue), false},
-        {"LABELS", TYPE_VARCHAR, sizeof(StringValue), false},
-        {"VALUE", TYPE_BIGINT, sizeof(int64_t), false},
+        {"BE_ID", TypeDescriptor::from_logical_type(TYPE_BIGINT), sizeof(int64_t), false},
+        {"NAME", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), false},
+        {"LABELS", TypeDescriptor::create_varchar_type(sizeof(StringValue)), sizeof(StringValue), false},
+        {"VALUE", TypeDescriptor::from_logical_type(TYPE_BIGINT), sizeof(int64_t), false},
 };
 
 SchemaBeMetricsScanner::SchemaBeMetricsScanner()
@@ -79,7 +79,8 @@ Status SchemaBeMetricsScanner::start(RuntimeState* state) {
 
 Status SchemaBeMetricsScanner::fill_chunk(ChunkPtr* chunk) {
     const auto& slot_id_to_index_map = (*chunk)->get_slot_id_to_index_map();
-    for (; _cur_idx < _infos.size(); _cur_idx++) {
+    auto end = _cur_idx + 1;
+    for (; _cur_idx < end; _cur_idx++) {
         auto& info = _infos[_cur_idx];
         for (const auto& [slot_id, index] : slot_id_to_index_map) {
             if (slot_id < 1 || slot_id > 14) {

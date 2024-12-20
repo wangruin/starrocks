@@ -15,41 +15,53 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <ostream>
 
+#include "column/column_access_path.h"
 #include "common/status.h"
+#include "compaction_task_context.h"
+#include "runtime/mem_tracker.h"
+#include "storage/lake/versioned_tablet.h"
+
+namespace starrocks {
+class TxnLogPB;
+class TxnLogPB_OpCompaction;
+} // namespace starrocks
 
 namespace starrocks::lake {
 
+class Rowset;
+class TabletWriter;
+
 class CompactionTask {
 public:
-    struct Stats {
-        std::atomic<int64_t> input_bytes{0};
-        std::atomic<int64_t> input_rows{0};
-        std::atomic<int64_t> output_bytes{0};
-        std::atomic<int64_t> output_rows{0};
+    // CancelFunc is a function that used to tell the compaction task whether the task
+    // should be cancelled.
+    using CancelFunc = std::function<Status()>;
 
-        void merge(const Stats& stats2);
-    };
-
+    explicit CompactionTask(VersionedTablet tablet, std::vector<std::shared_ptr<Rowset>> input_rowsets,
+                            CompactionTaskContext* context, std::shared_ptr<const TabletSchema> tablet_schema);
     virtual ~CompactionTask() = default;
 
-    virtual Status execute(Stats* stats) = 0;
+    virtual Status execute(CancelFunc cancel_func, ThreadPool* flush_pool = nullptr) = 0;
+
+    Status execute_index_major_compaction(TxnLogPB* txn_log);
+
+    inline static const CancelFunc kNoCancelFn = []() { return Status::OK(); };
+    inline static const CancelFunc kCancelledFn = []() { return Status::Aborted(""); };
+
+    Status fill_compaction_segment_info(TxnLogPB_OpCompaction* op_compaction, TabletWriter* writer);
+
+protected:
+    int64_t _txn_id;
+    VersionedTablet _tablet;
+    std::vector<std::shared_ptr<Rowset>> _input_rowsets;
+    std::unique_ptr<MemTracker> _mem_tracker = nullptr;
+    CompactionTaskContext* _context;
+    std::shared_ptr<const TabletSchema> _tablet_schema;
+    // for flat json used
+    std::vector<std::unique_ptr<ColumnAccessPath>> _column_access_paths;
 };
-
-inline void CompactionTask::Stats::merge(const CompactionTask::Stats& stats2) {
-    input_bytes.fetch_add(stats2.input_bytes, std::memory_order_relaxed);
-    input_rows.fetch_add(stats2.input_rows, std::memory_order_relaxed);
-    output_bytes.fetch_add(stats2.output_bytes, std::memory_order_relaxed);
-    output_rows.fetch_add(stats2.output_rows, std::memory_order_relaxed);
-}
-
-inline std::ostream& operator<<(std::ostream& os, const CompactionTask::Stats& stats) {
-    os << "Stats{input_bytes=" << stats.input_bytes.load(std::memory_order_relaxed)
-       << " input_rows=" << stats.input_rows.load(std::memory_order_relaxed)
-       << " output_bytes=" << stats.output_bytes.load(std::memory_order_relaxed)
-       << " output_rows=" << stats.output_rows.load(std::memory_order_relaxed) << "}";
-    return os;
-}
 
 } // namespace starrocks::lake

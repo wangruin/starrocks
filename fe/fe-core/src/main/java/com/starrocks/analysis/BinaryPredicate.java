@@ -35,17 +35,13 @@
 package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
-import com.starrocks.catalog.PrimitiveType;
-import com.starrocks.catalog.Type;
+import com.starrocks.common.Pair;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
-import com.starrocks.thrift.TExprOpcode;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -56,123 +52,23 @@ import java.util.Objects;
  * Most predicates with two operands..
  */
 public class BinaryPredicate extends Predicate implements Writable {
-    private static final Logger LOG = LogManager.getLogger(BinaryPredicate.class);
 
     public static final com.google.common.base.Predicate<BinaryPredicate> IS_RANGE_PREDICATE =
-            arg -> arg.getOp() == Operator.LT
-                    || arg.getOp() == Operator.LE
-                    || arg.getOp() == Operator.GT
-                    || arg.getOp() == Operator.GE;
+            arg -> arg.getOp() == BinaryType.LT
+                    || arg.getOp() == BinaryType.LE
+                    || arg.getOp() == BinaryType.GT
+                    || arg.getOp() == BinaryType.GE;
 
     public static final com.google.common.base.Predicate<BinaryPredicate> IS_EQ_PREDICATE =
-            arg -> arg.getOp() == Operator.EQ;
+            arg -> arg.getOp() == BinaryType.EQ;
 
     public static final com.google.common.base.Predicate<BinaryPredicate> IS_EQ_NULL_PREDICATE =
-            arg -> arg.getOp() == Operator.EQ_FOR_NULL;
+            arg -> arg.getOp() == BinaryType.EQ_FOR_NULL;
 
     // true if this BinaryPredicate is inferred from slot equivalences, false otherwise.
     private boolean isInferred_ = false;
 
-    public enum Operator {
-        EQ("=", "eq", TExprOpcode.EQ, false),
-        NE("!=", "ne", TExprOpcode.NE, false),
-        LE("<=", "le", TExprOpcode.LE, true),
-        GE(">=", "ge", TExprOpcode.GE, true),
-        LT("<", "lt", TExprOpcode.LT, true),
-        GT(">", "gt", TExprOpcode.GT, true),
-        EQ_FOR_NULL("<=>", "eq_for_null", TExprOpcode.EQ_FOR_NULL, false);
-
-        private final String description;
-        private final String name;
-        private final TExprOpcode opcode;
-        private final boolean monotonic;
-
-        Operator(String description,
-                 String name,
-                 TExprOpcode opcode,
-                 boolean monotonic) {
-            this.description = description;
-            this.name = name;
-            this.opcode = opcode;
-            this.monotonic = monotonic;
-        }
-
-        @Override
-        public String toString() {
-            return description;
-        }
-
-        public String getName() {
-            return name;
-        }
-
-        public TExprOpcode getOpcode() {
-            return opcode;
-        }
-
-        public Operator commutative() {
-            switch (this) {
-                case EQ:
-                    return this;
-                case NE:
-                    return this;
-                case LE:
-                    return GE;
-                case GE:
-                    return LE;
-                case LT:
-                    return GT;
-                case GT:
-                    return LE;
-                case EQ_FOR_NULL:
-                    return this;
-            }
-            return null;
-        }
-
-        public Operator converse() {
-            switch (this) {
-                case EQ:
-                    return EQ;
-                case NE:
-                    return NE;
-                case LE:
-                    return GE;
-                case GE:
-                    return LE;
-                case LT:
-                    return GT;
-                case GT:
-                    return LT;
-                case EQ_FOR_NULL:
-                    return EQ_FOR_NULL;
-                // case DISTINCT_FROM: return DISTINCT_FROM;
-                // case NOT_DISTINCT: return NOT_DISTINCT;
-                // case NULL_MATCHING_EQ:
-                // throw new IllegalStateException("Not implemented");
-                default:
-                    throw new IllegalStateException("Invalid operator");
-            }
-        }
-
-        public boolean isEquivalence() {
-            return this == EQ || this == EQ_FOR_NULL;
-        }
-
-        public boolean isMonotonic() {
-            return monotonic;
-        }
-
-        public boolean isUnequivalence() {
-            return this == NE;
-        }
-
-        public boolean isNotRangeComparison() {
-            return isEquivalence() || isUnequivalence();
-        }
-    }
-
-    private Operator op;
+    private BinaryType op;
     // check if left is slot and right isnot slot.
     private Boolean slotIsleft = null;
 
@@ -181,14 +77,14 @@ public class BinaryPredicate extends Predicate implements Writable {
         super();
     }
 
-    public BinaryPredicate(Operator op, Expr e1, Expr e2) {
+    public BinaryPredicate(BinaryType op, Expr e1, Expr e2) {
         this(op, e1, e2, NodePosition.ZERO);
     }
 
-    public BinaryPredicate(Operator op, Expr e1, Expr e2, NodePosition pos) {
+    public BinaryPredicate(BinaryType op, Expr e1, Expr e2, NodePosition pos) {
         super(pos);
         this.op = op;
-        this.opcode = op.opcode;
+        this.opcode = op.getOpcode();
         Preconditions.checkNotNull(e1);
         children.add(e1);
         Preconditions.checkNotNull(e2);
@@ -207,31 +103,31 @@ public class BinaryPredicate extends Predicate implements Writable {
         return new BinaryPredicate(this);
     }
 
-    public Operator getOp() {
+    public BinaryType getOp() {
         return op;
     }
 
     @Override
     public Expr negate() {
-        Operator newOp = null;
+        BinaryType newOp = null;
         switch (op) {
             case EQ:
-                newOp = Operator.NE;
+                newOp = BinaryType.NE;
                 break;
             case NE:
-                newOp = Operator.EQ;
+                newOp = BinaryType.EQ;
                 break;
             case LT:
-                newOp = Operator.GE;
+                newOp = BinaryType.GE;
                 break;
             case LE:
-                newOp = Operator.GT;
+                newOp = BinaryType.GT;
                 break;
             case GE:
-                newOp = Operator.LT;
+                newOp = BinaryType.LT;
                 break;
             case GT:
-                newOp = Operator.LE;
+                newOp = BinaryType.LE;
                 break;
             default:
                 throw new IllegalStateException("Not implemented");
@@ -267,105 +163,6 @@ public class BinaryPredicate extends Predicate implements Writable {
         } else {
             msg.setChild_type(getChild(0).getType().getPrimitiveType().toThrift());
         }
-    }
-
-    private static boolean canCompareDate(PrimitiveType t1, PrimitiveType t2) {
-        if (t1.isDateType()) {
-            return t2.isDateType() || t2.isStringType();
-        } else if (t2.isDateType()) {
-            return t1.isStringType();
-        } else {
-            return false;
-        }
-    }
-
-    public static Type getCmpType(Type type1, Type type2) {
-        PrimitiveType t1 = type1.getResultType().getPrimitiveType();
-        PrimitiveType t2 = type2.getResultType().getPrimitiveType();
-
-        if (canCompareDate(type1.getPrimitiveType(), type2.getPrimitiveType())) {
-            return Type.DATETIME;
-        }
-
-        // Following logical is compatible with MySQL:
-        //    Cast to DOUBLE by default, because DOUBLE has the largest range of values.
-        if (type1.isJsonType() || type2.isJsonType()) {
-            return Type.JSON;
-        }
-        if (type1.isArrayType() || type2.isArrayType()) {
-            // Must both be array
-            if (!type1.equals(type2)) {
-                return Type.INVALID;
-            }
-            return type1;
-        }
-        if (type1.isComplexType() || type2.isComplexType()) {
-            // We don't support complex type for binary predicate.
-            return Type.INVALID;
-        }
-        if (t1 == PrimitiveType.VARCHAR && t2 == PrimitiveType.VARCHAR) {
-            return Type.VARCHAR;
-        }
-        if (t1 == PrimitiveType.BIGINT && t2 == PrimitiveType.BIGINT) {
-            return Type.getAssignmentCompatibleType(type1, type2, false);
-        }
-        if (t1.isDecimalV3Type()) {
-            return Type.getAssignmentCompatibleType(type1, type2, false);
-        }
-        if (t2.isDecimalV3Type()) {
-            return Type.getAssignmentCompatibleType(type1, type2, false);
-        }
-        if ((t1 == PrimitiveType.BIGINT || t1 == PrimitiveType.DECIMALV2)
-                && (t2 == PrimitiveType.BIGINT || t2 == PrimitiveType.DECIMALV2)) {
-            return Type.DECIMALV2;
-        }
-        if ((t1 == PrimitiveType.BIGINT || t1 == PrimitiveType.LARGEINT)
-                && (t2 == PrimitiveType.BIGINT || t2 == PrimitiveType.LARGEINT)) {
-            return Type.LARGEINT;
-        }
-
-        return Type.DOUBLE;
-    }
-
-    /**
-     * If predicate is of the form "<slotref> <op> <expr>", returns expr,
-     * otherwise returns null. Slotref may be wrapped in a CastExpr.
-     */
-    public Expr getSlotBinding(SlotId id) {
-        SlotRef slotRef = null;
-        // check left operand
-        if (getChild(0) instanceof SlotRef) {
-            slotRef = (SlotRef) getChild(0);
-        } else if (getChild(0) instanceof CastExpr && getChild(0).getChild(0) instanceof SlotRef) {
-            if (((CastExpr) getChild(0)).canHashPartition()) {
-                slotRef = (SlotRef) getChild(0).getChild(0);
-            }
-        }
-        if (slotRef != null && slotRef.getSlotId() == id) {
-            slotIsleft = true;
-            return getChild(1);
-        }
-
-        // check right operand
-        if (getChild(1) instanceof SlotRef) {
-            slotRef = (SlotRef) getChild(1);
-        } else if (getChild(1) instanceof CastExpr && getChild(1).getChild(0) instanceof SlotRef) {
-            if (((CastExpr) getChild(1)).canHashPartition()) {
-                slotRef = (SlotRef) getChild(1).getChild(0);
-            }
-        }
-
-        if (slotRef != null && slotRef.getSlotId() == id) {
-            slotIsleft = false;
-            return getChild(0);
-        }
-
-        return null;
-    }
-
-    public boolean slotIsLeft() {
-        Preconditions.checkState(slotIsleft != null);
-        return slotIsleft;
     }
 
     /*
@@ -405,7 +202,7 @@ public class BinaryPredicate extends Predicate implements Writable {
         }
 
         // read op
-        Operator op = Operator.valueOf(Text.readString(in));
+        BinaryType op = BinaryType.valueOf(Text.readString(in));
         // read left
         SlotRef left = new SlotRef(null, Text.readString(in));
         // read right
@@ -422,13 +219,28 @@ public class BinaryPredicate extends Predicate implements Writable {
         return binaryPredicate;
     }
 
+    public Pair<SlotRef, Expr> createSlotAndLiteralPair() {
+        Expr leftExpr = getChild(0);
+        Expr rightExpr = getChild(1);
+        if (leftExpr instanceof SlotRef && (rightExpr instanceof Parameter) &&
+                (((Parameter) rightExpr).getExpr() instanceof LiteralExpr)) {
+            SlotRef slot = (SlotRef) leftExpr;
+            return Pair.create(slot, ((Parameter) rightExpr).getExpr());
+        } else if (rightExpr instanceof SlotRef && (leftExpr instanceof Parameter) &&
+                (((Parameter) leftExpr).getExpr() instanceof LiteralExpr)) {
+            SlotRef slot = (SlotRef) rightExpr;
+            return Pair.create(slot, ((Parameter) leftExpr).getExpr());
+        }
+        return null;
+    }
+
     @Override
     public int hashCode() {
         return 31 * super.hashCode() + Objects.hashCode(op);
     }
 
     public boolean isNullable() {
-        return !Operator.EQ_FOR_NULL.equals(op) && hasNullableChild();
+        return !BinaryType.EQ_FOR_NULL.equals(op) && hasNullableChild();
     }
 
     /**

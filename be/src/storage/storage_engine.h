@@ -43,6 +43,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <set>
 #include <string>
 #include <thread>
@@ -50,6 +51,7 @@
 #include <vector>
 
 #include "agent/status.h"
+#include "column/chunk.h"
 #include "common/status.h"
 #include "gen_cpp/AgentService_types.h"
 #include "gen_cpp/BackendService_types.h"
@@ -67,16 +69,51 @@ namespace bthread {
 class Executor;
 }
 
+namespace starrocks::lake {
+class LocalPkIndexManager;
+}
+
 namespace starrocks {
 
 class DataDir;
 class EngineTask;
 class MemTableFlushExecutor;
 class Tablet;
+class ReplicationTxnManager;
 class UpdateManager;
 class CompactionManager;
+class PublishVersionManager;
+class DictionaryCacheManager;
 class SegmentFlushExecutor;
 class SegmentReplicateExecutor;
+
+struct DeltaColumnGroupKey {
+    int64_t tablet_id;
+    RowsetId rowsetid;
+    uint32_t segment_id;
+
+    DeltaColumnGroupKey() = default;
+    DeltaColumnGroupKey(int64_t tid, RowsetId rid, uint32_t sid) : tablet_id(tid), rowsetid(rid), segment_id(sid) {}
+    ~DeltaColumnGroupKey() = default;
+
+    bool operator==(const DeltaColumnGroupKey& rhs) const {
+        return tablet_id == rhs.tablet_id && segment_id == rhs.segment_id && rowsetid == rhs.rowsetid;
+    }
+
+    bool operator<(const DeltaColumnGroupKey& rhs) const {
+        if (tablet_id < rhs.tablet_id) {
+            return true;
+        } else if (tablet_id > rhs.tablet_id) {
+            return false;
+        } else if (rowsetid < rhs.rowsetid) {
+            return true;
+        } else if (rowsetid != rhs.rowsetid) {
+            return false;
+        } else {
+            return segment_id < rhs.segment_id;
+        }
+    }
+};
 
 struct AutoIncrementMeta {
     int64_t min;
@@ -98,6 +135,9 @@ public:
     StorageEngine(const EngineOptions& options);
     virtual ~StorageEngine();
 
+    StorageEngine(const StorageEngine&) = delete;
+    const StorageEngine& operator=(const StorageEngine&) = delete;
+
     static Status open(const EngineOptions& options, StorageEngine** engine_ptr);
 
     static StorageEngine* instance() { return _s_instance; }
@@ -114,13 +154,17 @@ public:
 
     size_t get_store_num() { return _store_map.size(); }
 
-    Status get_all_data_dir_info(std::vector<DataDirInfo>* data_dir_infos, bool need_update);
+    void get_all_data_dir_info(std::vector<DataDirInfo>* data_dir_infos, bool need_update);
 
-    // get root path for creating tablet. The returned vector of root path should be random,
-    // for avoiding that all the tablet would be deployed one disk.
+    std::vector<string> get_store_paths();
+    // Get root path vector for creating tablet. The returned vector is sorted by the disk usage in asc order,
+    // then the front portion of the vector excluding paths which have high disk usage is shuffled to avoid
+    // the newly created tablet is distributed on only on specific path.
     std::vector<DataDir*> get_stores_for_create_tablet(TStorageMedium::type storage_medium);
     DataDir* get_store(const std::string& path);
     DataDir* get_store(int64_t path_hash);
+
+    DataDir* get_persistent_index_store(int64_t tablet_id);
 
     uint32_t available_storage_medium_type_count() { return _available_storage_medium_type_count; }
 
@@ -158,21 +202,21 @@ public:
         _report_cv.notify_all();
     }
 
-    // call this to wait for a report notification until timeout
-    void wait_for_report_notify(int64_t timeout_sec, bool from_report_tablet_thread) {
+    // call this to wait for a report notification or until timeout.
+    // returns:
+    // - true: wake up with notification recieved
+    // - false: wait until timeout without notification
+    bool wait_for_report_notify(int64_t timeout_sec, bool from_report_tablet_thread) {
+        bool* watch_var = from_report_tablet_thread ? &_need_report_tablet : &_need_report_disk_stat;
         auto wait_timeout_sec = std::chrono::seconds(timeout_sec);
         std::unique_lock<std::mutex> l(_report_mtx);
-        // When wait_for() returns, regardless of the return-result(possibly a timeout
-        // error), the report_tablet_thread and report_disk_stat_thread(see TaskWorkerPool)
-        // immediately begin the next round of reporting, so there is no need to check
-        // the return-value of wait_for().
-        if (from_report_tablet_thread) {
-            _report_cv.wait_for(l, wait_timeout_sec, [this] { return _need_report_tablet; });
-            _need_report_tablet = false;
-        } else {
-            _report_cv.wait_for(l, wait_timeout_sec, [this] { return _need_report_disk_stat; });
-            _need_report_disk_stat = false;
+        auto ret = _report_cv.wait_for(l, wait_timeout_sec, [&] { return *watch_var; });
+        if (ret) {
+            // if is waken up with return value `true`, the condition must be satisfied.
+            DCHECK(*watch_var);
+            *watch_var = false;
         }
+        return ret;
     }
 
     Status execute_task(EngineTask* task);
@@ -181,17 +225,29 @@ public:
 
     TxnManager* txn_manager() { return _txn_manager.get(); }
 
+    ReplicationTxnManager* replication_txn_manager() { return _replication_txn_manager.get(); }
+
     CompactionManager* compaction_manager() { return _compaction_manager.get(); }
+
+    PublishVersionManager* publish_version_manager() { return _publish_version_manager.get(); }
+
+    DictionaryCacheManager* dictionary_cache_manager() { return _dictionary_cache_manager.get(); }
 
     bthread::Executor* async_delta_writer_executor() { return _async_delta_writer_executor.get(); }
 
     MemTableFlushExecutor* memtable_flush_executor() { return _memtable_flush_executor.get(); }
+
+    MemTableFlushExecutor* lake_memtable_flush_executor() { return _lake_memtable_flush_executor.get(); }
 
     SegmentReplicateExecutor* segment_replicate_executor() { return _segment_replicate_executor.get(); }
 
     SegmentFlushExecutor* segment_flush_executor() { return _segment_flush_executor.get(); }
 
     UpdateManager* update_manager() { return _update_manager.get(); }
+
+#ifdef USE_STAROS
+    lake::LocalPkIndexManager* local_pk_index_manager() { return _local_pk_index_manager.get(); }
+#endif
 
     bool check_rowset_id_in_unused_rowsets(const RowsetId& rowset_id);
 
@@ -200,8 +256,6 @@ public:
     bool rowset_id_in_use(const RowsetId& rowset_id) { return _rowset_id_generator->id_in_use(rowset_id); }
 
     void release_rowset_id(const RowsetId& rowset_id) { return _rowset_id_generator->release_id(rowset_id); }
-
-    void set_heartbeat_flags(HeartbeatFlags* heartbeat_flags) { _heartbeat_flags = heartbeat_flags; }
 
     // start all backgroud threads. This should be call after env is ready.
     virtual Status start_bg_threads();
@@ -217,6 +271,9 @@ public:
     std::vector<std::pair<int64_t, std::vector<std::pair<uint32_t, std::string>>>>
     get_executed_repair_compaction_tasks();
 
+    void submit_manual_compaction_task(int64_t tablet_id, int64_t rowset_size_threshold);
+    std::string get_manual_compaction_status();
+
     void do_manual_compact(bool force_compact);
 
     void increase_update_compaction_thread(const int num_threads_per_disk);
@@ -224,6 +281,42 @@ public:
     Status get_next_increment_id_interval(int64_t tableid, size_t num_row, std::vector<int64_t>& ids);
 
     void remove_increment_map_by_table_id(int64_t table_id);
+
+    bool get_need_write_cluster_id() { return _need_write_cluster_id; }
+
+    size_t delta_column_group_list_memory_usage(const DeltaColumnGroupList& dcgs);
+
+    void search_delta_column_groups_by_version(const DeltaColumnGroupList& all_dcgs, int64_t version,
+                                               DeltaColumnGroupList* dcgs);
+
+    Status get_delta_column_group(KVStore* meta, int64_t tablet_id, RowsetId rowsetid, uint32_t segment_id,
+                                  int64_t version, DeltaColumnGroupList* dcgs);
+
+    void clear_cached_delta_column_group(const std::vector<DeltaColumnGroupKey>& dcg_keys);
+
+    void clear_rowset_delta_column_group_cache(const Rowset& rowset);
+
+    void disable_disks(const std::vector<string>& disabled_disks);
+
+    void decommission_disks(const std::vector<string>& decommissioned_disks);
+
+    void wake_finish_publish_vesion_thread() {
+        std::unique_lock<std::mutex> wl(_finish_publish_version_mutex);
+        _finish_publish_version_cv.notify_one();
+    }
+
+    void add_schedule_apply_task(int64_t tablet_id, std::chrono::steady_clock::time_point time_point);
+
+    void wake_schedule_apply_thread() {
+        std::unique_lock<std::mutex> wl(_schedule_apply_mutex);
+        _apply_tablet_changed_cv.notify_one();
+    }
+
+    void start_schedule_apply_thread();
+
+    bool is_as_cn() { return !_options.need_write_cluster_id; }
+
+    bool enable_light_pk_compaction_publish();
 
 protected:
     static StorageEngine* _s_instance;
@@ -235,7 +328,7 @@ protected:
 private:
     // Instance should be inited from `static open()`
     // MUST NOT be called in other circumstances.
-    Status _open();
+    Status _open(const EngineOptions& options);
 
     Status _init_store_map();
 
@@ -274,12 +367,28 @@ private:
     void* _update_compaction_thread_callback(void* arg, DataDir* data_dir);
     // repair compaction function
     void* _repair_compaction_thread_callback(void* arg);
+    // manual compaction function
+    void* _manual_compaction_thread_callback(void* arg);
+    // pk index major compaction function
+    void* _pk_index_major_compaction_thread_callback(void* arg);
+
+    void* _pk_dump_thread_callback(void* arg);
+
+#ifdef USE_STAROS
+    // local pk index of SHARED_DATA gc/evict function
+    void* _local_pk_index_shared_data_gc_evict_thread_callback(void* arg);
+#endif
+
+    bool _check_and_run_manual_compaction_task();
 
     // garbage sweep thread process function. clear snapshot and trash folder
     void* _garbage_sweeper_thread_callback(void* arg);
 
     // delete tablet with io error process function
     void* _disk_stat_monitor_thread_callback(void* arg);
+
+    // finish publish version process function
+    void* _finish_publish_version_thread_callback(void* arg);
 
     // clean file descriptors cache
     void* _fd_cache_clean_callback(void* arg);
@@ -289,9 +398,13 @@ private:
 
     void* _path_scan_thread_callback(void* arg);
 
+    void* _clear_expired_replication_snapshots_callback(void* arg);
+
     void* _tablet_checkpoint_callback(void* arg);
 
     void* _adjust_pagecache_callback(void* arg);
+
+    void* _schedule_apply_thread_callback(void* arg);
 
     void _start_clean_fd_cache();
     Status _perform_cumulative_compaction(DataDir* data_dir, std::pair<int32_t, int32_t> tablet_shards_range);
@@ -303,34 +416,10 @@ private:
     size_t _compaction_check_one_round();
 
 private:
-    struct CompactionCandidate {
-        CompactionCandidate(uint32_t nicumulative_compaction_, int64_t tablet_id_, uint32_t index_)
-                : nice(nicumulative_compaction_), tablet_id(tablet_id_), disk_index(index_) {}
-        uint32_t nice;
-        int64_t tablet_id;
-        uint32_t disk_index = -1;
-    };
-
-    // In descending order
-    struct CompactionCandidateComparator {
-        bool operator()(const CompactionCandidate& a, const CompactionCandidate& b) { return a.nice > b.nice; }
-    };
-
-    struct CompactionDiskStat {
-        CompactionDiskStat(std::string path, uint32_t index, bool used)
-                : storage_path(std::move(path)), disk_index(index), is_used(used) {}
-        const std::string storage_path;
-        const uint32_t disk_index;
-        uint32_t task_running{0};
-        uint32_t task_remaining{0};
-        bool is_used;
-    };
-
     EngineOptions _options;
     std::mutex _store_lock;
-    std::map<std::string, DataDir*> _store_map;
+    std::map<std::string, std::unique_ptr<DataDir>> _store_map;
     uint32_t _available_storage_medium_type_count;
-
     bool _is_all_cluster_id_exist;
 
     std::mutex _gc_mutex;
@@ -346,6 +435,8 @@ private:
     std::thread _garbage_sweeper_thread;
     // thread to monitor disk stat
     std::thread _disk_stat_monitor_thread;
+    // thread to check finish publish version task
+    std::thread _finish_publish_version_thread;
     // threads to run base compaction
     std::vector<std::thread> _base_compaction_threads;
     // threads to check cumulative
@@ -357,6 +448,14 @@ private:
     std::mutex _repair_compaction_tasks_lock;
     std::vector<std::pair<int64_t, std::vector<uint32_t>>> _repair_compaction_tasks;
     std::vector<std::pair<int64_t, std::vector<std::pair<uint32_t, std::string>>>> _executed_repair_compaction_tasks;
+    std::vector<std::thread> _manual_compaction_threads;
+    // thread to run pk index major compaction
+    std::thread _pk_index_major_compaction_thread;
+    // thread to generate pk dump
+    std::thread _pk_dump_thread;
+    // thread to gc/evict local pk index in sharded_data
+    std::thread _local_pk_index_shared_data_gc_evict_thread;
+
     // threads to clean all file descriptor not actively in use
     std::thread _fd_cache_clean_thread;
     std::thread _adjust_cache_thread;
@@ -366,6 +465,8 @@ private:
     // threads to run tablet checkpoint
     std::vector<std::thread> _tablet_checkpoint_threads;
 
+    std::thread _clear_expired_replcation_snapshots_thread;
+
     std::thread _compaction_checker_thread;
     std::mutex _checker_mutex;
     std::condition_variable _checker_cv;
@@ -373,22 +474,27 @@ private:
     std::mutex _trash_sweeper_mutex;
     std::condition_variable _trash_sweeper_cv;
 
+    std::mutex _finish_publish_version_mutex;
+    std::condition_variable _finish_publish_version_cv;
+
     // For tablet and disk-stat report
     std::mutex _report_mtx;
     std::condition_variable _report_cv;
     bool _need_report_tablet = false;
     bool _need_report_disk_stat = false;
 
-    std::mutex _engine_task_mutex;
-
     std::unique_ptr<TabletManager> _tablet_manager;
     std::unique_ptr<TxnManager> _txn_manager;
+
+    std::unique_ptr<ReplicationTxnManager> _replication_txn_manager;
 
     std::unique_ptr<RowsetIdGenerator> _rowset_id_generator;
 
     std::unique_ptr<bthread::Executor> _async_delta_writer_executor;
 
     std::unique_ptr<MemTableFlushExecutor> _memtable_flush_executor;
+
+    std::unique_ptr<MemTableFlushExecutor> _lake_memtable_flush_executor;
 
     std::unique_ptr<SegmentReplicateExecutor> _segment_replicate_executor;
 
@@ -398,26 +504,32 @@ private:
 
     std::unique_ptr<CompactionManager> _compaction_manager;
 
-    HeartbeatFlags* _heartbeat_flags = nullptr;
+    std::unique_ptr<PublishVersionManager> _publish_version_manager;
+
+    std::unique_ptr<DictionaryCacheManager> _dictionary_cache_manager;
 
     std::unordered_map<int64_t, std::shared_ptr<AutoIncrementMeta>> _auto_increment_meta_map;
 
     std::mutex _auto_increment_mutex;
 
-    StorageEngine(const StorageEngine&) = delete;
-    const StorageEngine& operator=(const StorageEngine&) = delete;
-};
+    bool _need_write_cluster_id = true;
 
-// DummyStorageEngine is used for ComputeNode, it only stores cluster id.
-class DummyStorageEngine : public StorageEngine {
-    std::string _conf_path;
-    std::unique_ptr<ClusterIdMgr> cluster_id_mgr;
+    // Delta Column Group cache, dcg is short for `Delta Column Group`
+    // This cache just used for non-Primary Key table
+    std::mutex _delta_column_group_cache_lock;
+    std::map<DeltaColumnGroupKey, DeltaColumnGroupList> _delta_column_group_cache;
+    std::unique_ptr<MemTracker> _delta_column_group_cache_mem_tracker;
 
-public:
-    DummyStorageEngine(const EngineOptions& options);
-    static Status open(const EngineOptions& options, StorageEngine** engine_ptr);
-    Status set_cluster_id(int32_t cluster_id) override;
-    Status start_bg_threads() override { return Status::OK(); };
+    mutable std::mutex _schedule_apply_mutex;
+    std::condition_variable _apply_tablet_changed_cv;
+    std::thread _schedule_apply_thread;
+    std::priority_queue<std::pair<std::chrono::steady_clock::time_point, int64_t>,
+                        std::vector<std::pair<std::chrono::steady_clock::time_point, int64_t>>, std::greater<>>
+            _schedule_apply_tasks;
+
+#ifdef USE_STAROS
+    std::unique_ptr<lake::LocalPkIndexManager> _local_pk_index_manager;
+#endif
 };
 
 /// Load min_garbage_sweep_interval and max_garbage_sweep_interval from config,

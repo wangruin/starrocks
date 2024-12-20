@@ -15,13 +15,10 @@
 
 package com.starrocks.rpc;
 
-import com.baidu.bjf.remoting.protobuf.utils.JDKCompilerHelper;
-import com.baidu.bjf.remoting.protobuf.utils.compiler.JdkCompiler;
 import com.baidu.jprotobuf.pbrpc.client.ProtobufRpcProxy;
 import com.baidu.jprotobuf.pbrpc.transport.RpcClient;
 import com.baidu.jprotobuf.pbrpc.transport.RpcClientOptions;
 import com.starrocks.common.Config;
-import com.starrocks.common.util.JdkUtils;
 import com.starrocks.thrift.TNetworkAddress;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,12 +28,6 @@ public class BrpcProxy {
     // TODO: Eviction
     private final ConcurrentHashMap<TNetworkAddress, PBackendService> backendServiceMap;
     private final ConcurrentHashMap<TNetworkAddress, LakeService> lakeServiceMap;
-
-    static {
-        int javaRuntimeVersion = JdkUtils.getJavaVersionAsInteger(System.getProperty("java.version"));
-        JDKCompilerHelper
-                .setCompiler(new JdkCompiler(JdkCompiler.class.getClassLoader(), String.valueOf(javaRuntimeVersion)));
-    }
 
     public BrpcProxy() {
         final RpcClientOptions rpcOptions = new RpcClientOptions();
@@ -72,11 +63,11 @@ public class BrpcProxy {
         return getInstance().getBackendServiceImpl(address);
     }
 
-    public static LakeService getLakeService(TNetworkAddress address) {
+    public static LakeService getLakeService(TNetworkAddress address) throws RpcException {
         return getInstance().getLakeServiceImpl(address);
     }
 
-    public static LakeService getLakeService(String host, int port) {
+    public static LakeService getLakeService(String host, int port) throws RpcException {
         return getInstance().getLakeServiceImpl(new TNetworkAddress(host, port));
     }
 
@@ -84,8 +75,12 @@ public class BrpcProxy {
         return backendServiceMap.computeIfAbsent(address, this::createBackendService);
     }
 
-    protected LakeService getLakeServiceImpl(TNetworkAddress address) {
-        return lakeServiceMap.computeIfAbsent(address, this::createLakeService);
+    protected LakeService getLakeServiceImpl(TNetworkAddress address) throws RpcException {
+        try {
+            return lakeServiceMap.computeIfAbsent(address, this::createLakeService);
+        } catch (Exception e) {
+            throw new RpcException("fail to initialize the LakeService on node " + address.getHostname(), e);
+        }
     }
 
     private PBackendService createBackendService(TNetworkAddress address) {

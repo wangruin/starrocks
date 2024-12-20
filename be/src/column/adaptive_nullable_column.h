@@ -205,7 +205,7 @@ public:
     size_t byte_size(size_t from, size_t size) const override {
         materialized_nullable();
         DCHECK_LE(from + size, this->size()) << "Range error";
-        return _data_column->byte_size(from, size) + _null_column->Column::byte_size(from, size);
+        return _data_column->byte_size(from, size) + _null_column->byte_size(from, size);
     }
 
     size_t byte_size(size_t idx) const override {
@@ -276,9 +276,7 @@ public:
 
     StatusOr<ColumnPtr> upgrade_if_overflow() override {
         materialized_nullable();
-        if (_null_column->capacity_limit_reached()) {
-            return Status::InternalError("Size of NullableColumn exceed the limit");
-        }
+        RETURN_IF_ERROR(_null_column->capacity_limit_reached());
 
         return upgrade_helper_func(&_data_column);
     }
@@ -293,11 +291,11 @@ public:
         return _data_column->has_large_column();
     }
 
-    bool append_strings(const Buffer<Slice>& strs) override;
+    bool append_strings(const Slice* data, size_t size) override;
 
-    bool append_strings_overflow(const Buffer<Slice>& strs, size_t max_length) override;
+    bool append_strings_overflow(const Slice* data, size_t size, size_t max_length) override;
 
-    bool append_continuous_strings(const Buffer<Slice>& strs) override;
+    bool append_continuous_strings(const Slice* data, size_t size) override;
 
     bool append_continuous_fixed_length_strings(const char* data, size_t size, int fixed_length) override;
 
@@ -334,7 +332,7 @@ public:
 
     void append_default(size_t count) override { append_nulls(count); }
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t max_one_element_serialize_size() const override {
         materialized_nullable();
@@ -375,7 +373,7 @@ public:
 
     int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
-    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override;
+    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol = false) const override;
 
     const ColumnPtr& begin_append_not_default_value() const {
         switch (_state) {
@@ -525,7 +523,7 @@ public:
         }
     }
 
-    ColumnPtr replicate(const std::vector<uint32_t>& offsets) override {
+    ColumnPtr replicate(const Buffer<uint32_t>& offsets) override {
         materialized_nullable();
         return NullableColumn::replicate(offsets);
     }
@@ -556,9 +554,9 @@ public:
         return NullableColumn::debug_string();
     }
 
-    bool capacity_limit_reached(std::string* msg = nullptr) const override {
+    Status capacity_limit_reached() const override {
         materialized_nullable();
-        return NullableColumn::capacity_limit_reached(msg);
+        return NullableColumn::capacity_limit_reached();
     }
 
     void check_or_die() const override {

@@ -119,7 +119,7 @@ public:
                     size_t end) const override {
         DCHECK_GT(end, start);
         ResultType result = this->data(state).sum;
-        ResultColumnType* column = down_cast<ResultColumnType*>(dst);
+        auto* column = down_cast<ResultColumnType*>(dst);
         for (size_t i = start; i < end; ++i) {
             column->get_data()[i] = result;
         }
@@ -133,7 +133,7 @@ public:
 
     void batch_serialize(FunctionContext* ctx, size_t chunk_size, const Buffer<AggDataPtr>& agg_states,
                          size_t state_offset, Column* to) const override {
-        ResultColumnType* column = down_cast<ResultColumnType*>(to);
+        auto* column = down_cast<ResultColumnType*>(to);
         Buffer<ResultType>& result_data = column->get_data();
         for (size_t i = 0; i < chunk_size; i++) {
             result_data.emplace_back(this->data(agg_states[i] + state_offset).sum);
@@ -158,8 +158,7 @@ public:
     }
 
     void batch_finalize_with_selection(FunctionContext* ctx, size_t chunk_size, const Buffer<AggDataPtr>& agg_states,
-                                       size_t state_offset, Column* to,
-                                       const std::vector<uint8_t>& selection) const override {
+                                       size_t state_offset, Column* to, const Filter& selection) const override {
         DCHECK(to->is_numeric());
         ResultType values[chunk_size];
         size_t selected_lengh = 0;

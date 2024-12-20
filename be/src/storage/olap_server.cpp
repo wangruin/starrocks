@@ -42,15 +42,22 @@
 #include <string>
 #include <unordered_set>
 
+#include "common/config.h"
 #include "common/status.h"
+#include "fs/fs_util.h"
 #include "storage/compaction.h"
 #include "storage/compaction_manager.h"
+#include "storage/lake/local_pk_index_manager.h"
 #include "storage/lake/update_manager.h"
 #include "storage/olap_common.h"
 #include "storage/olap_define.h"
+#include "storage/persistent_index_compaction_manager.h"
+#include "storage/publish_version_manager.h"
+#include "storage/replication_txn_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
 #include "storage/update_manager.h"
+#include "tablet_meta_manager.h"
 #include "util/gc_helper.h"
 #include "util/thread.h"
 #include "util/time.h"
@@ -78,7 +85,7 @@ Status StorageEngine::start_bg_threads() {
     Thread::set_thread_name(_update_cache_expire_thread, "cache_expire");
 
     _update_cache_evict_thread = std::thread([this] { _update_cache_evict_thread_callback(nullptr); });
-    Thread::set_thread_name(_update_cache_expire_thread, "evict_update_cache");
+    Thread::set_thread_name(_update_cache_evict_thread, "evict_update_cache");
 
     _unused_rowset_monitor_thread = std::thread([this] { _unused_rowset_monitor_thread_callback(nullptr); });
     Thread::set_thread_name(_unused_rowset_monitor_thread, "rowset_monitor");
@@ -91,10 +98,26 @@ Status StorageEngine::start_bg_threads() {
     _disk_stat_monitor_thread = std::thread([this] { _disk_stat_monitor_thread_callback(nullptr); });
     Thread::set_thread_name(_disk_stat_monitor_thread, "disk_monitor");
 
+    _pk_index_major_compaction_thread = std::thread([this] { _pk_index_major_compaction_thread_callback(nullptr); });
+    Thread::set_thread_name(_pk_index_major_compaction_thread, "pk_index_compaction_scheduler");
+
+    _pk_dump_thread = std::thread([this] { _pk_dump_thread_callback(nullptr); });
+    Thread::set_thread_name(_pk_dump_thread, "pk_dump");
+
+#ifdef USE_STAROS
+    _local_pk_index_shared_data_gc_evict_thread =
+            std::thread([this] { _local_pk_index_shared_data_gc_evict_thread_callback(nullptr); });
+    Thread::set_thread_name(_local_pk_index_shared_data_gc_evict_thread, "pk_index_shared_data_gc_evict");
+#endif
+
+    // start thread for check finish publish version
+    _finish_publish_version_thread = std::thread([this] { _finish_publish_version_thread_callback(nullptr); });
+    Thread::set_thread_name(_finish_publish_version_thread, "finish_publish_version");
+
     // convert store map to vector
     std::vector<DataDir*> data_dirs;
     for (auto& tmp_store : _store_map) {
-        data_dirs.push_back(tmp_store.second);
+        data_dirs.push_back(tmp_store.second.get());
     }
     const auto data_dir_num = static_cast<int32_t>(data_dirs.size());
 
@@ -113,7 +136,7 @@ Status StorageEngine::start_bg_threads() {
             max_compaction_concurrency > base_compaction_num_threads + cumulative_compaction_num_threads) {
             max_compaction_concurrency = base_compaction_num_threads + cumulative_compaction_num_threads;
         }
-        Compaction::init(max_compaction_concurrency);
+        (void)Compaction::init(max_compaction_concurrency);
 
         _base_compaction_threads.reserve(base_compaction_num_threads);
         // The config::tablet_map_shard_size is preferably a multiple of `base_compaction_num_threads_per_disk`,
@@ -157,23 +180,10 @@ Status StorageEngine::start_bg_threads() {
             }
         }
     } else {
-        int32_t max_task_num = 0;
-        // new compaction framework
-        if (config::base_compaction_num_threads_per_disk >= 0 &&
-            config::cumulative_compaction_num_threads_per_disk >= 0) {
-            max_task_num = static_cast<int32_t>(StorageEngine::instance()->get_store_num() *
-                                                (config::cumulative_compaction_num_threads_per_disk +
-                                                 config::base_compaction_num_threads_per_disk));
-        } else {
-            // When cumulative_compaction_num_threads_per_disk or config::base_compaction_num_threads_per_disk is less than 0,
-            // there is no limit to _max_task_num if max_compaction_concurrency is also less than 0, and here we set maximum value to be 20.
-            max_task_num = std::min(20, static_cast<int32_t>(StorageEngine::instance()->get_store_num() * 5));
-        }
-        if (config::max_compaction_concurrency > 0 && config::max_compaction_concurrency < max_task_num) {
-            max_task_num = config::max_compaction_concurrency;
-        }
+        _compaction_manager->set_max_compaction_concurrency(config::max_compaction_concurrency);
+        int32_t max_task_num = _compaction_manager->compute_max_compaction_task_num();
 
-        Compaction::init(max_task_num);
+        (void)Compaction::init(max_task_num);
 
         // compaction_manager must init_max_task_num() before any comapction_scheduler starts
         _compaction_manager->init_max_task_num(max_task_num);
@@ -197,6 +207,11 @@ Status StorageEngine::start_bg_threads() {
     _repair_compaction_thread = std::thread([this] { _repair_compaction_thread_callback(nullptr); });
     Thread::set_thread_name(_repair_compaction_thread, "repair_compact");
 
+    for (uint32_t i = 0; i < config::manual_compaction_threads; i++) {
+        _manual_compaction_threads.emplace_back([this] { _manual_compaction_thread_callback(nullptr); });
+        Thread::set_thread_name(_manual_compaction_threads.back(), "manual_compact");
+    }
+
     // tablet checkpoint thread
     for (auto data_dir : data_dirs) {
         _tablet_checkpoint_threads.emplace_back([this, data_dir] { _tablet_checkpoint_callback((void*)data_dir); });
@@ -217,13 +232,24 @@ Status StorageEngine::start_bg_threads() {
         }
     }
 
+    _clear_expired_replcation_snapshots_thread =
+            std::thread([this]() { _clear_expired_replication_snapshots_callback(nullptr); });
+    Thread::set_thread_name(_clear_expired_replcation_snapshots_thread, "clear_expired_replication_snapshots");
+
     if (!config::disable_storage_page_cache) {
         _adjust_cache_thread = std::thread([this] { _adjust_pagecache_callback(nullptr); });
         Thread::set_thread_name(_adjust_cache_thread, "adjust_cache");
     }
 
+    start_schedule_apply_thread();
+
     LOG(INFO) << "All backgroud threads of storage engine have started.";
     return Status::OK();
+}
+
+void StorageEngine::start_schedule_apply_thread() {
+    _schedule_apply_thread = std::thread([this] { _schedule_apply_thread_callback(nullptr); });
+    Thread::set_thread_name(_schedule_apply_thread, "schedule_apply");
 }
 
 void evict_pagecache(StoragePageCache* cache, int64_t bytes_to_dec, std::atomic<bool>& stoped) {
@@ -260,7 +286,7 @@ void* StorageEngine::_adjust_pagecache_callback(void* arg_this) {
         if (config::disable_storage_page_cache) {
             continue;
         }
-        MemTracker* memtracker = ExecEnv::GetInstance()->process_mem_tracker();
+        MemTracker* memtracker = GlobalEnv::GetInstance()->process_mem_tracker();
         if (memtracker == nullptr || !memtracker->has_limit() || cache == nullptr) {
             continue;
         }
@@ -300,7 +326,7 @@ void* StorageEngine::_adjust_pagecache_callback(void* arg_this) {
             size_t bytes_to_dec = dec_advisor->bytes_should_gc(MonoTime::Now(), delta_high);
             evict_pagecache(cache, static_cast<int64_t>(bytes_to_dec), _bg_worker_stopped);
         } else {
-            int64_t max_cache_size = std::max(ExecEnv::GetInstance()->get_storage_page_cache_size(), kcacheMinSize);
+            int64_t max_cache_size = std::max(GlobalEnv::GetInstance()->get_storage_page_cache_size(), kcacheMinSize);
             int64_t cur_cache_size = cache->get_capacity();
             if (cur_cache_size >= max_cache_size) {
                 continue;
@@ -368,6 +394,73 @@ void* StorageEngine::_base_compaction_thread_callback(void* arg, DataDir* data_d
     return nullptr;
 }
 
+void* StorageEngine::_pk_index_major_compaction_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(1);
+        // schedule persistent index compaction
+        if (config::enable_pindex_minor_compaction) {
+            _update_manager->get_pindex_compaction_mgr()->schedule([&]() {
+                return StorageEngine::instance()->tablet_manager()->pick_tablets_to_do_pk_index_major_compaction();
+            });
+#ifdef USE_STAROS
+            auto update_manager = ExecEnv::GetInstance()->lake_update_manager();
+            _local_pk_index_manager->schedule([&]() {
+                return _local_pk_index_manager->pick_tablets_to_do_pk_index_major_compaction(update_manager);
+            });
+#endif
+        }
+    }
+
+    return nullptr;
+}
+
+void* StorageEngine::_pk_dump_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(60);
+        // disable pk dump generation when pk_dump_interval_seconds less than 0
+        if (config::pk_dump_interval_seconds > 0) {
+            auto st = StorageEngine::instance()->tablet_manager()->generate_pk_dump();
+            if (!st.ok()) {
+                LOG(ERROR) << "generate pk dump failed, st: " << st;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+#ifdef USE_STAROS
+void* StorageEngine::_local_pk_index_shared_data_gc_evict_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    auto lake_update_manager = ExecEnv::GetInstance()->lake_update_manager();
+
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(config::pindex_shared_data_gc_evict_interval_seconds);
+        for (DataDir* data_dir : get_stores()) {
+            auto pk_path = data_dir->get_persistent_index_path();
+            std::set<std::string> tablet_ids;
+            Status ret = fs::list_dirs_files(pk_path, &tablet_ids, nullptr);
+            if (!ret.ok()) {
+                LOG(WARNING) << "fail to walk dir. path=[" + pk_path << "] error[" << ret.to_string() << "]";
+                continue;
+            }
+            lake::LocalPkIndexManager::gc(lake_update_manager, data_dir, tablet_ids);
+            lake::LocalPkIndexManager::evict(lake_update_manager, data_dir, tablet_ids);
+        }
+    }
+
+    return nullptr;
+}
+#endif
+
 void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data_dir) {
 #ifdef GOOGLE_PROFILER
     ProfilerRegisterThread();
@@ -380,7 +473,9 @@ void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data
         } else {
             status = Status::InternalError("data dir out of capacity");
         }
-        if (status.ok()) {
+        if (status.ok() && !_options.compaction_mem_tracker->any_limit_exceeded() &&
+            !_options.update_mem_tracker->any_limit_exceeded()) {
+            // keep schedule compaction if memory is fine.
             continue;
         }
 
@@ -391,7 +486,8 @@ void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data
         }
         do {
             SLEEP_IN_BG_WORKER(interval);
-            if (!_options.compaction_mem_tracker->any_limit_exceeded()) {
+            if (!_options.compaction_mem_tracker->any_limit_exceeded() &&
+                !_options.update_mem_tracker->any_limit_exceeded()) {
                 break;
             }
         } while (true);
@@ -426,7 +522,7 @@ void* StorageEngine::_repair_compaction_thread_callback(void* arg) {
             }
             vector<pair<uint32_t, string>> rowset_results;
             for (auto rowsetid : task.second) {
-                auto st = tablet->updates()->compaction(ExecEnv::GetInstance()->compaction_mem_tracker(), {rowsetid});
+                auto st = tablet->updates()->compaction(GlobalEnv::GetInstance()->compaction_mem_tracker(), {rowsetid});
                 if (!st.ok()) {
                     LOG(WARNING) << "repair compaction failed tablet: " << task.first << " rowset: " << rowsetid << " "
                                  << st;
@@ -586,6 +682,29 @@ void* StorageEngine::_disk_stat_monitor_thread_callback(void* arg) {
     return nullptr;
 }
 
+void* StorageEngine::_finish_publish_version_thread_callback(void* arg) {
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        int32_t interval = config::finish_publish_version_internal;
+        {
+            // wait cv for at most one second and then wake up to check if has pending tasks or stopping in progress
+            auto wait_timeout = std::chrono::seconds(1);
+            std::unique_lock<std::mutex> wl(_finish_publish_version_mutex);
+            while (!_publish_version_manager->has_pending_task() &&
+                   !_bg_worker_stopped.load(std::memory_order_consume)) {
+                _finish_publish_version_cv.wait_for(wl, wait_timeout);
+            }
+            _publish_version_manager->finish_publish_version_task();
+            if (interval <= 0) {
+                LOG(WARNING) << "finish_publish_version_internal config is illegal: " << interval << ", force set to 1";
+                interval = 1000;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+    }
+
+    return nullptr;
+}
+
 void* StorageEngine::_cumulative_compaction_thread_callback(void* arg, DataDir* data_dir,
                                                             const std::pair<int32_t, int32_t>& tablet_shards_range) {
 #ifdef GOOGLE_PROFILER
@@ -702,6 +821,12 @@ void* StorageEngine::_path_gc_thread_callback(void* arg) {
         // perform path gc by rowset id
         ((DataDir*)arg)->perform_path_gc_by_rowsetid();
 
+        LOG(INFO) << "try to perform path gc by dcg files!";
+        // perform dcg files gc
+        ((DataDir*)arg)->perform_delta_column_files_gc();
+        // perform crm files gc
+        ((DataDir*)arg)->perform_crm_gc(config::unused_crm_file_threshold_second);
+
         int32_t interval = config::path_gc_check_interval_second;
         if (interval <= 0) {
             LOG(WARNING) << "path gc thread check interval config is illegal:" << interval
@@ -727,12 +852,34 @@ void* StorageEngine::_path_scan_thread_callback(void* arg) {
     while (!_bg_worker_stopped.load(std::memory_order_consume)) {
         LOG(INFO) << "try to perform path scan!";
         ((DataDir*)arg)->perform_path_scan();
+        ((DataDir*)arg)->perform_tmp_path_scan();
 
         int32_t interval = config::path_scan_interval_second;
         if (interval <= 0) {
             LOG(WARNING) << "path gc thread check interval config is illegal:" << interval
                          << "will be forced set to one day";
             interval = 24 * 3600; // one day
+        }
+        SLEEP_IN_BG_WORKER(interval);
+    }
+
+    return nullptr;
+}
+
+void* StorageEngine::_clear_expired_replication_snapshots_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        LOG(INFO) << "try to clear expired replication snapshots!";
+        replication_txn_manager()->clear_expired_snapshots();
+
+        int32_t interval = config::clear_expired_replication_snapshots_interval_seconds;
+        if (interval <= 0) {
+            LOG(WARNING) << "clear expired replication snapshots interval seconds config is illegal:" << interval
+                         << "will be forced set to one hour";
+            interval = 3600; // 1 hour
         }
         SLEEP_IN_BG_WORKER(interval);
     }
@@ -757,6 +904,42 @@ void* StorageEngine::_tablet_checkpoint_callback(void* arg) {
         }
     }
 
+    return nullptr;
+}
+
+void* StorageEngine::_schedule_apply_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        {
+            auto wait_timeout = std::chrono::seconds(1);
+            std::unique_lock<std::mutex> ul(_schedule_apply_mutex);
+            while (_schedule_apply_tasks.empty() && !_bg_worker_stopped.load(std::memory_order_consume)) {
+                _apply_tablet_changed_cv.wait_for(ul, wait_timeout);
+            }
+
+            if (_bg_worker_stopped.load(std::memory_order_consume)) {
+                break;
+            }
+
+            auto time_point = std::chrono::steady_clock::now();
+            while (!_bg_worker_stopped.load(std::memory_order_consume) && !_schedule_apply_tasks.empty() &&
+                   _schedule_apply_tasks.top().first <= time_point) {
+                auto tablet_id = _schedule_apply_tasks.top().second;
+                _schedule_apply_tasks.pop();
+                auto tablet = _tablet_manager->get_tablet(tablet_id);
+                if (tablet == nullptr || tablet->updates() == nullptr) {
+                    continue;
+                }
+                tablet->updates()->check_for_apply();
+            }
+
+            if (!_bg_worker_stopped.load(std::memory_order_consume) && !_schedule_apply_tasks.empty()) {
+                _apply_tablet_changed_cv.wait_until(ul, _schedule_apply_tasks.top().first);
+            }
+        }
+    }
     return nullptr;
 }
 

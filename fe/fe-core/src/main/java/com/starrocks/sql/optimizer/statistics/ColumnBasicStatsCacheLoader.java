@@ -16,14 +16,15 @@ package com.starrocks.sql.optimizer.statistics;
 
 import com.github.benmanes.caffeine.cache.AsyncCacheLoader;
 import com.google.common.collect.ImmutableList;
-import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.util.DateUtils;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
@@ -44,6 +45,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 
+import static com.starrocks.catalog.InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
 import static com.starrocks.sql.optimizer.Utils.getLongFromDateTime;
 
 public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStatsCacheKey, Optional<ColumnStatistic>> {
@@ -54,6 +56,9 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
     public @NonNull CompletableFuture<Optional<ColumnStatistic>> asyncLoad(@NonNull ColumnStatsCacheKey cacheKey,
                                                                            @NonNull Executor executor) {
         return CompletableFuture.supplyAsync(() -> {
+            if (FeConstants.enableUnitStatistics) {
+                return Optional.empty();
+            }
             try {
                 ConnectContext connectContext = StatisticUtils.buildConnectContext();
                 connectContext.setThreadLocalInfo();
@@ -68,6 +73,8 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
                 throw e;
             } catch (Exception e) {
                 throw new CompletionException(e);
+            } finally {
+                ConnectContext.remove();
             }
         }, executor);
     }
@@ -76,7 +83,13 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
     public CompletableFuture<Map<@NonNull ColumnStatsCacheKey, @NonNull Optional<ColumnStatistic>>> asyncLoadAll(
             @NonNull Iterable<? extends @NonNull ColumnStatsCacheKey> keys, @NonNull Executor executor) {
         return CompletableFuture.supplyAsync(() -> {
-
+            if (FeConstants.enableUnitStatistics) {
+                Map<ColumnStatsCacheKey, Optional<ColumnStatistic>> result = new HashMap<>();
+                for (ColumnStatsCacheKey key : keys) {
+                    result.put(key, Optional.empty());
+                }
+                return result;
+            }
             try {
                 long tableId = -1;
                 List<String> columns = new ArrayList<>();
@@ -105,6 +118,8 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
                 throw e;
             } catch (Exception e) {
                 throw new CompletionException(e);
+            } finally {
+                ConnectContext.remove();
             }
         }, executor);
     }
@@ -125,24 +140,28 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
     }
 
     private ColumnStatistic convert2ColumnStatistics(TStatisticData statisticData) throws AnalysisException {
-        Database db = GlobalStateMgr.getCurrentState().getDb(statisticData.dbId);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(statisticData.dbId);
         MetaUtils.checkDbNullAndReport(db, String.valueOf(statisticData.dbId));
-        Table table = db.getTable(statisticData.tableId);
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), statisticData.tableId);
         if (!(table instanceof OlapTable)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_TABLE_ERROR, statisticData.tableId);
         }
-        Column column = table.getColumn(statisticData.columnName);
-        if (column == null) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_FIELD_ERROR, statisticData.columnName);
-        }
 
+        Type columnType = StatisticUtils.getQueryStatisticsColumnType(table, statisticData.columnName);
+        return buildColumnStatistics(statisticData, DEFAULT_INTERNAL_CATALOG_NAME, db.getFullName(), table.getName(),
+                statisticData.columnName, columnType);
+    }
+
+    public static ColumnStatistic buildColumnStatistics(TStatisticData statisticData, String catalog, String db,
+                                                 String table, String columnName, Type columnType) {
         ColumnStatistic.Builder builder = ColumnStatistic.builder();
         double minValue = Double.NEGATIVE_INFINITY;
         double maxValue = Double.POSITIVE_INFINITY;
+        double distinctValues = statisticData.countDistinct;
         try {
-            if (column.getPrimitiveType().isCharFamily()) {
+            if (columnType.getPrimitiveType().isCharFamily()) {
                 // do nothing
-            } else if (column.getPrimitiveType().equals(PrimitiveType.DATE)) {
+            } else if (columnType.getPrimitiveType().equals(PrimitiveType.DATE)) {
                 if (statisticData.isSetMin() && !statisticData.getMin().isEmpty()) {
                     minValue = (double) getLongFromDateTime(DateUtils.parseStringWithDefaultHSM(
                             statisticData.min, DateUtils.DATE_FORMATTER_UNIX));
@@ -151,14 +170,12 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
                     maxValue = (double) getLongFromDateTime(DateUtils.parseStringWithDefaultHSM(
                             statisticData.max, DateUtils.DATE_FORMATTER_UNIX));
                 }
-            } else if (column.getPrimitiveType().equals(PrimitiveType.DATETIME)) {
+            } else if (columnType.getPrimitiveType().equals(PrimitiveType.DATETIME)) {
                 if (statisticData.isSetMin() && !statisticData.getMin().isEmpty()) {
-                    minValue = (double) getLongFromDateTime(DateUtils.parseStringWithDefaultHSM(
-                            statisticData.min, DateUtils.DATE_TIME_FORMATTER_UNIX));
+                    minValue = (double) getLongFromDateTime(DateUtils.parseDatTimeString(statisticData.min));
                 }
                 if (statisticData.isSetMax() && !statisticData.getMax().isEmpty()) {
-                    maxValue = (double) getLongFromDateTime(DateUtils.parseStringWithDefaultHSM(
-                            statisticData.max, DateUtils.DATE_TIME_FORMATTER_UNIX));
+                    maxValue = (double) getLongFromDateTime(DateUtils.parseDatTimeString(statisticData.max));
                 }
             } else {
                 if (statisticData.isSetMin() && !statisticData.getMin().isEmpty()) {
@@ -169,13 +186,24 @@ public class ColumnBasicStatsCacheLoader implements AsyncCacheLoader<ColumnStats
                 }
             }
         } catch (Exception e) {
-            LOG.warn("convert TStatisticData to ColumnStatistics failed, db : {}, table : {}, column : {}, errMsg : {}",
-                    db.getFullName(), table.getName(), column.getName(), e.getMessage());
+            LOG.warn("convert TStatisticData to ColumnStatistics failed, catalog: {}, db : {}, table : {}, " +
+                            "column : {}, errMsg : {}", catalog, db, table, columnName, e.getMessage());
+        }
+
+        if (minValue > maxValue) {
+            LOG.warn("Min: {}, Max: {} values abnormal for catalog : {}, db : {}, table : {}, column : {}",
+                    minValue, maxValue, catalog, db, table, columnName);
+            minValue = Double.NEGATIVE_INFINITY;
+            maxValue = Double.POSITIVE_INFINITY;
+        }
+
+        if (distinctValues <= 0) {
+            distinctValues = 1;
         }
 
         return builder.setMinValue(minValue).
                 setMaxValue(maxValue).
-                setDistinctValuesCount(statisticData.countDistinct).
+                setDistinctValuesCount(distinctValues).
                 setAverageRowSize(statisticData.dataSize / Math.max(statisticData.rowCount, 1)).
                 setNullsFraction(statisticData.nullCount * 1.0 / Math.max(statisticData.rowCount, 1)).build();
     }

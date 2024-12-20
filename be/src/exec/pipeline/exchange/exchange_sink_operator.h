@@ -75,6 +75,8 @@ public:
 
     Status push_chunk(RuntimeState* state, const ChunkPtr& chunk) override;
 
+    void update_metrics(RuntimeState* state) override;
+
     // For the first chunk , serialize the chunk data and meta to ChunkPB both.
     // For other chunk, only serialize the chunk data to ChunkPB.
     Status serialize_chunk(const Chunk* chunk, ChunkPB* dst, bool* is_first_chunk, int num_receivers = 1);
@@ -144,7 +146,7 @@ private:
     int32_t _encode_level = 0;
     // Will set in prepare
     int32_t _be_number = 0;
-    phmap::flat_hash_map<int64_t, std::unique_ptr<Channel>> _instance_id2channel;
+    phmap::flat_hash_map<int64_t, std::unique_ptr<Channel>, StdHash<int64_t>> _instance_id2channel;
     std::vector<Channel*> _channels;
     // index list for channels
     // We need a random order of sending channels to avoid rpc blocking at the same time.
@@ -172,9 +174,14 @@ private:
 
     RuntimeProfile::Counter* _serialize_chunk_timer = nullptr;
     RuntimeProfile::Counter* _shuffle_hash_timer = nullptr;
+    RuntimeProfile::Counter* _shuffle_chunk_append_counter = nullptr;
+    RuntimeProfile::Counter* _shuffle_chunk_append_timer = nullptr;
     RuntimeProfile::Counter* _compress_timer = nullptr;
     RuntimeProfile::Counter* _bytes_pass_through_counter = nullptr;
-    RuntimeProfile::Counter* _uncompressed_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _sender_input_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _serialized_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _compressed_bytes_counter = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _pass_through_buffer_peak_mem_usage = nullptr;
 
     std::atomic<bool> _is_finished = false;
     std::atomic<bool> _is_cancelled = false;

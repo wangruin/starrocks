@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "storage/memtable.h"
 #include "storage/olap_define.h"
 #include "util/spinlock.h"
 #include "util/threadpool.h"
@@ -53,10 +54,11 @@ class MemTable;
 // the statistic of a certain flush handler.
 // use atomic because it may be updated by multi threads
 struct FlushStatistic {
-    int64_t flush_time_ns = 0;
     int64_t flush_count = 0;
-    int64_t flush_size_bytes = 0;
     int64_t cur_flush_count = 0;
+    std::atomic<int64_t> queueing_memtable_num = 0;
+    int64_t pending_time_ns = 0;
+    MemtableStats memtable_stats;
 };
 
 std::ostream& operator<<(std::ostream& os, const FlushStatistic& stat);
@@ -94,9 +96,14 @@ public:
     }
 
     void set_status(const Status& status) {
-        if (status.ok()) return;
+        if (status.ok()) {
+            return;
+        }
+
         std::lock_guard l(_status_lock);
-        if (_status.ok()) _status = status;
+        if (_status.ok()) {
+            _status = status;
+        }
     }
 
 private:
@@ -132,12 +139,18 @@ public:
     // because it needs path hash of each data dir.
     Status init(const std::vector<DataDir*>& data_dirs);
 
+    Status init_for_lake_table(const std::vector<DataDir*>& data_dirs);
+
+    static int calc_max_threads_for_lake_table(const std::vector<DataDir*>& data_dirs);
+
     // dynamic update max threads num
     Status update_max_threads(int max_threads);
 
     // NOTE: we use SERIAL mode here to ensure all mem-tables from one tablet are flushed in order.
     std::unique_ptr<FlushToken> create_flush_token(
             ThreadPool::ExecutionMode execution_mode = ThreadPool::ExecutionMode::SERIAL);
+
+    ThreadPool* get_thread_pool() { return _flush_pool.get(); }
 
 private:
     std::unique_ptr<ThreadPool> _flush_pool;

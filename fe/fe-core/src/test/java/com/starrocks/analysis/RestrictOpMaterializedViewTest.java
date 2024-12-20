@@ -16,10 +16,8 @@
 package com.starrocks.analysis;
 
 import com.google.common.collect.Maps;
-import com.starrocks.common.Config;
-import com.starrocks.common.FeConstants;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.load.DeleteHandler;
+import com.starrocks.load.DeleteMgr;
 import com.starrocks.load.routineload.KafkaRoutineLoadJob;
 import com.starrocks.load.routineload.LoadDataSourceType;
 import com.starrocks.qe.ConnectContext;
@@ -46,12 +44,8 @@ public class RestrictOpMaterializedViewTest {
 
     @BeforeClass
     public static void setUp() throws Exception {
-        FeConstants.runningUnitTest = true;
-        FeConstants.default_scheduler_interval_millisecond = 100;
-        Config.dynamic_partition_enable = true;
-        Config.dynamic_partition_check_interval_seconds = 1;
-        Config.enable_experimental_mv = true;
         UtFrameUtils.createMinStarRocksCluster();
+        // set default config for async mvs
         String createTblStmtStr =
                 "CREATE TABLE tbl1\n" +
                         "(\n" +
@@ -75,6 +69,10 @@ public class RestrictOpMaterializedViewTest {
                 ") " +
                 "as select tbl1.k1 ss, k2 from tbl1;";
         ctx = UtFrameUtils.createDefaultCtx();
+
+        // set default config for async mvs
+        UtFrameUtils.setDefaultConfigForAsyncMVTest(ctx);
+
         starRocksAssert = new StarRocksAssert(ctx);
         starRocksAssert.withDatabase("db1").useDatabase("db1");
         starRocksAssert.withTable(createTblStmtStr);
@@ -119,7 +117,7 @@ public class RestrictOpMaterializedViewTest {
         String sql1 = "delete from db1.mv1 where k2 = 3;";
         try {
             StatementBase statementBase = UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
-            DeleteHandler deleteHandler = new DeleteHandler();
+            DeleteMgr deleteHandler = new DeleteMgr();
             deleteHandler.process((DeleteStmt) statementBase);
             Assert.fail();
         } catch (Exception e) {

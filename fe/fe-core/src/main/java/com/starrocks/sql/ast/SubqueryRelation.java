@@ -15,9 +15,11 @@
 package com.starrocks.sql.ast;
 
 import com.starrocks.analysis.Expr;
+import com.starrocks.sql.analyzer.FieldId;
 import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
+import java.util.Map;
 
 public class SubqueryRelation extends QueryRelation {
     private final QueryStatement queryStatement;
@@ -36,6 +38,11 @@ public class SubqueryRelation extends QueryRelation {
         }
     }
 
+    @Override
+    public Map<Expr, FieldId> getColumnReferences() {
+        return queryStatement.getQueryRelation().getColumnReferences();
+    }
+
     public QueryStatement getQueryStatement() {
         return queryStatement;
     }
@@ -43,6 +50,10 @@ public class SubqueryRelation extends QueryRelation {
     @Override
     public String toString() {
         return alias == null ? "anonymous" : alias.toString();
+    }
+
+    public boolean isAnonymous() {
+        return alias == null;
     }
 
     @Override

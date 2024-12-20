@@ -18,7 +18,9 @@
 
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
+#include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
+#include "exprs/function_helper.h"
 #include "gutil/bits.h"
 #include "gutil/casts.h"
 #include "gutil/strings/fastmem.h"
@@ -61,7 +63,7 @@ size_t ArrayColumn::byte_size(size_t from, size_t size) const {
     DCHECK_LE(from + size, this->size()) << "Range error";
     return _elements->byte_size(_offsets->get_data()[from],
                                 _offsets->get_data()[from + size] - _offsets->get_data()[from]) +
-           _offsets->Column::byte_size(from, size);
+           _offsets->byte_size(from, size);
 }
 
 size_t ArrayColumn::byte_size(size_t idx) const {
@@ -70,6 +72,7 @@ size_t ArrayColumn::byte_size(size_t idx) const {
 }
 
 void ArrayColumn::reserve(size_t n) {
+    _elements->reserve(n);
     _offsets->reserve(n + 1);
 }
 
@@ -148,6 +151,7 @@ bool ArrayColumn::append_nulls(size_t count) {
     return false;
 }
 
+// append an empty array []
 void ArrayColumn::append_default() {
     _offsets->append(_offsets->get_data().back());
 }
@@ -169,7 +173,7 @@ void ArrayColumn::fill_default(const Filter& filter) {
     update_rows(*default_column, indexes.data());
 }
 
-Status ArrayColumn::update_rows(const Column& src, const uint32_t* indexes) {
+void ArrayColumn::update_rows(const Column& src, const uint32_t* indexes) {
     const auto& array_column = down_cast<const ArrayColumn&>(src);
 
     const UInt32Column& src_offsets = array_column.offsets();
@@ -192,7 +196,7 @@ Status ArrayColumn::update_rows(const Column& src, const uint32_t* indexes) {
                 element_idxes.emplace_back(element_offset + j);
             }
         }
-        RETURN_IF_ERROR(_elements->update_rows(array_column.elements(), element_idxes.data()));
+        _elements->update_rows(array_column.elements(), element_idxes.data());
     } else {
         MutableColumnPtr new_array_column = clone_empty();
         size_t idx_begin = 0;
@@ -208,8 +212,20 @@ Status ArrayColumn::update_rows(const Column& src, const uint32_t* indexes) {
         }
         swap_column(*new_array_column.get());
     }
+}
 
-    return Status::OK();
+void ArrayColumn::remove_first_n_values(size_t count) {
+    if (count >= _offsets->size()) {
+        count = _offsets->size() - 1;
+    }
+
+    size_t offset = _offsets->get_data()[count];
+    _elements->remove_first_n_values(offset);
+    _offsets->remove_first_n_values(count);
+
+    for (size_t i = 0; i < _offsets->size(); i++) {
+        _offsets->get_data()[i] -= offset;
+    }
 }
 
 uint32_t ArrayColumn::serialize(size_t idx, uint8_t* pos) {
@@ -384,7 +400,7 @@ int ArrayColumn::compare_at(size_t left, size_t right, const Column& right_colum
     return lhs_size < rhs_size ? -1 : (lhs_size == rhs_size ? 0 : 1);
 }
 
-bool ArrayColumn::equals(size_t left, const Column& rhs, size_t right) const {
+int ArrayColumn::equals(size_t left, const Column& rhs, size_t right, bool safe_eq) const {
     const auto& rhs_array = down_cast<const ArrayColumn&>(rhs);
 
     size_t lhs_offset = _offsets->get_data()[left];
@@ -394,36 +410,38 @@ bool ArrayColumn::equals(size_t left, const Column& rhs, size_t right) const {
     size_t rhs_end = rhs_array._offsets->get_data()[right + 1];
 
     if (lhs_end - lhs_offset != rhs_end - rhs_offset) {
-        return false;
+        return EQUALS_FALSE;
     }
-    auto lhs_elements = ColumnHelper::get_data_column(_elements.get());
-    auto rhs_elements = ColumnHelper::get_data_column(rhs_array._elements.get());
+
+    int ret = EQUALS_TRUE;
     while (lhs_offset < lhs_end) {
-        if (_elements->is_null(lhs_offset)) {
-            if (!rhs_array._elements->is_null(rhs_offset)) {
-                return false;
-            }
-        } else {
-            if (rhs_array._elements->is_null(rhs_offset)) {
-                return false;
-            }
-            if (!lhs_elements->equals(lhs_offset, *rhs_elements, rhs_offset)) {
-                return false;
-            }
+        auto tmp = _elements->equals(lhs_offset, *(rhs_array._elements.get()), rhs_offset, safe_eq);
+
+        // return directly if false
+        if (tmp == EQUALS_FALSE) {
+            return EQUALS_FALSE;
+        } else if (tmp == EQUALS_NULL) {
+            // need check all if is null
+            ret = EQUALS_NULL;
         }
+
         lhs_offset++;
         rhs_offset++;
     }
-    return true;
+
+    return safe_eq ? EQUALS_TRUE : ret;
 }
 
 void ArrayColumn::compare_column(const Column& rhs_column, std::vector<int8_t>* output) const {
-    CHECK(size() == rhs_column.size()) << "Two input columns must have same rows";
+    if (size() != rhs_column.size()) {
+        throw std::runtime_error("Two input columns in comparison must have same rows");
+    }
 
     size_t rows = size();
     output->resize(rows);
     for (size_t i = 0; i < rows; i++) {
-        (*output)[i] = static_cast<int8_t>(compare_at(i, i, rhs_column, 1));
+        int res = compare_at(i, i, rhs_column, 1);
+        (*output)[i] = (res > 0) - (res < 0);
     }
 }
 
@@ -482,7 +500,7 @@ int64_t ArrayColumn::xor_checksum(uint32_t from, uint32_t to) const {
     return (xor_checksum ^ _elements->xor_checksum(element_from, element_to));
 }
 
-void ArrayColumn::put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const {
+void ArrayColumn::put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol) const {
     DCHECK_LT(idx, size());
     const size_t offset = _offsets->get_data()[idx];
     const size_t array_size = _offsets->get_data()[idx + 1] - offset;
@@ -571,12 +589,14 @@ std::string ArrayColumn::debug_item(size_t idx) const {
 
 std::string ArrayColumn::debug_string() const {
     std::stringstream ss;
+    ss << "[";
     for (size_t i = 0; i < size(); ++i) {
         if (i > 0) {
             ss << ", ";
         }
         ss << debug_item(i);
     }
+    ss << "]";
     return ss.str();
 }
 
@@ -597,5 +617,85 @@ Status ArrayColumn::unfold_const_children(const starrocks::TypeDescriptor& type)
     _elements = ColumnHelper::unfold_const_column(type.children[0], _elements->size(), _elements);
     return Status::OK();
 }
+
+size_t ArrayColumn::get_total_elements_num(const NullColumnPtr& null_column) const {
+    if (null_column == nullptr) {
+        return _elements->size();
+    }
+    DCHECK_LE(_offsets->size() - 1, null_column->size());
+    size_t elements_num = 0;
+    size_t num_rows = _offsets->size() - 1;
+    const auto& null_data = null_column->get_data();
+    for (size_t i = 0; i < num_rows; i++) {
+        if (!null_data[i]) {
+            elements_num += _offsets->get_data()[i + 1] - _offsets->get_data()[i];
+        }
+    }
+    return elements_num;
+}
+
+template <bool ConstV1, bool ConstV2, bool IgnoreNull>
+bool ArrayColumn::compare_lengths_from_offsets(const UInt32Column& v1, const UInt32Column& v2,
+                                               const NullColumnPtr& null_column) {
+    [[maybe_unused]] uint8_t* null_data = nullptr;
+    if constexpr (!IgnoreNull) {
+        null_data = null_column->get_data().data();
+    }
+
+    size_t num_rows = v1.size() - 1;
+    if constexpr (ConstV1 && ConstV2) {
+        // if both are const column, we only compare the first row once
+        num_rows = 1;
+    }
+    bool result = true;
+    const auto& offsets_v1 = v1.get_data();
+    const auto& offsets_v2 = v2.get_data();
+
+    for (size_t i = 0; i < num_rows && result; i++) {
+        [[maybe_unused]] uint32_t len1 =
+                (ConstV1) ? (offsets_v1[1] - offsets_v1[0]) : (offsets_v1[i + 1] - offsets_v1[i]);
+        [[maybe_unused]] uint32_t len2 =
+                (ConstV2) ? (offsets_v2[1] - offsets_v2[0]) : (offsets_v2[i + 1] - offsets_v2[i]);
+        if constexpr (IgnoreNull) {
+            result &= (len1 == len2);
+        } else {
+            if (!null_data[i]) {
+                result &= (len1 == len2);
+            }
+        }
+    }
+    return result;
+}
+
+template <bool IgnoreNull>
+bool ArrayColumn::is_all_array_lengths_equal(const ColumnPtr& v1, const ColumnPtr& v2,
+                                             const NullColumnPtr& null_column) {
+    DCHECK(v1->is_array() && v2->is_array());
+    DCHECK(!v1->is_nullable() && !v2->is_nullable());
+
+    if (v1->size() != v2->size()) {
+        return false;
+    }
+    auto data_v1 = FunctionHelper::get_data_column_of_const(v1);
+    auto data_v2 = FunctionHelper::get_data_column_of_const(v2);
+    auto* array_v1 = down_cast<ArrayColumn*>(data_v1.get());
+    auto* array_v2 = down_cast<ArrayColumn*>(data_v2.get());
+    const auto& offsets_v1 = array_v1->offsets();
+    const auto& offsets_v2 = array_v2->offsets();
+    if (v1->is_constant() && v2->is_constant()) {
+        return compare_lengths_from_offsets<true, true, IgnoreNull>(offsets_v1, offsets_v2, null_column);
+    } else if (v1->is_constant() && !v2->is_constant()) {
+        return compare_lengths_from_offsets<true, false, IgnoreNull>(offsets_v1, offsets_v2, null_column);
+    } else if (!v1->is_constant() && v2->is_constant()) {
+        return compare_lengths_from_offsets<false, true, IgnoreNull>(offsets_v1, offsets_v2, null_column);
+    }
+
+    return compare_lengths_from_offsets<false, false, IgnoreNull>(offsets_v1, offsets_v2, null_column);
+}
+
+template bool ArrayColumn::is_all_array_lengths_equal<true>(const ColumnPtr& v1, const ColumnPtr& v2,
+                                                            const NullColumnPtr& null_data);
+template bool ArrayColumn::is_all_array_lengths_equal<false>(const ColumnPtr& v1, const ColumnPtr& v2,
+                                                             const NullColumnPtr& null_data);
 
 } // namespace starrocks

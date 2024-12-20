@@ -14,7 +14,11 @@
 
 #include "formats/parquet/encoding.h"
 
+#include <iterator>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 #include "formats/parquet/encoding_dict.h"
 #include "formats/parquet/encoding_plain.h"
@@ -94,9 +98,6 @@ private:
         std::unique_ptr<EncodingInfo> info(new EncodingInfo(traits));
         _encoding_map.emplace(key, info.release());
     }
-
-    // Add fixed length byte array
-    void _add_flba_map() {}
 
     std::unordered_map<TypeEncodingPair, EncodingInfo*, EncodingMapHash> _encoding_map;
 };

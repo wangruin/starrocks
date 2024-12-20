@@ -40,35 +40,40 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.BrokerDesc;
-import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.LiteralExpr;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
 import com.starrocks.catalog.FunctionSet;
-import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.SparkResource;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.Pair;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.LoadPriority;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.load.BrokerFileGroup;
 import com.starrocks.load.BrokerFileGroupAggInfo.FileGroupAggKey;
 import com.starrocks.load.FailMsg;
 import com.starrocks.load.Load;
+import com.starrocks.load.PartitionUtils;
+import com.starrocks.load.PartitionUtils.RangePartitionBoundary;
 import com.starrocks.load.loadv2.etl.EtlJobConfig;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlColumn;
 import com.starrocks.load.loadv2.etl.EtlJobConfig.EtlColumnMapping;
@@ -83,8 +88,7 @@ import com.starrocks.load.loadv2.etl.EtlJobConfig.SourceType;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.ImportColumnDesc;
-import com.starrocks.sql.common.ErrorType;
-import com.starrocks.sql.common.StarRocksPlannerException;
+import com.starrocks.sql.common.MetaUtils;
 import com.starrocks.transaction.TransactionState;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -92,6 +96,7 @@ import org.apache.logging.log4j.Logger;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 // 1. create etl job config and write it into jobconfig.json file
 // 2. submit spark etl job
@@ -112,7 +117,6 @@ public class SparkLoadPendingTask extends LoadTask {
                                 Map<FileGroupAggKey, List<BrokerFileGroup>> aggKeyToBrokerFileGroups,
                                 SparkResource resource, BrokerDesc brokerDesc) {
         super(loadTaskCallback, TaskType.PENDING, LoadPriority.NORMAL_VALUE);
-        this.retryTime = 3;
         this.attachment = new SparkPendingTaskAttachment(signature);
         this.aggKeyToBrokerFileGroups = aggKeyToBrokerFileGroups;
         this.resource = resource;
@@ -139,8 +143,9 @@ public class SparkLoadPendingTask extends LoadTask {
 
         // handler submit etl job
         SparkEtlJobHandler handler = new SparkEtlJobHandler();
+        Long sparkLoadSubmitTimeout = ((SparkLoadJob) callback).sparkLoadSubmitTimeoutSecond;
         handler.submitEtlJob(loadJobId, loadLabel, etlJobConfig, resource, brokerDesc, sparkLoadAppHandle,
-                sparkAttachment);
+                sparkAttachment, sparkLoadSubmitTimeout);
         LOG.info("submit spark etl job success. load job id: {}, attachment: {}", loadJobId, sparkAttachment);
     }
 
@@ -150,13 +155,14 @@ public class SparkLoadPendingTask extends LoadTask {
     }
 
     private void createEtlJobConf() throws LoadException {
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
         if (db == null) {
             throw new LoadException("db does not exist. id: " + dbId);
         }
 
         Map<Long, EtlTable> tables = Maps.newHashMap();
-        db.readLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(db.getId(), LockType.READ);
         try {
             Map<Long, Set<Long>> tableIdToPartitionIds = Maps.newHashMap();
             Set<Long> allPartitionsTableIds = Sets.newHashSet();
@@ -166,7 +172,7 @@ public class SparkLoadPendingTask extends LoadTask {
                 FileGroupAggKey aggKey = entry.getKey();
                 long tableId = aggKey.getTableId();
 
-                OlapTable table = (OlapTable) db.getTable(tableId);
+                OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
                 if (table == null) {
                     throw new LoadException("table does not exist. id: " + tableId);
                 }
@@ -184,7 +190,7 @@ public class SparkLoadPendingTask extends LoadTask {
                     tables.put(tableId, etlTable);
 
                     // add table indexes to transaction state
-                    TransactionState txnState = GlobalStateMgr.getCurrentGlobalTransactionMgr()
+                    TransactionState txnState = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
                             .getTransactionState(dbId, transactionId);
                     if (txnState == null) {
                         throw new LoadException("txn does not exist. id: " + transactionId);
@@ -198,7 +204,7 @@ public class SparkLoadPendingTask extends LoadTask {
                 }
             }
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db.getId(), LockType.READ);
         }
 
         String outputFilePattern = EtlJobConfig.getOutputFilePattern(loadLabel, FilePatternVersion.V1);
@@ -217,7 +223,7 @@ public class SparkLoadPendingTask extends LoadTask {
                 continue;
             }
 
-            OlapTable table = (OlapTable) db.getTable(tableId);
+            OlapTable table = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
             if (table == null) {
                 throw new LoadException("table does not exist. id: " + tableId);
             }
@@ -348,99 +354,118 @@ public class SparkLoadPendingTask extends LoadTask {
 
         List<String> partitionColumnRefs = Lists.newArrayList();
         List<EtlPartition> etlPartitions = Lists.newArrayList();
-        if (type == PartitionType.RANGE) {
-            RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) table.getPartitionInfo();
-            for (Column column : rangePartitionInfo.getPartitionColumns()) {
-                partitionColumnRefs.add(column.getName());
-            }
-
-            List<Map.Entry<Long, Range<PartitionKey>>> sortedRanges = null;
-            try {
-                sortedRanges = rangePartitionInfo.getSortedRangeMap(partitionIds);
-            } catch (AnalysisException e) {
-                throw new LoadException(e.getMessage());
-            }
-            for (Map.Entry<Long, Range<PartitionKey>> entry : sortedRanges) {
-                long partitionId = entry.getKey();
-                Partition partition = table.getPartition(partitionId);
-                if (partition == null) {
-                    throw new LoadException("partition does not exist. id: " + partitionId);
-                }
-
-                // bucket num
-                int bucketNum = partition.getDistributionInfo().getBucketNum();
-
-                // is min|max partition
-                Range<PartitionKey> range = entry.getValue();
-                boolean isMaxPartition = range.upperEndpoint().isMaxValue();
-                boolean isMinPartition = range.lowerEndpoint().isMinValue();
-
-                // start keys
-                List<LiteralExpr> rangeKeyExprs = null;
-                List<Object> startKeys = Lists.newArrayList();
-                if (!isMinPartition) {
-                    rangeKeyExprs = range.lowerEndpoint().getKeys();
-                    for (int i = 0; i < rangeKeyExprs.size(); ++i) {
-                        LiteralExpr literalExpr = rangeKeyExprs.get(i);
-
-                        Object keyValue;
-                        if (literalExpr instanceof DateLiteral) {
-                            keyValue = convertDateLiteralToNumber((DateLiteral) literalExpr);
-                        } else {
-                            keyValue = literalExpr.getRealObjectValue();
-                        }
-
-                        startKeys.add(keyValue);
-                    }
-                }
-
-                // end keys
-                // is empty list when max partition
-                List<Object> endKeys = Lists.newArrayList();
-                if (!isMaxPartition) {
-                    rangeKeyExprs = range.upperEndpoint().getKeys();
-                    for (int i = 0; i < rangeKeyExprs.size(); ++i) {
-                        LiteralExpr literalExpr = rangeKeyExprs.get(i);
-
-                        Object keyValue;
-                        if (literalExpr instanceof DateLiteral) {
-                            keyValue = convertDateLiteralToNumber((DateLiteral) literalExpr);
-                        } else {
-                            keyValue = literalExpr.getRealObjectValue();
-                        }
-                        endKeys.add(keyValue);
-                    }
-                }
-
-                etlPartitions.add(new EtlPartition(partitionId, startKeys, endKeys, isMinPartition, isMaxPartition, bucketNum));
-            }
-        } else {
-            Preconditions.checkState(type == PartitionType.UNPARTITIONED);
-            Preconditions.checkState(partitionIds.size() == 1);
-
-            for (Long partitionId : partitionIds) {
-                Partition partition = table.getPartition(partitionId);
-                if (partition == null) {
-                    throw new LoadException("partition does not exist. id: " + partitionId);
-                }
-
-                // bucket num
-                int bucketNum = partition.getDistributionInfo().getBucketNum();
-
-                etlPartitions.add(new EtlPartition(partitionId, Lists.newArrayList(), Lists.newArrayList(),
-                        true, true, bucketNum));
-            }
+        switch (type) {
+            case RANGE:
+                etlPartitions = initEtlRangePartition(partitionColumnRefs, table, partitionIds);
+                break;
+            case LIST:
+                etlPartitions = initEtlListPartition(partitionColumnRefs, table, partitionIds);
+                break;
+            case UNPARTITIONED:
+                etlPartitions = initEtlUnPartitioned(table, partitionIds);
+                break;
         }
 
         // distribution column refs
-        List<String> distributionColumnRefs = Lists.newArrayList();
         DistributionInfo distributionInfo = table.getDefaultDistributionInfo();
         Preconditions.checkState(distributionInfo.getType() == DistributionInfoType.HASH);
-        for (Column column : ((HashDistributionInfo) distributionInfo).getDistributionColumns()) {
-            distributionColumnRefs.add(column.getName());
-        }
+        List<String> distributionColumnRefs = MetaUtils.getColumnNamesByColumnIds(
+                table.getIdToColumn(), distributionInfo.getDistributionColumns());
 
         return new EtlPartitionInfo(type.typeString, partitionColumnRefs, distributionColumnRefs, etlPartitions);
+    }
+
+    private List<EtlPartition> initEtlListPartition(
+            List<String> partitionColumnRefs, OlapTable table, Set<Long> partitionIds) throws LoadException {
+        ListPartitionInfo listPartitionInfo = (ListPartitionInfo) table.getPartitionInfo();
+        partitionColumnRefs.addAll(table.getPartitionInfo().getPartitionColumns(table.getIdToColumn()).
+                stream().map(Column::getName).collect(Collectors.toList()));
+        List<EtlPartition> etlPartitions = Lists.newArrayList();
+        Map<Long, List<List<LiteralExpr>>> multiLiteralExprValues = listPartitionInfo.getMultiLiteralExprValues();
+        Map<Long, List<LiteralExpr>> literalExprValues = listPartitionInfo.getLiteralExprValues();
+        for (Long partitionId : partitionIds) {
+            Partition partition = table.getPartition(partitionId);
+            if (partition == null) {
+                throw new LoadException("partition does not exist. id: " + partitionId);
+            }
+            // bucket num
+            int bucketNum = partition.getDistributionInfo().getBucketNum();
+            // list partition values
+            List<List<Object>> inKeys = PartitionUtils.calListPartitionKeys(
+                    multiLiteralExprValues.get(partitionId),
+                    literalExprValues.get(partitionId)
+            );
+
+            for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
+                long physicalPartitionId = physicalPartition.getId();
+                etlPartitions.add(new EtlPartition(physicalPartitionId, inKeys, bucketNum));
+            }
+        }
+        return etlPartitions;
+    }
+
+    private List<EtlPartition> initEtlRangePartition(
+            List<String> partitionColumnRefs, OlapTable table, Set<Long> partitionIds) throws LoadException {
+        RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) table.getPartitionInfo();
+        List<EtlPartition> etlPartitions = Lists.newArrayList();
+        partitionColumnRefs.addAll(table.getPartitionInfo().getPartitionColumns(table.getIdToColumn())
+                .stream().map(Column::getName).collect(Collectors.toList()));
+
+        List<Map.Entry<Long, Range<PartitionKey>>> sortedRanges = null;
+        try {
+            sortedRanges = rangePartitionInfo.getSortedRangeMap(partitionIds);
+        } catch (AnalysisException e) {
+            throw new LoadException(e.getMessage());
+        }
+        for (Map.Entry<Long, Range<PartitionKey>> entry : sortedRanges) {
+            long partitionId = entry.getKey();
+            Partition partition = table.getPartition(partitionId);
+            if (partition == null) {
+                throw new LoadException("partition does not exist. id: " + partitionId);
+            }
+
+            // bucket num
+            int bucketNum = partition.getDistributionInfo().getBucketNum();
+
+            RangePartitionBoundary boundary = PartitionUtils.calRangePartitionBoundary(entry.getValue());
+
+            for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
+                long physicalPartitionId = physicalPartition.getId();
+
+                etlPartitions.add(new EtlPartition(
+                        physicalPartitionId,
+                        boundary.getStartKeys(),
+                        boundary.getEndKeys(),
+                        boundary.isMinPartition(),
+                        boundary.isMaxPartition(),
+                        bucketNum));
+            }
+        }
+        return etlPartitions;
+    }
+
+    private List<EtlPartition> initEtlUnPartitioned(OlapTable table, Set<Long> partitionIds) throws LoadException {
+        PartitionType type = table.getPartitionInfo().getType();
+        List<EtlPartition> etlPartitions = Lists.newArrayList();
+        Preconditions.checkState(type == PartitionType.UNPARTITIONED);
+        Preconditions.checkState(partitionIds.size() == 1);
+
+        for (Long partitionId : partitionIds) {
+            Partition partition = table.getPartition(partitionId);
+            if (partition == null) {
+                throw new LoadException("partition does not exist. id: " + partitionId);
+            }
+
+            // bucket num
+            int bucketNum = partition.getDistributionInfo().getBucketNum();
+
+            for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
+                long physicalPartitionId = physicalPartition.getId();
+                etlPartitions.add(new EtlPartition(physicalPartitionId, Lists.newArrayList(), Lists.newArrayList(),
+                        true, true, bucketNum));
+            }
+        }
+        return etlPartitions;
     }
 
     private EtlFileGroup createEtlFileGroup(BrokerFileGroup fileGroup, Set<Long> tablePartitionIds,
@@ -456,8 +481,24 @@ public class SparkLoadPendingTask extends LoadTask {
         // check columns
         try {
             Load.initColumns(table, copiedColumnExprList, fileGroup.getColumnToHadoopFunction());
-        } catch (UserException e) {
+        } catch (StarRocksException e) {
             throw new LoadException(e.getMessage());
+        }
+        // add generated column mapping
+        for (ImportColumnDesc generatedColumnDesc : Load.getMaterializedShadowColumnDesc(table, db.getFullName(), false)) {
+            Expr expr = generatedColumnDesc.getExpr();
+            List<SlotRef> slots = Lists.newArrayList();
+            expr.collect(SlotRef.class, slots);
+            for (SlotRef slot : slots) {
+                for (ImportColumnDesc columnDesc : copiedColumnExprList) {
+                    if (!columnDesc.isColumn() && slot.getColumnName().equals(columnDesc.getColumnName())) {
+                        throw new LoadException("generated column can not refenece the column which is the " +
+                                "result of the expression in spark load");
+                    }
+                }
+            }
+            copiedColumnExprList.add(generatedColumnDesc);
+            exprByName.put(generatedColumnDesc.getColumnName(), generatedColumnDesc.getExpr());
         }
         // add shadow column mapping when schema change
         for (ImportColumnDesc columnDesc : Load.getSchemaChangeShadowColumnDesc(table, exprByName)) {
@@ -506,6 +547,14 @@ public class SparkLoadPendingTask extends LoadTask {
             partitionIds = Lists.newArrayList(tablePartitionIds);
         }
 
+        List<Long> physicalPartitionIds = Lists.newArrayList();
+        for (Long partitionId : partitionIds) {
+            Partition partition = table.getPartition(partitionId);
+            for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
+                physicalPartitionIds.add(physicalPartition.getId());
+            }
+        }
+
         // where
         // TODO: check
         String where = "";
@@ -518,12 +567,13 @@ public class SparkLoadPendingTask extends LoadTask {
         Map<String, String> hiveTableProperties = Maps.newHashMap();
         if (fileGroup.isLoadFromTable()) {
             long srcTableId = fileGroup.getSrcTableId();
-            HiveTable srcHiveTable = (HiveTable) db.getTable(srcTableId);
+            HiveTable srcHiveTable = (HiveTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                        .getTable(db.getId(), srcTableId);
             if (srcHiveTable == null) {
                 throw new LoadException("table does not exist. id: " + srcTableId);
             }
             hiveDbTableName = srcHiveTable.getHiveDbTable();
-            hiveTableProperties.putAll(srcHiveTable.getHiveProperties());
+            hiveTableProperties.putAll(srcHiveTable.getProperties());
         }
 
         // check hll and bitmap func
@@ -543,13 +593,13 @@ public class SparkLoadPendingTask extends LoadTask {
         EtlFileGroup etlFileGroup = null;
         if (fileGroup.isLoadFromTable()) {
             etlFileGroup = new EtlFileGroup(SourceType.HIVE, fileFieldNames, hiveDbTableName, hiveTableProperties,
-                    fileGroup.isNegative(), columnMappings, where, partitionIds);
+                    fileGroup.isNegative(), columnMappings, where, physicalPartitionIds);
         } else {
             etlFileGroup = new EtlFileGroup(SourceType.FILE, fileGroup.getFilePaths(), fileFieldNames,
                     fileGroup.getColumnsFromPath(), fileGroup.getColumnSeparator(),
                     fileGroup.getRowDelimiter(), fileGroup.isNegative(),
                     fileGroup.getFileFormat(), columnMappings,
-                    where, partitionIds);
+                    where, physicalPartitionIds);
         }
 
         return etlFileGroup;
@@ -579,7 +629,8 @@ public class SparkLoadPendingTask extends LoadTask {
         }
 
         String msg = "BITMAP column must use bitmap function, like " + columnName + "=to_bitmap(xxx) or "
-                + columnName + "=bitmap_hash() or " + columnName + "=bitmap_dict()";
+                + columnName + "=bitmap_hash() or " + columnName + "=bitmap_dict() or "
+                + columnName + "=bitmap_from_binary()";
         if (!(expr instanceof FunctionCallExpr)) {
             throw new LoadException(msg);
         }
@@ -587,7 +638,8 @@ public class SparkLoadPendingTask extends LoadTask {
         String functionName = fn.getFnName().getFunction();
         if (!functionName.equalsIgnoreCase(FunctionSet.TO_BITMAP)
                 && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_HASH)
-                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_DICT)) {
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_DICT)
+                && !functionName.equalsIgnoreCase(FunctionSet.BITMAP_FROM_BINARY)) {
             throw new LoadException(msg);
         }
 
@@ -596,19 +648,4 @@ public class SparkLoadPendingTask extends LoadTask {
         }
     }
 
-    // This is to be compatible with Spark Load Job formats for Date type.
-    // Because the historical version is serialized and deserialized with a special hash number for DateLiteral,
-    // special processing is also done here for DateLiteral to keep the historical version compatible.
-    // The deserialized code is in "SparkDpp.createPartitionRangeKeys"
-    public static Object convertDateLiteralToNumber(DateLiteral dateLiteral) {
-        if (dateLiteral.getType().isDate()) {
-            return (dateLiteral.getYear() * 16 * 32L
-                    + dateLiteral.getMonth() * 32
-                    + dateLiteral.getDay());
-        } else if (dateLiteral.getType().isDatetime()) {
-            return dateLiteral.getLongValue();
-        } else {
-            throw new StarRocksPlannerException("Invalid date type: " + dateLiteral.getType(), ErrorType.INTERNAL_ERROR);
-        }
-    }
 }

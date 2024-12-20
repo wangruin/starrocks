@@ -24,6 +24,7 @@ import com.starrocks.catalog.IcebergTable;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.ExpressionContext;
@@ -63,6 +64,7 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalRepeatOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalSchemaScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalSetOperation;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionTableScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalTopNOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalUnionOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalValuesOperator;
@@ -73,6 +75,7 @@ import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CloneOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CollectionElementOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
@@ -82,6 +85,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ExistsPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LikePredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.MatchExprOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorVisitor;
 import com.starrocks.sql.optimizer.operator.stream.PhysicalStreamAggOperator;
@@ -111,7 +115,12 @@ public class Explain {
     }
 
     public static CostEstimate buildCost(OptExpression optExpression) {
-        return CostModel.calculateCostEstimate(new ExpressionContext(optExpression));
+        CostEstimate totalCost = CostModel.calculateCostEstimate(new ExpressionContext(optExpression));
+        for (OptExpression child : optExpression.getInputs()) {
+            CostEstimate curCost = buildCost(child);
+            totalCost = CostEstimate.addCost(totalCost, curCost);
+        }
+        return totalCost;
     }
 
     private static class OperatorStr {
@@ -172,6 +181,11 @@ public class Explain {
         }
 
         @Override
+        public OperatorStr visitPhysicalProject(OptExpression optExpression, OperatorPrinter.ExplainContext context) {
+            return visit(optExpression.getInputs().get(0), context);
+        }
+
+        @Override
         public OperatorStr visitPhysicalOlapScan(OptExpression optExpression, OperatorPrinter.ExplainContext context) {
             PhysicalOlapScanOperator scan = (PhysicalOlapScanOperator) optExpression.getOp();
 
@@ -183,23 +197,31 @@ public class Explain {
                                     .collect(Collectors.joining(", ")) + "]"))
                     .append("\n");
 
+            if (scan.getTable().isMaterializedView()) {
+                buildOperatorProperty(sb, "MaterializedView: true", context.step);
+            }
             buildCostEstimate(sb, optExpression, context.step);
 
             int totalTabletsNum = 0;
             for (Long partitionId : scan.getSelectedPartitionId()) {
                 final Partition partition = ((OlapTable) scan.getTable()).getPartition(partitionId);
-                final MaterializedIndex selectedTable = partition.getIndex(scan.getSelectedIndexId());
-                totalTabletsNum += selectedTable.getTablets().size();
+                for (PhysicalPartition subPartition : partition.getSubPartitions()) {
+                    final MaterializedIndex selectedTable = subPartition.getIndex(scan.getSelectedIndexId());
+                    totalTabletsNum += selectedTable.getTablets().size();
+                }
             }
             String partitionAndBucketInfo = "partitionRatio: " +
                     scan.getSelectedPartitionId().size() +
                     "/" +
-                    ((OlapTable) scan.getTable()).getPartitions().size() +
+                    ((OlapTable) scan.getTable()).getVisiblePartitionNames().size() +
                     ", tabletRatio: " +
                     scan.getSelectedTabletId().size() +
                     "/" +
                     totalTabletsNum;
             buildOperatorProperty(sb, partitionAndBucketInfo, context.step);
+            if (scan.getGtid() > 0) {
+                buildOperatorProperty(sb, "gtid: " + scan.getGtid(), context.step);
+            }
             buildCommonProperty(sb, scan, context.step);
             return new OperatorStr(sb.toString(), context.step, Collections.emptyList());
         }
@@ -209,7 +231,7 @@ public class Explain {
             PhysicalHiveScanOperator scan = (PhysicalHiveScanOperator) optExpression.getOp();
 
             StringBuilder sb = new StringBuilder("- HIVE-SCAN [")
-                    .append(((HiveTable) scan.getTable()).getTableName())
+                    .append(((HiveTable) scan.getTable()).getCatalogTableName())
                     .append("]")
                     .append(buildOutputColumns(scan,
                             "[" + scan.getOutputColumns().stream().map(new ExpressionPrinter()::print)
@@ -226,7 +248,7 @@ public class Explain {
             PhysicalIcebergScanOperator scan = (PhysicalIcebergScanOperator) optExpression.getOp();
 
             StringBuilder sb = new StringBuilder("- ICEBERG-SCAN [")
-                    .append(((IcebergTable) scan.getTable()).getRemoteTableName())
+                    .append(((IcebergTable) scan.getTable()).getCatalogTableName())
                     .append("]")
                     .append(buildOutputColumns(scan,
                             "[" + scan.getOutputColumns().stream().map(new ExpressionPrinter()::print)
@@ -241,7 +263,7 @@ public class Explain {
             PhysicalHudiScanOperator scan = (PhysicalHudiScanOperator) optExpression.getOp();
 
             StringBuilder sb = new StringBuilder("- Hudi-SCAN [")
-                    .append(((HudiTable) scan.getTable()).getTableName())
+                    .append(((HudiTable) scan.getTable()).getCatalogTableName())
                     .append("]")
                     .append(buildOutputColumns(scan,
                             "[" + scan.getOutputColumns().stream().map(new ExpressionPrinter()::print)
@@ -365,7 +387,7 @@ public class Explain {
                 HashDistributionDesc desc =
                         ((HashDistributionSpec) exchange.getDistributionSpec()).getHashDistributionDesc();
                 sb.append("- EXCHANGE(SHUFFLE) ");
-                sb.append(desc.getColumns());
+                sb.append(desc.getExplainInfo());
             } else {
                 sb.append("- EXCHANGE(").append(exchange.getDistributionSpec()).append(")");
             }
@@ -590,11 +612,11 @@ public class Explain {
 
             StringBuilder sb = new StringBuilder("- DECODE ")
                     .append(buildOutputColumns(decode,
-                            "[" + decode.getDictToStrings().keySet().stream().map(Object::toString)
+                            "[" + decode.getDictIdToStringsId().keySet().stream().map(Object::toString)
                                     .collect(Collectors.joining(", ")) + "]"))
                     .append("\n");
 
-            for (Map.Entry<Integer, Integer> kv : decode.getDictToStrings().entrySet()) {
+            for (Map.Entry<Integer, Integer> kv : decode.getDictIdToStringsId().entrySet()) {
                 buildOperatorProperty(sb, kv.getValue().toString() + " := " + kv.getKey().toString(), context.step);
             }
 
@@ -715,6 +737,22 @@ public class Explain {
 
             return new OperatorStr(sb.toString(), context.step, Collections.emptyList());
         }
+
+        @Override
+        public OperatorStr visitPhysicalTableFunctionTableScan(OptExpression optExpr, ExplainContext context) {
+            PhysicalTableFunctionTableScanOperator scan = (PhysicalTableFunctionTableScanOperator) optExpr.getOp();
+            StringBuilder sb = new StringBuilder("- TableFunctionScan[")
+                    .append(scan.getTable().toString())
+                    .append("]")
+                    .append(buildOutputColumns(scan,
+                            "[" + scan.getOutputColumns().stream().map(new ExpressionPrinter()::print)
+                                    .collect(Collectors.joining(", ")) + "]"))
+                    .append("\n");
+            buildCostEstimate(sb, optExpr, context.step);
+            buildCommonProperty(sb, scan, context.step);
+
+            return new OperatorStr(sb.toString(), context.step, Collections.emptyList());
+        }
     }
 
     public static class ExpressionPrinter
@@ -726,7 +764,7 @@ public class Explain {
 
         @Override
         public String visit(ScalarOperator scalarOperator, Void context) {
-            return scalarOperator.accept(this, null);
+            return scalarOperator.toString();
         }
 
         @Override
@@ -797,6 +835,11 @@ public class Explain {
             sb.append("BETWEEN ");
             sb.append(predicate.getChild(1)).append(" AND ").append(predicate.getChild(2));
             return sb.toString();
+        }
+
+        @Override
+        public String visitCloneOperator(CloneOperator operator, Void context) {
+            return "CLONE(" + print(operator.getChild(0)) + ")";
         }
 
         @Override
@@ -878,6 +921,11 @@ public class Explain {
             }
 
             return print(predicate.getChild(0)) + " REGEXP " + print(predicate.getChild(1));
+        }
+
+        @Override
+        public String visitMatchExprOperator(MatchExprOperator predicate, Void context) {
+            return print(predicate.getChild(0)) + " MATCH " + print(predicate.getChild(1));
         }
 
         @Override

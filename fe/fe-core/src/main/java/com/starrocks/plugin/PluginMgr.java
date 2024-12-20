@@ -40,10 +40,15 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.PrintableMap;
+import com.starrocks.persist.ImageWriter;
+import com.starrocks.persist.metablock.SRMetaBlockEOFException;
+import com.starrocks.persist.metablock.SRMetaBlockException;
+import com.starrocks.persist.metablock.SRMetaBlockID;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
+import com.starrocks.persist.metablock.SRMetaBlockWriter;
 import com.starrocks.plugin.PluginInfo.PluginType;
 import com.starrocks.plugin.PluginLoader.PluginStatus;
 import com.starrocks.qe.AuditLogBuilder;
@@ -52,9 +57,7 @@ import com.starrocks.sql.ast.InstallPluginStmt;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInputStream;
 import java.io.DataOutput;
-import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
@@ -126,7 +129,7 @@ public class PluginMgr implements Writable {
 
     // install a plugin from user's command.
     // install should be successfully, or nothing should be left if failed to install.
-    public PluginInfo installPlugin(InstallPluginStmt stmt) throws IOException, UserException {
+    public PluginInfo installPlugin(InstallPluginStmt stmt) throws IOException, StarRocksException {
         PluginLoader pluginLoader = new DynamicPluginLoader(Config.plugin_dir, stmt.getPluginPath(), stmt.getMd5sum());
         pluginLoader.setStatus(PluginStatus.INSTALLING);
 
@@ -137,7 +140,7 @@ public class PluginMgr implements Writable {
             }
 
             if (checkDynamicPluginNameExist(info.getName())) {
-                throw new UserException("plugin " + info.getName() + " has already been installed.");
+                throw new StarRocksException("plugin " + info.getName() + " has already been installed.");
             }
 
             // install plugin
@@ -145,14 +148,14 @@ public class PluginMgr implements Writable {
             pluginLoader.setStatus(PluginStatus.INSTALLED);
 
             if (!addDynamicPluginNameIfAbsent(info.getName())) {
-                throw new UserException("plugin " + info.getName() + " has already been installed.");
+                throw new StarRocksException("plugin " + info.getName() + " has already been installed.");
             }
             plugins[info.getTypeId()].put(info.getName(), pluginLoader);
 
             GlobalStateMgr.getCurrentState().getEditLog().logInstallPlugin(info);
             LOG.info("install plugin {}", info.getName());
             return info;
-        } catch (IOException | UserException e) {
+        } catch (Throwable e) {
             pluginLoader.uninstall();
             throw e;
         }
@@ -162,7 +165,7 @@ public class PluginMgr implements Writable {
      * Dynamic uninstall plugin.
      * If uninstall failed, the plugin should NOT be removed from plugin manager.
      */
-    public PluginInfo uninstallPlugin(String name) throws IOException, UserException {
+    public PluginInfo uninstallPlugin(String name) throws IOException, StarRocksException {
         if (!checkDynamicPluginNameExist(name)) {
             throw new DdlException("Plugin " + name + " does not exist");
         }
@@ -222,22 +225,22 @@ public class PluginMgr implements Writable {
      * It must add the plugin to the "plugins" and "dynamicPluginNames", even if the plugin
      * is not loaded successfully.
      */
-    public void replayLoadDynamicPlugin(PluginInfo info) throws IOException, UserException {
+    public void replayLoadDynamicPlugin(PluginInfo info) throws IOException {
         DynamicPluginLoader pluginLoader = new DynamicPluginLoader(Config.plugin_dir, info);
         try {
             // should add to "plugins" first before loading.
             PluginLoader checkLoader = plugins[info.getTypeId()].putIfAbsent(info.getName(), pluginLoader);
             if (checkLoader != null) {
-                throw new UserException("plugin " + info.getName() + " has already been installed.");
+                throw new StarRocksException("plugin " + info.getName() + " has already been installed.");
             }
 
             pluginLoader.setStatus(PluginStatus.INSTALLING);
             // install plugin
             pluginLoader.reload();
             pluginLoader.setStatus(PluginStatus.INSTALLED);
-        } catch (IOException | UserException e) {
+        } catch (IOException | StarRocksException e) {
             pluginLoader.setStatus(PluginStatus.ERROR, e.getMessage());
-            throw e;
+            LOG.warn("fail to load plugin", e);
         } finally {
             // this is a replay process, so whether it is successful or not, add it's name.
             addDynamicPluginNameIfAbsent(info.getName());
@@ -322,18 +325,6 @@ public class PluginMgr implements Writable {
         return rows;
     }
 
-    public void readFields(DataInputStream dis) throws IOException {
-        int size = dis.readInt();
-        for (int i = 0; i < size; i++) {
-            try {
-                PluginInfo pluginInfo = PluginInfo.read(dis);
-                replayLoadDynamicPlugin(pluginInfo);
-            } catch (Exception e) {
-                LOG.warn("load plugin failed.", e);
-            }
-        }
-    }
-
     @Override
     public void write(DataOutput out) throws IOException {
         // only need to persist dynamic plugins
@@ -345,16 +336,20 @@ public class PluginMgr implements Writable {
         }
     }
 
-    public long loadPlugins(DataInputStream dis, long checksum) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_78) {
-            readFields(dis);
+    public void save(ImageWriter imageWriter) throws IOException, SRMetaBlockException {
+        List<PluginInfo> pluginInfos = getAllDynamicPluginInfo();
+
+        int numJson = 1 + pluginInfos.size();
+        SRMetaBlockWriter writer = imageWriter.getBlockWriter(SRMetaBlockID.PLUGIN_MGR, numJson);
+        writer.writeInt(pluginInfos.size());
+        for (PluginInfo pluginInfo : pluginInfos) {
+            writer.writeJson(pluginInfo);
         }
-        LOG.info("finished replay plugins from image");
-        return checksum;
+
+        writer.close();
     }
 
-    public long savePlugins(DataOutputStream dos, long checksum) throws IOException {
-        write(dos);
-        return checksum;
+    public void load(SRMetaBlockReader reader) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
+        reader.readCollection(PluginInfo.class, this::replayLoadDynamicPlugin);
     }
 }

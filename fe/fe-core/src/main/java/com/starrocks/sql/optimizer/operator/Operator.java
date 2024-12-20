@@ -14,14 +14,24 @@
 
 package com.starrocks.sql.optimizer.operator;
 
+import com.google.api.client.util.Sets;
 import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.RowOutputInfo;
+import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalScanOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+import com.starrocks.sql.optimizer.property.DomainProperty;
 
+import java.util.BitSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 public abstract class Operator {
     public static final long DEFAULT_LIMIT = -1;
@@ -29,7 +39,11 @@ public abstract class Operator {
 
     protected final OperatorType opType;
     protected long limit = DEFAULT_LIMIT;
-    protected ScalarOperator predicate;
+    protected ScalarOperator predicate = null;
+    // common sub operators in predicate
+    protected Map<ColumnRefOperator, ScalarOperator> predicateCommonOperators = null;
+
+    private static long saltGenerator = 0;
     /**
      * Before entering the Cascades search framework,
      * we need to merge LogicalProject and child children into one node
@@ -39,6 +53,27 @@ public abstract class Operator {
     protected Projection projection;
 
     protected RowOutputInfo rowOutputInfo;
+
+    // Add salt make the original equivalent operators nonequivalent to avoid Group
+    // mutual reference in Memo.
+    // Only LogicalScanOperator/PhysicalScanOperator yielded by CboTablePruneRule has salt.
+    // if no salt, two different Groups will be merged into one, that leads to mutual reference
+    // or self reference of groups
+    protected long salt = 0;
+
+    // mark which rule(bit) has been applied to the operator.
+    protected BitSet opRuleBits = new BitSet();
+    // mark which mv has been applied to the operator
+    protected Set<Long> opAppliedMVs = Sets.newHashSet();
+
+    // an operator logically equivalent to 'this' operator
+    // used by view based mv rewrite
+    // eg: LogicalViewScanOperator is logically equivalent to the operator build from the view
+    protected Operator equivalentOp;
+
+    protected DomainProperty domainProperty;
+
+    protected int planNodeId = -1;
 
     public Operator(OperatorType opType) {
         this.opType = opType;
@@ -90,6 +125,14 @@ public abstract class Operator {
         this.predicate = predicate;
     }
 
+    public Map<ColumnRefOperator, ScalarOperator> getPredicateCommonOperators() {
+        return predicateCommonOperators;
+    }
+
+    public void setPredicateCommonOperators(Map<ColumnRefOperator, ScalarOperator> predicateCommonOperators) {
+        this.predicateCommonOperators = predicateCommonOperators;
+    }
+
     public Projection getProjection() {
         return projection;
     }
@@ -98,26 +141,104 @@ public abstract class Operator {
         this.projection = projection;
     }
 
+    public void addSalt() {
+        if ((this instanceof LogicalJoinOperator) || (this instanceof LogicalScanOperator)) {
+            this.salt = ++saltGenerator;
+        }
+    }
+
+    public void setSalt(long salt) {
+        if ((this instanceof LogicalJoinOperator) ||
+                (this instanceof LogicalScanOperator) ||
+                (this instanceof PhysicalScanOperator) ||
+                (this instanceof PhysicalJoinOperator)) {
+            this.salt = salt;
+        }
+    }
+    public boolean hasSalt() {
+        return salt > 0;
+    }
+
+    public long getSalt() {
+        return salt;
+    }
+
+    public void setOpRuleBit(int bit) {
+        this.opRuleBits.set(bit);
+    }
+
+    public void resetOpRuleBit(int bit) {
+        this.opRuleBits.clear(bit);
+    }
+
+    public boolean isOpRuleBitSet(int bit) {
+        return opRuleBits.get(bit);
+    }
+
+    public void setOpAppliedMV(long mvId) {
+        this.opAppliedMVs.add(mvId);
+    }
+
+    public boolean isOpAppliedMV(long mvId) {
+        return opAppliedMVs.contains(mvId);
+    }
+
+    public Operator getEquivalentOp() {
+        return equivalentOp;
+    }
+
+    public void setEquivalentOp(Operator equivalentOp) {
+        this.equivalentOp = equivalentOp;
+    }
+
     public RowOutputInfo getRowOutputInfo(List<OptExpression> inputs) {
-        if (rowOutputInfo != null) {
-            return rowOutputInfo;
+        if (rowOutputInfo == null) {
+            rowOutputInfo = deriveRowOutputInfo(inputs);
+        }
+
+        // transformation may update the projection, so update the rowOutputInfo at the same time
+        if (projection != null) {
+            rowOutputInfo = new RowOutputInfo(projection.getColumnRefMap(), projection.getCommonSubOperatorMap(),
+                    rowOutputInfo.getOriginalColOutputInfo(), rowOutputInfo.getEndogenousCols());
+        }
+        return rowOutputInfo;
+    }
+
+    public void clearRowOutputInfo() {
+        rowOutputInfo = null;
+    }
+
+    public DomainProperty getDomainProperty(List<OptExpression> inputs) {
+        if (domainProperty == null) {
+            domainProperty = deriveDomainProperty(inputs);
         }
 
         if (projection != null) {
-            rowOutputInfo = new RowOutputInfo(projection.getColumnRefMap());
-        } else {
-            rowOutputInfo = deriveRowOutputInfo(inputs);
+            domainProperty = domainProperty.projectDomainProperty(projection.getColumnRefMap());
         }
-        return rowOutputInfo;
+
+        return domainProperty;
+    }
+
+    public int getPlanNodeId() {
+        return planNodeId;
+    }
+
+    public void setPlanNodeId(int planNodeId) {
+        this.planNodeId = planNodeId;
     }
 
     protected RowOutputInfo deriveRowOutputInfo(List<OptExpression> inputs) {
         throw new UnsupportedOperationException();
     }
 
+    protected DomainProperty deriveDomainProperty(List<OptExpression> inputs) {
+        return new DomainProperty(Map.of());
+    }
+
     protected RowOutputInfo projectInputRow(RowOutputInfo inputRow) {
         List<ColumnOutputInfo> entryList = Lists.newArrayList();
-        for (ColumnOutputInfo columnOutputInfo : inputRow.getColumnEntries()) {
+        for (ColumnOutputInfo columnOutputInfo : inputRow.getColumnOutputInfo()) {
             entryList.add(new ColumnOutputInfo(columnOutputInfo.getColumnRef(), columnOutputInfo.getColumnRef()));
         }
         return new RowOutputInfo(entryList);
@@ -147,63 +268,75 @@ public abstract class Operator {
         Operator operator = (Operator) o;
         return limit == operator.limit && opType == operator.opType &&
                 Objects.equals(predicate, operator.predicate) &&
-                Objects.equals(projection, operator.projection);
+                Objects.equals(projection, operator.projection) &&
+                Objects.equals(salt, operator.salt);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(opType.ordinal(), limit, predicate, projection);
+        return Objects.hash(opType.ordinal(), limit, predicate, projection, salt);
     }
 
     public abstract static class Builder<O extends Operator, B extends Builder> {
-        protected OperatorType opType;
-        protected long limit = DEFAULT_LIMIT;
-        protected ScalarOperator predicate;
-        protected Projection projection;
+        protected O builder = newInstance();
+
+        protected abstract O newInstance();
 
         public B withOperator(O operator) {
-            this.opType = operator.opType;
-            this.limit = operator.limit;
-            this.predicate = operator.predicate;
-            this.projection = operator.projection;
+            builder.limit = operator.limit;
+            builder.predicate = operator.predicate;
+            builder.projection = operator.projection;
+            builder.salt = operator.salt;
+            builder.equivalentOp = operator.equivalentOp;
+            builder.opRuleBits.or(operator.opRuleBits);
+            builder.opAppliedMVs.addAll(operator.opAppliedMVs);
             return (B) this;
         }
 
-        public abstract O build();
+        public O build() {
+            O newOne = builder;
+            builder = null;
+            return newOne;
+        }
 
         public OperatorType getOpType() {
-            return opType;
-        }
-
-        public B setOpType(OperatorType opType) {
-            this.opType = opType;
-            return (B) this;
+            return builder.opType;
         }
 
         public long getLimit() {
-            return limit;
+            return builder.limit;
         }
 
         public B setLimit(long limit) {
-            this.limit = limit;
+            builder.limit = limit;
             return (B) this;
         }
 
         public ScalarOperator getPredicate() {
-            return predicate;
+            return builder.predicate;
         }
 
         public B setPredicate(ScalarOperator predicate) {
-            this.predicate = predicate;
+            builder.predicate = predicate;
             return (B) this;
         }
 
         public Projection getProjection() {
-            return projection;
+            return builder.projection;
         }
 
         public B setProjection(Projection projection) {
-            this.projection = projection;
+            builder.projection = projection;
+            return (B) this;
+        }
+
+        public B addSalt() {
+            builder.salt = ++saltGenerator;
+            return (B) this;
+        }
+
+        public B setOpBitSet(BitSet opRuleMask) {
+            builder.opRuleBits = opRuleMask;
             return (B) this;
         }
     }

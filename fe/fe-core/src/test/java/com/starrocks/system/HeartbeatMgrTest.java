@@ -35,39 +35,53 @@
 package com.starrocks.system;
 
 import com.starrocks.catalog.FsBroker;
-import com.starrocks.common.GenericPool;
 import com.starrocks.common.Pair;
 import com.starrocks.common.util.Util;
 import com.starrocks.ha.FrontendNodeType;
+import com.starrocks.rpc.ThriftConnectionPool;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.NodeMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.system.HeartbeatMgr.BrokerHeartbeatHandler;
 import com.starrocks.system.HeartbeatMgr.FrontendHeartbeatHandler;
 import com.starrocks.system.HeartbeatResponse.HbStatus;
+import com.starrocks.thrift.HeartbeatService;
 import com.starrocks.thrift.TBrokerOperationStatus;
 import com.starrocks.thrift.TBrokerOperationStatusCode;
 import com.starrocks.thrift.TBrokerPingBrokerRequest;
 import com.starrocks.thrift.TFileBrokerService;
+import com.starrocks.thrift.THeartbeatResult;
+import com.starrocks.thrift.TMasterInfo;
 import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TRunMode;
+import com.starrocks.thrift.TStatus;
+import com.starrocks.thrift.TStatusCode;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
+import mockit.Verifications;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.util.Collections;
 
 public class HeartbeatMgrTest {
 
     @Mocked
     private GlobalStateMgr globalStateMgr;
 
+    @Mocked
+    private NodeMgr nodeMgr;
+
     @Before
     public void setUp() {
         new Expectations() {
             {
-                globalStateMgr.getSelfNode();
+                globalStateMgr.getNodeMgr();
                 minTimes = 0;
-                result = Pair.create("192.168.1.3", 9010); // not self
+                result = nodeMgr;
 
                 globalStateMgr.isReady();
                 minTimes = 0;
@@ -79,6 +93,13 @@ public class HeartbeatMgrTest {
             }
         };
 
+        new Expectations(nodeMgr) {
+            {
+                nodeMgr.getSelfNode();
+                minTimes = 0;
+                result = Pair.create("192.168.1.3", 9010); // not self
+            }
+        };
     }
 
     @Test
@@ -97,7 +118,7 @@ public class HeartbeatMgrTest {
         };
 
         Frontend fe = new Frontend(FrontendNodeType.FOLLOWER, "test", "192.168.1.1", 9010);
-        FrontendHeartbeatHandler handler = new FrontendHeartbeatHandler(fe, 12345, "abcd");
+        FrontendHeartbeatHandler handler = new FrontendHeartbeatHandler(fe, 0, "abcd");
         HeartbeatResponse response = handler.call();
 
         Assert.assertTrue(response instanceof FrontendHbResponse);
@@ -110,7 +131,7 @@ public class HeartbeatMgrTest {
         Assert.assertEquals("2.0-ac45651a", hbResponse.getFeVersion());
 
         Frontend fe2 = new Frontend(FrontendNodeType.FOLLOWER, "test2", "192.168.1.2", 9010);
-        handler = new FrontendHeartbeatHandler(fe2, 12345, "abcd");
+        handler = new FrontendHeartbeatHandler(fe2, 0, "abcd");
         response = handler.call();
 
         Assert.assertTrue(response instanceof FrontendHbResponse);
@@ -127,9 +148,9 @@ public class HeartbeatMgrTest {
         TBrokerOperationStatus status = new TBrokerOperationStatus();
         status.setStatusCode(TBrokerOperationStatusCode.OK);
 
-        new MockUp<GenericPool<TFileBrokerService.Client>>() {
+        new MockUp<ThriftConnectionPool<TFileBrokerService.Client>>() {
             @Mock
-            public TFileBrokerService.Client borrowObject(TNetworkAddress address) throws Exception {
+            public TFileBrokerService.Client borrowObject(TNetworkAddress address, int timeoutMs) throws Exception {
                 return client;
             }
 
@@ -162,4 +183,68 @@ public class HeartbeatMgrTest {
         Assert.assertEquals(HbStatus.OK, hbResponse.getStatus());
     }
 
+    @Test
+    public void testBackendHandler(@Mocked HeartbeatService.Client client) throws Exception {
+        TStatus status = new TStatus(TStatusCode.ABORTED);
+        status.setError_msgs(Collections.singletonList("error_msg"));
+        THeartbeatResult res = new THeartbeatResult();
+        res.setStatus(status);
+
+        new MockUp<ThriftConnectionPool<?>>() {
+            @Mock
+            public HeartbeatService.Client borrowObject(TNetworkAddress address, int timeoutMs) throws Exception {
+                return client;
+            }
+
+            @Mock
+            public void returnObject(TNetworkAddress address, HeartbeatService.Client object) {
+            }
+
+            @Mock
+            public void invalidateObject(TNetworkAddress address, HeartbeatService.Client object) {
+            }
+        };
+
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
+        new MockUp<HeartbeatMgr>() {
+            @Mock
+            public long computeMinActiveTxnId() {
+                return 100L;
+            }
+        };
+
+        new Expectations() {
+            {
+                client.heartbeat((TMasterInfo) any);
+                minTimes = 1;
+                result = res;
+            }
+        };
+
+        // call setLeader() to init the MASTER_INFO
+        new HeartbeatMgr(false).setLeader(1, "123", 1);
+
+        ComputeNode cn = new ComputeNode(1, "192.168.1.1", 8111);
+        HeartbeatMgr.BackendHeartbeatHandler handler = new HeartbeatMgr.BackendHeartbeatHandler(cn);
+        HeartbeatResponse response = handler.call();
+        Assert.assertTrue(response instanceof BackendHbResponse);
+        BackendHbResponse hbResponse = (BackendHbResponse) response;
+        Assert.assertEquals(HbStatus.BAD, hbResponse.getStatus());
+
+        new Verifications() {
+            {
+                TMasterInfo masterInfo;
+                client.heartbeat(masterInfo = withCapture());
+                // verify the runMode is set in the masterInfo request
+                Assert.assertNotNull(masterInfo);
+                Assert.assertEquals(TRunMode.SHARED_DATA, masterInfo.getRun_mode());
+            }
+        };
+    }
 }

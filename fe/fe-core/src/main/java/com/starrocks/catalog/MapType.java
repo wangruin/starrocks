@@ -42,7 +42,7 @@ public class MapType extends Type {
     public MapType(Type keyType, Type valueType) {
         Preconditions.checkNotNull(keyType);
         Preconditions.checkNotNull(valueType);
-        selectedFields = new Boolean[] { false, false };
+        selectedFields = new Boolean[] {false, false};
         this.keyType = keyType;
         this.valueType = valueType;
     }
@@ -135,9 +135,9 @@ public class MapType extends Type {
     @Override
     public String toSql(int depth) {
         if (depth >= MAX_NESTING_DEPTH) {
-            return "MAP<...>";
+            return "map<...>";
         }
-        return String.format("MAP<%s,%s>",
+        return String.format("map<%s,%s>",
                 keyType.toSql(depth + 1), valueType.toSql(depth + 1));
     }
 
@@ -170,14 +170,31 @@ public class MapType extends Type {
     }
 
     @Override
+    public boolean isFullyCompatible(Type other) {
+        if (!other.isMapType()) {
+            return false;
+        }
+
+        if (equals(other)) {
+            return true;
+        }
+
+        MapType t = (MapType) other;
+        return keyType.isFullyCompatible(t.getKeyType()) && valueType.isFullyCompatible(t.getValueType());
+    }
+
+    @Override
     public MapType clone() {
         MapType clone = (MapType) super.clone();
         clone.keyType = this.keyType.clone();
         clone.valueType = this.valueType.clone();
-        clone.selectedFields = this.selectedFields.clone();
+        if (this.selectedFields != null) {
+            clone.selectedFields = this.selectedFields.clone();
+        }
         return clone;
     }
 
+    // Todo: remove it after remove selectedFields
     public static class MapTypeDeserializer implements JsonDeserializer<MapType> {
         @Override
         public MapType deserialize(JsonElement jsonElement, java.lang.reflect.Type type,
@@ -190,6 +207,29 @@ public class MapType extends Type {
             Type valueType = GsonUtils.GSON.fromJson(value, Type.class);
             return new MapType(keyType, valueType);
         }
+    }
+
+    public String toMysqlDataTypeString() {
+        return "map";
+    }
+
+    // This implementation is the same as BE schema_columns_scanner.cpp type_to_string
+    public String toMysqlColumnTypeString() {
+        return toSql();
+    }
+
+    @Override
+    protected String toTypeString(int depth) {
+        if (depth >= MAX_NESTING_DEPTH) {
+            return "map<...>";
+        }
+        return String.format("map<%s,%s>",
+                keyType.toTypeString(depth + 1), valueType.toTypeString(depth + 1));
+    }
+
+    @Override
+    public int getMaxUniqueId() {
+        return Math.max(keyType.getMaxUniqueId(), valueType.getMaxUniqueId());
     }
 }
 

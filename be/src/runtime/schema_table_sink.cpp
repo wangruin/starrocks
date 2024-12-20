@@ -70,16 +70,15 @@ static Status set_config_remote(const StarRocksNodesInfo& nodes_info, int64_t be
     if (node_info == nullptr) {
         return Status::InternalError(strings::Substitute("set_config fail: be $0 not found", be_id));
     }
-    doris::PBackendService_Stub* stub =
-            ExecEnv::GetInstance()->brpc_stub_cache()->get_stub(node_info->host, node_info->brpc_port);
+    auto stub = ExecEnv::GetInstance()->brpc_stub_cache()->get_stub(node_info->host, node_info->brpc_port);
     if (stub == nullptr) {
         return Status::InternalError(strings::Substitute("set_config fail to get brpc stub for $0:$1", node_info->host,
                                                          node_info->brpc_port));
     }
     ExecuteCommandRequestPB request;
     request.set_command("set_config");
-    request.set_params(strings::Substitute("{\"name\":\"$0\",\"value\":\"$1\"}", name, value));
-    RefCountClosure<ExecuteCommandResultPB>* closure = new RefCountClosure<ExecuteCommandResultPB>();
+    request.set_params(strings::Substitute(R"({"name":"$0","value":"$1"})", name, value));
+    auto* closure = new RefCountClosure<ExecuteCommandResultPB>();
     closure->cntl.set_timeout_ms(10000);
     closure->ref();
     DeferOp op([&]() {
@@ -104,14 +103,15 @@ static Status set_config_remote(const StarRocksNodesInfo& nodes_info, int64_t be
 }
 
 static Status write_be_configs_table(const StarRocksNodesInfo& nodes_info, int64_t self_be_id, Columns& columns) {
-    if (columns.size() != 3) {
-        return Status::InternalError("write be_configs table should have 3 columns");
+    if (columns.size() < 3) {
+        return Status::InternalError("write be_configs table should have at least 3 columns");
     }
     auto update_config = UpdateConfigAction::instance();
     if (update_config == nullptr) {
         LOG(WARNING) << "write_be_configs_table ignored: UpdateConfigAction is not inited";
         return Status::OK();
     }
+    Status ret;
     for (size_t i = 0; i < columns[0]->size(); ++i) {
         int64_t be_id = columns[0]->get(i).get_int64();
         const auto& name = columns[1]->get(i).get_slice().to_string();
@@ -133,8 +133,9 @@ static Status write_be_configs_table(const StarRocksNodesInfo& nodes_info, int64
         } else {
             LOG(WARNING) << "set_config " << mode << " " << name << "=" << value << " failed " << s.to_string();
         }
+        ret.update(s);
     }
-    return Status::OK();
+    return ret;
 }
 
 Status SchemaTableSink::send_chunk(RuntimeState* state, Chunk* chunk) {

@@ -19,9 +19,10 @@
 #include "exec/spillable_chunks_sorter_sort.h"
 
 namespace starrocks {
-void SpillableChunksSorterFullSort::setup_runtime(RuntimeProfile* profile, MemTracker* parent_mem_tracker) {
-    ChunksSorterFullSort::setup_runtime(profile, parent_mem_tracker);
-    _spiller->set_metrics(spill::SpillProcessMetrics(profile));
+void SpillableChunksSorterFullSort::setup_runtime(RuntimeState* state, RuntimeProfile* profile,
+                                                  MemTracker* parent_mem_tracker) {
+    ChunksSorterFullSort::setup_runtime(state, profile, parent_mem_tracker);
+    _spiller->set_metrics(spill::SpillProcessMetrics(profile, state->mutable_total_spill_bytes()));
 }
 
 Status SpillableChunksSorterFullSort::update(RuntimeState* state, const ChunkPtr& chunk) {
@@ -35,17 +36,21 @@ Status SpillableChunksSorterFullSort::update(RuntimeState* state, const ChunkPtr
     bool first_time_spill = _spiller->spilled_append_rows() == 0;
     CHECK(!_spill_channel->has_task());
 
-    RETURN_IF_ERROR(_spiller->spill(state, chunk, io_executor(), spill::MemTrackerGuard(tls_mem_tracker)));
+    RETURN_IF_ERROR(_spiller->spill(state, chunk, TRACKER_WITH_SPILLER_GUARD(state, _spiller)));
 
     if (first_time_spill) {
         auto process_task = _spill_process_task();
         while (!_spiller->is_full()) {
             auto chunk_st = process_task();
             if (chunk_st.ok()) {
-                RETURN_IF_ERROR(_spiller->spill(state, chunk_st.value(), io_executor(),
-                                                spill::MemTrackerGuard(tls_mem_tracker)));
+                if (!chunk_st.value()->is_empty()) {
+                    RETURN_IF_ERROR(
+                            _spiller->spill(state, chunk_st.value(), TRACKER_WITH_SPILLER_GUARD(state, _spiller)));
+                }
+            } else if (chunk_st.status().is_end_of_file()) {
+                return Status::OK();
             } else {
-                break;
+                return chunk_st.status();
             }
         }
         _spill_channel->add_spill_task({std::move(process_task)});
@@ -54,24 +59,23 @@ Status SpillableChunksSorterFullSort::update(RuntimeState* state, const ChunkPtr
     return Status::OK();
 }
 
-Status SpillableChunksSorterFullSort::done(RuntimeState* state) {
+Status SpillableChunksSorterFullSort::do_done(RuntimeState* state) {
     if (_spill_strategy == spill::SpillStrategy::NO_SPILL) {
-        return ChunksSorterFullSort::done(state);
+        return ChunksSorterFullSort::do_done(state);
     }
 
-    if (_sorted_chunks.empty() && _unsorted_chunk == nullptr) {
+    if (_sorted_chunks.empty() && _unsorted_chunk == nullptr && _staging_unsorted_chunks.empty()) {
         // force flush
-        RETURN_IF_ERROR(_spiller->flush(state, io_executor(), spill::MemTrackerGuard(tls_mem_tracker)));
+        RETURN_IF_ERROR(_spiller->flush(state, TRACKER_WITH_SPILLER_GUARD(state, _spiller)));
     } else {
         // TODO: avoid sort multi times
         // spill sorted chunks
         auto spill_process_task = _spill_process_task();
         _spill_channel->add_spill_task({std::move(spill_process_task)});
         std::function<StatusOr<ChunkPtr>()> flush_task = [this, state]() -> StatusOr<ChunkPtr> {
-            RETURN_IF_ERROR(_spiller->flush(state, io_executor(), spill::MemTrackerGuard(tls_mem_tracker)));
+            RETURN_IF_ERROR(_spiller->flush(state, TRACKER_WITH_SPILLER_GUARD(state, _spiller)));
             return Status::EndOfFile("eos");
         };
-
         _spill_channel->add_spill_task({std::move(flush_task)});
     }
 
@@ -105,6 +109,13 @@ Status SpillableChunksSorterFullSort::get_next(ChunkPtr* chunk, bool* eos) {
     return Status::OK();
 }
 
+size_t SpillableChunksSorterFullSort::reserved_bytes(const ChunkPtr& chunk) {
+    if (chunk) {
+        return chunk->memory_usage() + (_unsorted_chunk != nullptr ? _unsorted_chunk->memory_usage() * 2 : 0);
+    }
+    return _unsorted_chunk != nullptr ? _unsorted_chunk->memory_usage() * 2 : 0;
+}
+
 size_t SpillableChunksSorterFullSort::get_output_rows() const {
     if (!_spiller->spilled()) {
         return ChunksSorterFullSort::get_output_rows();
@@ -136,7 +147,9 @@ std::function<StatusOr<ChunkPtr>()> SpillableChunksSorterFullSort::_spill_proces
         if (_process_staging_unsorted_chunk_idx != _staging_unsorted_chunks.size()) {
             return std::move(_staging_unsorted_chunks[_process_staging_unsorted_chunk_idx++]);
         }
-
+        if (_process_early_materialized_chunks_idx != _early_materialized_chunks.size()) {
+            return _late_materialize(std::move(_early_materialized_chunks[_process_early_materialized_chunks_idx++]));
+        }
         if (_process_sorted_chunk_idx != _sorted_chunks.size()) {
             return std::move(_sorted_chunks[_process_sorted_chunk_idx++]);
         }
@@ -145,7 +158,7 @@ std::function<StatusOr<ChunkPtr>()> SpillableChunksSorterFullSort::_spill_proces
 }
 
 Status SpillableChunksSorterFullSort::_get_result_from_spiller(ChunkPtr* chunk, bool* eos) {
-    auto chunk_st = _spiller->restore(_state, io_executor(), spill::MemTrackerGuard(tls_mem_tracker));
+    auto chunk_st = _spiller->restore(_state, TRACKER_WITH_SPILLER_GUARD(_state, _spiller));
     if (chunk_st.status().is_end_of_file()) {
         *eos = true;
     }

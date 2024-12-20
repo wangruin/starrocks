@@ -22,9 +22,10 @@
 #include "exprs/function_helper.h"
 #include "exprs/mock_vectorized_expr.h"
 #include "exprs/string_functions.h"
-#include "runtime/large_int_value.h"
+#include "runtime/types.h"
 #include "testutil/assert.h"
 #include "testutil/parallel_test.h"
+#include "types/large_int_value.h"
 
 namespace starrocks {
 
@@ -553,7 +554,7 @@ PARALLEL_TEST(VecStringFunctionsTest, split) {
     columns.emplace_back(delim);
     ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
     auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(result.get()));
-    ASSERT_EQ("['1','2','3'], ['aa','bb','cc'], ['a','b','c'], ['','']", col_array->debug_string());
+    ASSERT_EQ("[['1','2','3'], ['aa','bb','cc'], ['a','b','c'], ['','']]", col_array->debug_string());
 
     columns.clear();
     str->append("");
@@ -577,8 +578,8 @@ PARALLEL_TEST(VecStringFunctionsTest, split) {
     ctx->set_constant_columns(columns);
     ASSERT_TRUE(StringFunctions::split_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     result = StringFunctions::split(ctx.get(), columns).value();
-    ASSERT_EQ("['a','bc','d','eeee','f']", result->debug_string());
     ASSERT_TRUE(StringFunctions::split_close(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    ASSERT_EQ("[['a','bc','d','eeee','f']]", result->debug_string());
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, splitConst1) {
@@ -595,8 +596,8 @@ PARALLEL_TEST(VecStringFunctionsTest, splitConst1) {
     ctx->set_constant_columns(columns);
     ASSERT_TRUE(StringFunctions::split_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
-    ASSERT_EQ("['a,bc','eeee,f']", result->debug_string());
     ASSERT_TRUE(StringFunctions::split_close(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    ASSERT_EQ("[['a,bc','eeee,f']]", result->debug_string());
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, splitConst2) {
@@ -618,8 +619,265 @@ PARALLEL_TEST(VecStringFunctionsTest, splitConst2) {
     ctx->set_constant_columns(columns);
     ASSERT_TRUE(StringFunctions::split_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
-    ASSERT_EQ("['a','b','c'], ['aa','bb','cc'], ['eeeeeeeeee'], ['','']", result->debug_string());
+    ASSERT_EQ("[['a','b','c'], ['aa','bb','cc'], ['eeeeeeeeee'], ['','']]", result->debug_string());
     ASSERT_TRUE(StringFunctions::split_close(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, splitChinese) {
+    /// non-constant source and delimiter.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto delim = BinaryColumn::create();
+        auto null = NullColumn::create();
+
+        str->append("1上海,北,京");
+        delim->append(",");
+        null->append(0);
+
+        str->append("北京.南京.东京");
+        delim->append("");
+        null->append(0);
+
+        str->append("北 京南京*东……京");
+        delim->append("京");
+        null->append(0);
+
+        str->append("北京市北京区北京街道");
+        delim->append("北京");
+        null->append(0);
+
+        columns.emplace_back(str);
+        columns.emplace_back(delim);
+        ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
+        auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(result.get()));
+        ASSERT_EQ(
+                "[['1上海','北','京'], ['北','京','.','南','京','.','东','京'], ['北 ','南','*东……',''], "
+                "['','市','区','街道']]",
+                col_array->debug_string());
+    }
+    /// non-constant source and constant delimiter.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        Columns columns;
+
+        auto delim_const = ConstColumn::create(BinaryColumn::create());
+        auto str_binary_column = BinaryColumn::create();
+
+        str_binary_column->append("a地 区b");
+        str_binary_column->append("");
+        str_binary_column->append("地sh北j 京 g");
+        str_binary_column->append(",");
+
+        delim_const->append_datum("");
+        columns.clear();
+        columns.push_back(str_binary_column);
+        columns.push_back(delim_const);
+        ctx->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::split_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
+        ASSERT_TRUE(StringFunctions::split_close(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        ASSERT_EQ("[['a','地',' ','区','b'], [], ['地','s','h','北','j',' ','京',' ','g'], [',']]",
+                  result->debug_string());
+    }
+
+    /// constant source and delimiter
+    {
+        using CaseType = std::tuple<std::string, std::string, std::string>;
+        std::vector<CaseType> cases{
+                {"测隔试隔试", "", "[['测','隔','试','隔','试']]"},
+                {"测隔试隔试", "隔", "[['测','试','试']]"},
+                {"测隔试隔试", "a", "[['测隔试隔试']]"},
+                {"测abc隔试隔试", "", "[['测','a','b','c','隔','试','隔','试']]"},
+                {"测abc隔试隔试", "隔", "[['测abc','试','试']]"},
+                {"测abc隔试abc隔试", "a", "[['测','bc隔试','bc隔试']]"},
+                {"a|b|c|d", "", "[['a','|','b','|','c','|','d']]"},
+                {"a|b|c|d", "|", "[['a','b','c','d']]"},
+                {"a|b|c|d", "隔", "[['a|b|c|d']]"},
+        };
+
+        for (const auto& [src, delimiter, expected_out] : cases) {
+            std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+            Columns columns;
+
+            auto src_const = ConstColumn::create(BinaryColumn::create());
+            auto delim_const = ConstColumn::create(BinaryColumn::create());
+
+            src_const->append_datum(Slice(src));
+            delim_const->append_datum(Slice(delimiter));
+
+            columns.clear();
+            columns.push_back(src_const);
+            columns.push_back(delim_const);
+
+            ctx->set_constant_columns(columns);
+            ASSERT_TRUE(StringFunctions::split_prepare(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
+                                .ok());
+            ColumnPtr result = StringFunctions::split(ctx.get(), columns).value();
+            ASSERT_TRUE(
+                    StringFunctions::split_close(ctx.get(), FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+            ASSERT_EQ(expected_out, result->debug_string());
+        }
+    }
+}
+
+TypeDescriptor array_type(const LogicalType& child_type);
+
+PARALLEL_TEST(VecStringFunctionsTest, str_to_map_v1) {
+    // input array<string>
+    int chunk_size = 7;
+    TypeDescriptor TYPE_ARRAY_VARCHAR = array_type(TYPE_VARCHAR);
+    auto array_str_null = ColumnHelper::create_column(TYPE_ARRAY_VARCHAR, true);
+    // []
+    // NULL
+    // ['NULL']
+    array_str_null->append_datum(Datum(DatumArray{}));
+    array_str_null->append_datum(Datum());
+    array_str_null->append_datum(Datum(DatumArray{Datum("NULL")}));
+    array_str_null->append_datum(Datum(DatumArray{Datum("ab:b"), Datum("ab:b"), Datum("")}));
+    array_str_null->append_datum(Datum(DatumArray{Datum("a:b"), Datum("a:b中囸"), Datum("道c:d过’")}));
+    array_str_null->append_datum(Datum(DatumArray{Datum("a:c:b:d"), Datum(""), Datum("")}));
+    array_str_null->append_datum(Datum(DatumArray{Datum("ab:b"), Datum("ab:b"), Datum("")}));
+
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    TypeDescriptor string_type_desc = TypeDescriptor::create_varchar_type(10);
+    auto string_column = ColumnHelper::create_column(string_type_desc, true);
+    string_column->append_datum("a:b,c:d");
+    string_column->append_datum("a:1,b:2");
+
+    auto array_str_notnull = ColumnHelper::create_column(TYPE_ARRAY_VARCHAR, false);
+    array_str_notnull->append_datum(Datum(DatumArray{}));
+    array_str_notnull->append_datum(Datum(DatumArray{Datum("中国:shang海")}));
+    array_str_notnull->append_datum(Datum(DatumArray{Datum()}));
+    array_str_notnull->append_datum(Datum(DatumArray{Datum("ab:b"), Datum("ab:b"), Datum("")}));
+    array_str_notnull->append_datum(
+            Datum(DatumArray{Datum("a:b"), Datum("a:b中囸"), Datum("道c:d过’"), Datum("道c:d过")}));
+    array_str_notnull->append_datum(Datum(DatumArray{Datum("a:c:b:d"), Datum(""), Datum("")}));
+    array_str_notnull->append_datum(Datum(DatumArray{Datum("ab:b"), Datum("ab:b"), Datum("")}));
+
+    auto only_null = ColumnHelper::create_const_null_column(chunk_size);
+
+    // delimiters
+
+    auto map_delimiter_builder_nullable = ColumnBuilder<TYPE_VARCHAR>(chunk_size);
+    map_delimiter_builder_nullable.append(":");
+    map_delimiter_builder_nullable.append(":");
+    map_delimiter_builder_nullable.append("ab");
+    map_delimiter_builder_nullable.append(":");
+    map_delimiter_builder_nullable.append(":b");
+    map_delimiter_builder_nullable.append("");
+    map_delimiter_builder_nullable.append_null();
+    auto map_delimiter_nullable = map_delimiter_builder_nullable.build_nullable_column();
+    auto delimiter_column = ColumnHelper::create_column(string_type_desc, true);
+    delimiter_column->append_datum(",");
+    delimiter_column->append_datum(",");
+
+    auto map_delimiter_builder_notnull = ColumnBuilder<TYPE_VARCHAR>(chunk_size);
+    map_delimiter_builder_notnull.append(":");
+    map_delimiter_builder_notnull.append("国");
+    map_delimiter_builder_notnull.append("ab");
+    map_delimiter_builder_notnull.append(":");
+    map_delimiter_builder_notnull.append(":b");
+    map_delimiter_builder_notnull.append("");
+    map_delimiter_builder_notnull.append("");
+    auto map_delimiter_notnull = map_delimiter_builder_notnull.build(false);
+
+    auto empty_col = BinaryColumn::create();
+    empty_col->append_datum("");
+    auto delim_const_empty = ConstColumn::create(empty_col, chunk_size);
+
+    auto ch_col = BinaryColumn::create();
+    ch_col->append_datum("中");
+    auto delim_const_ch = ConstColumn::create(ch_col, chunk_size);
+
+    auto const_col = BinaryColumn::create();
+    const_col->append_datum(":");
+    auto delim_const = ConstColumn::create(const_col, chunk_size);
+
+    {
+        Columns columns{string_column, delimiter_column, map_delimiter_nullable};
+        ctx->set_constant_columns(columns);
+        auto res = StringFunctions::str_to_map(ctx.get(), columns).value();
+        ASSERT_EQ(res->debug_string(), "[{'a':'b','c':'d'}, {'a':'1','b':'2'}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, only_null}).value();
+        ASSERT_EQ(res->debug_string(), "CONST: NULL Size : 7");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, map_delimiter_nullable}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, NULL, {'NULL':NULL}, {'ab':'b','':NULL}, {'a':'中囸','道c:d过’':NULL}, "
+                  "{'a':':c:b:d','':NULL}, NULL]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, map_delimiter_notnull}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, NULL, {'NULL':NULL}, {'ab':'b','':NULL}, {'a':'中囸','道c:d过’':NULL}, "
+                  "{'a':':c:b:d','':NULL}, {'a':'b:b','':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, delim_const_empty}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, NULL, {'N':'ULL'}, {'a':'b:b','':NULL}, {'a':':b中囸','道':'c:d过’'}, "
+                  "{'a':':c:b:d','':NULL}, {'a':'b:b','':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, delim_const_ch}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, NULL, {'NULL':NULL}, {'ab:b':NULL,'':NULL}, {'a:b':'囸','道c:d过’':NULL}, "
+                  "{'a:c:b:d':NULL,'':NULL}, {'ab:b':NULL,'':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_null, delim_const}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, NULL, {'NULL':NULL}, {'ab':'b','':NULL}, {'a':'b中囸','道c':'d过’'}, "
+                  "{'a':'c:b:d','':NULL}, {'ab':'b','':NULL}]");
+    }
+    ///
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, only_null}).value();
+        ASSERT_EQ(res->debug_string(), "CONST: NULL Size : 7");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, map_delimiter_nullable}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, {'中国':'shang海'}, {'':NULL}, {'ab':'b','':NULL}, "
+                  "{'a':'中囸','道c:d过’':NULL,'道c:d过':NULL}, {'a':':c:b:d','':NULL}, NULL]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, map_delimiter_notnull}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, {'中':':shang海'}, {'':NULL}, {'ab':'b','':NULL}, "
+                  "{'a':'中囸','道c:d过’':NULL,'道c:d过':NULL}, {'a':':c:b:d','':NULL}, {'a':'b:b','':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, delim_const_empty}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, {'中':'国:shang海'}, {'':NULL}, {'a':'b:b','':NULL}, {'a':':b中囸','道':'c:d过'}, "
+                  "{'a':':c:b:d','':NULL}, {'a':'b:b','':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, delim_const_ch}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, {'':'国:shang海'}, {'':NULL}, {'ab:b':NULL,'':NULL}, "
+                  "{'a:b':'囸','道c:d过’':NULL,'道c:d过':NULL}, {'a:c:b:d':NULL,'':NULL}, {'ab:b':NULL,'':NULL}]");
+    }
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {array_str_notnull, delim_const}).value();
+        ASSERT_EQ(res->debug_string(),
+                  "[{'':NULL}, {'中国':'shang海'}, {'':NULL}, {'ab':'b','':NULL}, {'a':'b中囸','道c':'d过'}, "
+                  "{'a':'c:b:d','':NULL}, {'ab':'b','':NULL}]");
+    }
+    ///
+    {
+        auto res = StringFunctions::str_to_map_v1(nullptr, {only_null, only_null}).value();
+        ASSERT_EQ(res->debug_string(), "CONST: NULL Size : 7");
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
@@ -730,6 +988,51 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
     delim->append("");
     field->append(5);
 
+    // 20
+    str->append("2019年9月8日");
+    delim->append("");
+    field->append(4);
+
+    // 21
+    str->append("2019年9月8日");
+    delim->append("");
+    field->append(5);
+
+    // 22
+    str->append("2019年9月8日");
+    delim->append("");
+    field->append(6);
+
+    // 23
+    str->append("2019年9月8日");
+    delim->append("");
+    field->append(9);
+
+    // 24
+    str->append("2019年9月8日");
+    delim->append("");
+    field->append(10);
+
+    // 25
+    str->append("hello word");
+    delim->append(" ");
+    field->append(-1);
+
+    // 26
+    str->append("hello word");
+    delim->append(" ");
+    field->append(-2);
+
+    // 27
+    str->append("hello word");
+    delim->append(" ");
+    field->append(-3);
+
+    // 28
+    str->append("2019年9月8日");
+    delim->append("月");
+    field->append(-1);
+
     columns.emplace_back(str);
     columns.emplace_back(delim);
     columns.emplace_back(field);
@@ -757,6 +1060,15 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
     ASSERT_TRUE(v->get(17).is_null());
     ASSERT_TRUE(v->get(18).is_null());
     ASSERT_TRUE(v->get(19).is_null());
+    ASSERT_EQ("9", v->get(20).get<Slice>().to_string());
+    ASSERT_EQ("年", v->get(21).get<Slice>().to_string());
+    ASSERT_EQ("9", v->get(22).get<Slice>().to_string());
+    ASSERT_EQ("日", v->get(23).get<Slice>().to_string());
+    ASSERT_TRUE(v->get(24).is_null());
+    ASSERT_EQ("word", v->get(25).get<Slice>().to_string());
+    ASSERT_EQ("hello", v->get(26).get<Slice>().to_string());
+    ASSERT_TRUE(v->get(27).is_null());
+    ASSERT_EQ("8日", v->get(28).get<Slice>().to_string());
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, leftTest) {
@@ -1221,6 +1533,45 @@ PARALLEL_TEST(VecStringFunctionsTest, charTest) {
     ASSERT_EQ("~", v->get_data()[5].to_string());
 }
 
+PARALLEL_TEST(VecStringFunctionsTest, inetAtonInvalidIPv4Test) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+
+    Columns columns;
+    auto input_column = BinaryColumn::create();
+    input_column->append("999.999.999.999");
+    input_column->append("abc.def.ghi.jkl");
+    input_column->append("192.168.1.1.1");
+    input_column->append("192.168.1");
+    input_column->append("");
+    columns.emplace_back(input_column);
+
+    auto result = StringFunctions::inet_aton(ctx.get(), columns).value();
+
+    ASSERT_TRUE(result->is_null(0));
+    ASSERT_TRUE(result->is_null(1));
+    ASSERT_TRUE(result->is_null(2));
+    ASSERT_TRUE(result->is_null(3));
+    ASSERT_TRUE(result->is_null(4));
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, inetAtonValidIPv4Test) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+
+    Columns columns;
+    auto input_column = BinaryColumn::create();
+    input_column->append("192.168.1.1");
+    input_column->append("0.0.0.0");
+    input_column->append("255.255.255.255");
+    columns.emplace_back(input_column);
+
+    auto result = StringFunctions::inet_aton(ctx.get(), columns).value();
+
+    auto res_column = ColumnHelper::cast_to<TYPE_BIGINT>(result);
+    ASSERT_EQ(3232235777, res_column->get_data()[0]);
+    ASSERT_EQ(0, res_column->get_data()[1]);
+    ASSERT_EQ(4294967295, res_column->get_data()[2]);
+}
+
 PARALLEL_TEST(VecStringFunctionsTest, instrTest) {
     std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
     Columns columns;
@@ -1635,7 +1986,7 @@ PARALLEL_TEST(VecStringFunctionsTest, regexpExtract) {
                           "(i)(.*?)(s)"};
     int indexs[] = {1, 2, 1, 2};
 
-    std::string res[] = {"b", "drrry", "i", "tdecisiondli"};
+    std::string res[] = {"b", "drrry", "i", "tdeci"};
 
     for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
         str->append(strs[i]);
@@ -3013,6 +3364,579 @@ PARALLEL_TEST(VecStringFunctionsTest, strcmpTest) {
     ASSERT_EQ(0, v->get_data()[3]);
     ASSERT_EQ(-1, v->get_data()[4]);
     ASSERT_EQ(1, v->get_data()[5]);
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllPattern) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = BinaryColumn::create();
+    auto index = Int64Column::create();
+
+    std::string strs[] = {"AbCdE", "AbCdrrCryE", "hitCdeciCsionCdlist", "hitCdecCisiCondlCist", "12342356"};
+    std::string res[] = {"['b']", "['b']", "['hit','sion']", "['hit','isi']", "[]"};
+    int indexs[] = {1, 1, 1, 1, 1};
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        str->append(strs[i]);
+        pattern->append("([[:lower:]]+)C([[:lower:]]+)");
+        index->append(indexs[i]);
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        ASSERT_EQ(res[i], result->debug_item(i));
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllNullablePattern1) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = BinaryColumn::create();
+    auto index = Int64Column::create();
+
+    std::string strs[] = {"AbCdE", "AbCdrrryE", "hitdeciCsiondlist", "hitdecCisiondlist"};
+    int indexs[] = {1, 2, 1, 2};
+
+    std::string res[] = {"['b']", "['drrry']", "['hitdeci']", "['isiondlist']"};
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        str->append(strs[i]);
+        pattern->append("([[:lower:]]+)C([[:lower:]]+)");
+        index->append(indexs[i]);
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        ASSERT_EQ(res[i], result->debug_item(i));
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllNullablePattern2) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = BinaryColumn::create();
+    auto null = NullColumn::create();
+    auto index = Int64Column::create();
+
+    std::string strs[] = {"AbCdE", "AbCdrrryE", "hitdeciCsiondlist", "hitdecCisioedlise"};
+    int indexs[] = {1, 2, 1, 2};
+
+    std::string res[] = {"NULL", "['drrry']", "NULL", "['td','sio','s']"};
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        str->append(strs[i]);
+        pattern->append(i < 2 ? "([[:lower:]]+)C([[:lower:]]+)" : "(i)(.*?)(e)");
+        null->append(i % 2 == 0);
+        index->append(indexs[i]);
+    }
+
+    columns.push_back(str);
+    columns.push_back(NullableColumn::create(pattern, null));
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        ASSERT_EQ(res[i], result->debug_item(i));
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllOnlyNullPattern) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = ColumnHelper::create_const_null_column(1);
+    auto index = Int64Column::create();
+
+    int length = 4;
+
+    for (int i = 0; i < length; ++i) {
+        str->append("test" + std::to_string(i));
+        index->append(1);
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+    for (int i = 0; i < length; ++i) {
+        ASSERT_TRUE(result->is_null(i));
+    }
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllConstPattern) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("([[:lower:]]+)C([[:lower:]]+)", 1);
+    auto index = Int64Column::create();
+
+    std::string strs[] = {"AbCdE", "AbCdrrryE", "hitdeciCsiondlist", "hitdecCisiondlist"};
+    int indexs[] = {1, 2, 1, 2};
+
+    std::string res[] = {"['b']", "['drrry']", "['hitdeci']", "['isiondlist']"};
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        str->append(strs[i]);
+        index->append(indexs[i]);
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+
+    for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+        ASSERT_EQ(res[i], result->debug_item(i));
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpExtractAllConst) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    auto context = ctx.get();
+
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("([[:lower:]]+)C([[:lower:]]+)", 5);
+    auto index = ColumnHelper::create_const_column<TYPE_BIGINT>(2, 5);
+
+    std::string strs[] = {"AbCdE", "AbCdrrCryE", "hitCdeciCsionCdlist", "hitCdecCisiCondlCist", "12342356"};
+    std::string res[] = {"['d']", "['drr']", "['deci','dlist']", "['dec','ondl']", "[]"};
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        str->append(strs[i]);
+    }
+
+    columns.push_back(str);
+    columns.push_back(pattern);
+    columns.push_back(index);
+
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL).ok());
+
+    auto result = StringFunctions::regexp_extract_all(context, columns).value();
+
+    ASSERT_TRUE(
+            StringFunctions::regexp_close(context, FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                    .ok());
+
+    for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+        ASSERT_EQ(res[i], result->debug_item(i));
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, crc32Test) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    Columns columns;
+    auto str = BinaryColumn::create();
+    str->append("starrocks");
+    str->append("STARROCKS");
+    columns.push_back(str);
+
+    ASSERT_TRUE(StringFunctions::crc32(ctx.get(), columns).ok());
+    ColumnPtr result = StringFunctions::crc32(ctx.get(), columns).value();
+    auto v = ColumnHelper::cast_to<TYPE_BIGINT>(result);
+    ASSERT_EQ(static_cast<uint32_t>(2312449062), v->get_data()[0]);
+    ASSERT_EQ(static_cast<uint32_t>(3440849609), v->get_data()[1]);
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, regexpSplitTest) {
+    // const pattern, const max_split - default_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("[ABC]", 1);
+
+        std::string strs[] = {"oneAtwoBthreeC", "1A2B3C", "AABBCC"};
+        std::string res[] = {"['one','two','three','']", "['1','2','3','']", "['','','','','','','']"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+        }
+
+        columns.push_back(str);
+        columns.push_back(pattern);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // const pattern, const max_split - customized_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto null = NullColumn::create();
+        auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("[ABC]", 1);
+        auto max_split = ColumnHelper::create_const_column<TYPE_INT>(2, 1);
+
+        std::string strs[] = {"oneAtwoBthreeC", "1A2B3C", "AABBCC", "AABBCC"};
+        std::string res[] = {"['one','twoBthreeC']", "['1','2B3C']", "['','ABBCC']", "NULL"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            null->append(i == 3 ? 1 : 0);
+        }
+
+        columns.push_back(NullableColumn::create(str, null));
+        columns.push_back(pattern);
+        columns.push_back(max_split);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // const pattern - default_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("[ABC]", 1);
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC",
+                              "oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+
+        std::string res[] = {"['one','two','three','']", "['one','two','three','']", "['one','two','three','']",
+                             "['one','two','three','']", "['one','two','three','']", "['one','two','three','']"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+        }
+
+        columns.push_back(str);
+        columns.push_back(pattern);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // const pattern - customized_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto null = NullColumn::create();
+        auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("[ABC]", 1);
+        auto max_split = Int32Column::create();
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC",
+                              "oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+        int max_splits[] = {-1, 0, 1, 2, 3, 4, 5};
+
+        std::string res[] = {"['one','two','three','']",
+                             "['one','two','three','']",
+                             "['oneAtwoBthreeC']",
+                             "['one','twoBthreeC']",
+                             "['one','two','threeC']",
+                             "['one','two','three','']",
+                             "NULL"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            null->append(i == 6 ? 1 : 0);
+            max_split->append(max_splits[i]);
+        }
+
+        columns.push_back(NullableColumn::create(str, null));
+        columns.push_back(pattern);
+        columns.push_back(max_split);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // const max_split - default_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = BinaryColumn::create();
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+        std::string patterns[] = {"[nwe]", "[ne]", "[123]"};
+        std::string res[] = {"['o','','At','oBthr','','C']", "['o','','AtwoBthr','','C']", "['oneAtwoBthreeC']"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            pattern->append(patterns[i]);
+        }
+
+        columns.push_back(str);
+        columns.push_back(pattern);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // const max_split - customized_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = BinaryColumn::create();
+        auto null = NullColumn::create();
+        auto max_split = ColumnHelper::create_const_column<TYPE_INT>(4, 1);
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+        std::string patterns[] = {"[nwe]", "[ne]", "[123]", "[123]"};
+        std::string res[] = {"['o','','At','oBthreeC']", "['o','','AtwoBthr','eC']", "['oneAtwoBthreeC']", "NULL"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            pattern->append(patterns[i]);
+            null->append(i == 3 ? 1 : 0);
+        }
+
+        columns.push_back(str);
+        columns.push_back(NullableColumn::create(pattern, null));
+        columns.push_back(max_split);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // none const - default_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = BinaryColumn::create();
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+        std::string patterns[] = {"[nwe]", "[ne]", "[123]"};
+
+        std::string res[] = {"['o','','At','oBthr','','C']", "['o','','AtwoBthr','','C']", "['oneAtwoBthreeC']"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            pattern->append(patterns[i]);
+        }
+
+        columns.push_back(str);
+        columns.push_back(pattern);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
+
+    // none const - customized_max_split
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto context = ctx.get();
+
+        Columns columns;
+
+        auto str = BinaryColumn::create();
+        auto pattern = BinaryColumn::create();
+        auto null = NullColumn::create();
+        auto max_split = Int32Column::create();
+
+        std::string strs[] = {"oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC", "oneAtwoBthreeC"};
+        std::string patterns[] = {"[nwe]", "[ne]", "[123]", "[123]"};
+        int max_splits[] = {1, 2, 3, 4};
+
+        std::string res[] = {"['oneAtwoBthreeC']", "['o','eAtwoBthreeC']", "['oneAtwoBthreeC']", "NULL"};
+
+        for (int i = 0; i < sizeof(strs) / sizeof(strs[0]); ++i) {
+            str->append(strs[i]);
+            pattern->append(patterns[i]);
+            null->append(i == 3 ? 1 : 0);
+            max_split->append(max_splits[i]);
+        }
+
+        columns.push_back(str);
+        columns.push_back(NullableColumn::create(pattern, null));
+        columns.push_back(max_split);
+
+        context->set_constant_columns(columns);
+
+        ASSERT_TRUE(StringFunctions::regexp_extract_prepare(context, FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+        auto result = StringFunctions::regexp_split(context, columns).value();
+
+        ASSERT_TRUE(StringFunctions::regexp_close(context,
+                                                  FunctionContext::FunctionContext::FunctionStateScope::THREAD_LOCAL)
+                            .ok());
+
+        for (int i = 0; i < sizeof(res) / sizeof(res[0]); ++i) {
+            ASSERT_EQ(res[i], result->debug_item(i));
+        }
+    }
 }
 
 } // namespace starrocks

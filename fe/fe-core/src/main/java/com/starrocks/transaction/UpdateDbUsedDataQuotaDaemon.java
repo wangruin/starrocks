@@ -37,14 +37,14 @@ package com.starrocks.transaction;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
-import com.starrocks.common.util.LeaderDaemon;
+import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
-public class UpdateDbUsedDataQuotaDaemon extends LeaderDaemon {
+public class UpdateDbUsedDataQuotaDaemon extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(UpdateDbUsedDataQuotaDaemon.class);
 
     public UpdateDbUsedDataQuotaDaemon() {
@@ -58,15 +58,15 @@ public class UpdateDbUsedDataQuotaDaemon extends LeaderDaemon {
 
     private void updateAllDatabaseUsedDataQuota() {
         GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
-        List<Long> dbIdList = globalStateMgr.getDbIds();
+        List<Long> dbIdList = globalStateMgr.getLocalMetastore().getDbIds();
         GlobalTransactionMgr globalTransactionMgr = globalStateMgr.getGlobalTransactionMgr();
         for (Long dbId : dbIdList) {
-            Database db = globalStateMgr.getDb(dbId);
+            Database db = globalStateMgr.getLocalMetastore().getDb(dbId);
             if (db == null) {
                 LOG.warn("Database [" + dbId + "] doese not exist, skip to update database used data quota");
                 continue;
             }
-            if (db.isInfoSchemaDb()) {
+            if (db.isSystemDatabase()) {
                 continue;
             }
             try {

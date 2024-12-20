@@ -17,14 +17,17 @@
 
 package com.starrocks.journal.bdbje;
 
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.persist.gson.GsonUtils;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 // Write this class to bdb periodically
 public class Timestamp implements Writable {
+    @SerializedName("ts")
     private long timestamp;
 
     public Timestamp() {
@@ -37,11 +40,7 @@ public class Timestamp implements Writable {
 
     @Override
     public void write(DataOutput out) throws IOException {
-        out.writeLong(timestamp);
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        timestamp = in.readLong();
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
     public String toString() {

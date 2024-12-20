@@ -14,12 +14,21 @@
 
 #include "exprs/array_functions.h"
 
+#include <memory>
+
 #include "column/array_column.h"
 #include "column/column_hash.h"
+#include "column/column_viewer.h"
+#include "column/const_column.h"
 #include "column/map_column.h"
+#include "column/nullable_column.h"
 #include "column/struct_column.h"
 #include "column/type_traits.h"
+#include "column/vectorized_fwd.h"
 #include "common/statusor.h"
+#include "simd/simd.h"
+#include "util/phmap/phmap.h"
+#include "util/phmap/phmap_fwd_decl.h"
 #include "util/raw_container.h"
 
 namespace starrocks {
@@ -27,28 +36,31 @@ namespace starrocks {
 StatusOr<ColumnPtr> ArrayFunctions::array_length([[maybe_unused]] FunctionContext* context, const Columns& columns) {
     DCHECK_EQ(1, columns.size());
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
-
-    Column* arg0 = columns[0].get();
-    const size_t num_rows = arg0->size();
-
-    auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(arg0));
-
-    auto col_result = Int32Column::create();
-    raw::make_room(&col_result->get_data(), num_rows);
-    DCHECK_EQ(num_rows, col_result->size());
-
-    const uint32_t* offsets = col_array->offsets().get_data().data();
-
-    int32_t* p = col_result->get_data().data();
-    for (size_t i = 0; i < num_rows; i++) {
-        p[i] = offsets[i + 1] - offsets[i];
-    }
-
-    if (arg0->has_null()) {
-        // Copy null flags.
-        return NullableColumn::create(std::move(col_result), down_cast<NullableColumn*>(arg0)->null_column());
+    const size_t num_rows = columns[0]->size();
+    auto* col_array = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(columns[0].get()));
+    if (columns[0]->is_constant()) {
+        auto col_result = Int32Column::create();
+        col_result->append(col_array->offsets().get_data().data()[1]);
+        auto const_column = ConstColumn::create(std::move(col_result), num_rows);
+        return const_column;
     } else {
-        return col_result;
+        Column* arg0 = columns[0].get();
+        auto col_result = Int32Column::create();
+        raw::make_room(&col_result->get_data(), num_rows);
+        DCHECK_EQ(col_array->size(), col_result->size());
+
+        const uint32_t* offsets = col_array->offsets().get_data().data();
+        int32_t* p = col_result->get_data().data();
+        for (size_t i = 0; i < num_rows; i++) {
+            p[i] = offsets[i + 1] - offsets[i];
+        }
+
+        if (arg0->has_null()) {
+            // Copy null flags.
+            return NullableColumn::create(std::move(col_result), down_cast<NullableColumn*>(arg0)->null_column());
+        } else {
+            return col_result;
+        }
     }
 }
 
@@ -93,14 +105,12 @@ static StatusOr<ColumnPtr> do_array_append(const Column& elements, const UInt32C
 
 // FIXME: A proof-of-concept implementation with poor performance.
 StatusOr<ColumnPtr> ArrayFunctions::array_append([[maybe_unused]] FunctionContext* context, const Columns& columns) {
-    const Column* arg0 = columns[0].get();
-    const Column* arg1 = columns[1].get();
-    if (arg0->only_null()) {
+    if (columns[0]->only_null()) {
         return columns[0];
     }
 
-    arg0 = arg0->has_null() || arg0->is_constant() ? arg0 : ColumnHelper::get_data_column(arg0);
-    arg1 = arg1->has_null() || arg1->is_constant() ? arg1 : ColumnHelper::get_data_column(arg1);
+    const Column* arg0 = ColumnHelper::unpack_and_duplicate_const_column(columns[0]->size(), columns[0]).get();
+    const Column* arg1 = columns[1].get();
 
     const Column* array = arg0;
     const NullableColumn* nullable_array = nullptr;
@@ -132,7 +142,7 @@ StatusOr<ColumnPtr> ArrayFunctions::array_append([[maybe_unused]] FunctionContex
 
 class ArrayRemoveImpl {
 public:
-    static StatusOr<ColumnPtr> evaluate(const ColumnPtr array, const ColumnPtr element) {
+    static StatusOr<ColumnPtr> evaluate(const ColumnPtr& array, const ColumnPtr& element) {
         return _array_remove_generic(array, element);
     }
 
@@ -160,6 +170,11 @@ private:
         [[maybe_unused]] auto is_null = [](const NullColumn::Container* null_map, size_t idx) -> bool {
             return (*null_map)[idx] != 0;
         };
+
+        auto* targets_col = &targets;
+        if constexpr (ConstTarget) {
+            targets_col = down_cast<const ConstColumn*>(&targets)->data_column().get();
+        }
 
         uint32_t result_offset = 0;
         for (size_t i = 0; i < num_array; i++) {
@@ -209,8 +224,13 @@ private:
 
                 uint8_t found = 0;
                 if constexpr (std::is_same_v<ArrayColumn, ElementColumn> || std::is_same_v<MapColumn, ElementColumn> ||
-                              std::is_same_v<StructColumn, ElementColumn>) {
-                    found = elements.equals(offset + j, targets, i);
+                              std::is_same_v<StructColumn, ElementColumn> ||
+                              std::is_same_v<JsonColumn, ElementColumn>) {
+                    if constexpr (ConstTarget) {
+                        found = elements.equals(offset + j, *targets_col, 0);
+                    } else {
+                        found = elements.equals(offset + j, targets, i);
+                    }
                 } else if constexpr (ConstTarget) {
                     [[maybe_unused]] auto elements_ptr = (const ValueType*)(elements.raw_data());
                     auto targets_ptr = (const ValueType*)(targets.raw_data());
@@ -282,12 +302,12 @@ private:
         HANDLE_ELEMENT_TYPE(DateColumn);
         HANDLE_ELEMENT_TYPE(TimestampColumn);
         HANDLE_ELEMENT_TYPE(ArrayColumn);
+        HANDLE_ELEMENT_TYPE(JsonColumn);
         HANDLE_ELEMENT_TYPE(MapColumn);
         HANDLE_ELEMENT_TYPE(StructColumn);
+#undef HANDLE_ELEMENT_TYPE
 
-        LOG(ERROR) << "unhandled column type: " << typeid(array_elements).name();
-        DCHECK(false) << "unhandled column type: " << typeid(array_elements).name();
-        return ColumnHelper::create_const_null_column(array_elements.size());
+        return Status::NotSupported("unsupported operation for type: " + array_elements.get_name());
     }
 
     // array is non-nullable.
@@ -344,12 +364,10 @@ private:
     }
 
     static StatusOr<ColumnPtr> _array_remove_generic(const ColumnPtr& array, const ColumnPtr& target) {
-        if (array->only_null()) {
-            return array;
-        }
-        if (auto nullable = dynamic_cast<const NullableColumn*>(array.get()); nullable != nullptr) {
+        if (array->is_nullable()) {
+            auto nullable = down_cast<const NullableColumn*>(array.get());
             auto array_col = down_cast<const ArrayColumn*>(nullable->data_column().get());
-            ASSIGN_OR_RETURN(auto result, _array_remove_non_nullable(*array_col, *target));
+            ASSIGN_OR_RETURN(auto result, _array_remove_non_nullable(*array_col, *target))
             DCHECK_EQ(nullable->size(), result->size());
             return NullableColumn::create(std::move(result), nullable->null_column());
         }
@@ -367,7 +385,7 @@ public:
             auto arr_col_h = input->data_column()->clone();
             auto* arr_col = down_cast<ArrayColumn*>(arr_col_h.get());
             call_cum_sum(arr_col, nullptr);
-            return ConstColumn::create(std::move(arr_col_h));
+            return ConstColumn::create(std::move(arr_col_h), input->size());
         } else if (col->is_nullable()) {
             auto res = col->clone();
             auto* input = down_cast<NullableColumn*>(res.get());
@@ -421,26 +439,14 @@ private:
         }
 
         for (int i = 0; i < num_rows; ++i) {
-            size_t offset = offsets[i];
-            size_t array_size = offsets[i + 1] - offsets[i];
             if constexpr (nullable) {
                 DCHECK(null_data != nullptr);
-                if (null_data[offset]) {
+                if (null_data[i]) {
                     continue;
                 }
             }
-            RunTimeCppType<TYPE> cum_sum{};
-            if constexpr (element_nullable) {
-                if (element_null_data[offset]) {
-                    // skip null
-                } else {
-                    cum_sum += element_data[offset];
-                }
-            } else {
-                cum_sum += element_data[offset];
-            }
-
-            for (int j = offset + 1; j < offset + array_size; ++j) {
+            RunTimeCppType<TYPE> cum_sum{}; // TODO: to solve overflow
+            for (int j = offsets[i]; j < offsets[i + 1]; ++j) {
                 if constexpr (element_nullable) {
                     if (element_null_data[j]) {
                         // skip null
@@ -472,8 +478,9 @@ DEFINE_ARRAY_CUMSUM_FN(double, TYPE_DOUBLE)
 #undef DEFINE_ARRAY_CUMSUM_FN
 
 StatusOr<ColumnPtr> ArrayFunctions::array_remove([[maybe_unused]] FunctionContext* context, const Columns& columns) {
-    const ColumnPtr& arg0 = columns[0]; // array
-    const ColumnPtr& arg1 = columns[1]; // element
+    RETURN_IF_COLUMNS_ONLY_NULL({columns[0]});
+    const ColumnPtr& arg0 = ColumnHelper::unpack_and_duplicate_const_column(columns[0]->size(), columns[0]); // array
+    const ColumnPtr& arg1 = columns[1];                                                                      // element
 
     return ArrayRemoveImpl::evaluate(arg0, arg1);
 }
@@ -488,14 +495,19 @@ public:
     }
 
 private:
-    template <bool NullableElement, bool NullableTarget, bool ConstTarget, typename ElementColumn,
+    template <bool NullableElement, bool NullableTarget, bool ConstElement, bool ConstTarget, typename ElementColumn,
               typename TargetColumn>
     static StatusOr<ColumnPtr> _process(const ElementColumn& elements, const UInt32Column& offsets,
                                         const TargetColumn& targets, const NullColumn::Container* null_map_elements,
                                         const NullColumn::Container* null_map_targets) {
-        const size_t num_array = offsets.size() - 1;
         auto result = ReturnType::create();
-        result->resize(num_array);
+        if constexpr (ConstElement && ConstTarget) {
+            // if both element and target column are const, we only compute once here and generate ConstColumn with target size outside.
+            result->resize(1);
+        } else {
+            result->resize(targets.size());
+        }
+        const size_t result_size = result->size();
 
         auto* result_ptr = result->get_data().data();
 
@@ -510,19 +522,26 @@ private:
             return (*null_map)[idx] != 0;
         };
 
-        for (size_t i = 0; i < num_array; i++) {
-            size_t offset = offsets_ptr[i];
-            size_t array_size = offsets_ptr[i + 1] - offsets_ptr[i];
+        auto* targets_col = &targets;
+        if constexpr (ConstTarget) {
+            targets_col = down_cast<const ConstColumn*>(&targets)->data_column().get();
+        }
+
+        for (size_t i = 0; i < result_size; i++) {
+            size_t offset = ConstElement ? offsets_ptr[0] : offsets_ptr[i];
+            size_t array_size = ConstElement ? offsets_ptr[1] - offsets_ptr[0] : offsets_ptr[i + 1] - offsets_ptr[i];
+
+            if constexpr (!NullableElement && NullableTarget) {
+                if (is_null(null_map_targets, i)) {
+                    result_ptr[i] = 0;
+                    continue;
+                }
+            }
             uint8_t found = 0;
             size_t position = 0;
             for (size_t j = 0; j < array_size; j++) {
                 if constexpr (NullableElement && !NullableTarget) {
                     if (is_null(null_map_elements, offset + j)) {
-                        continue;
-                    }
-                }
-                if constexpr (!NullableElement && NullableTarget) {
-                    if (is_null(null_map_targets, i)) {
                         continue;
                     }
                 }
@@ -538,16 +557,22 @@ private:
                         break;
                     }
                 }
+
                 if constexpr (std::is_same_v<ArrayColumn, ElementColumn> || std::is_same_v<MapColumn, ElementColumn> ||
-                              std::is_same_v<StructColumn, ElementColumn>) {
-                    found = elements.equals(offset + j, targets, i);
+                              std::is_same_v<StructColumn, ElementColumn> ||
+                              std::is_same_v<JsonColumn, ElementColumn>) {
+                    if (ConstTarget) {
+                        found = elements.equals(offset + j, *targets_col, 0);
+                    } else {
+                        found = elements.equals(offset + j, targets, i);
+                    }
                 } else if constexpr (ConstTarget) {
-                    [[maybe_unused]] auto elements_ptr = (const ValueType*)(elements.raw_data());
+                    auto elements_ptr = (const ValueType*)(elements.raw_data());
                     auto targets_ptr = (const ValueType*)(targets.raw_data());
                     auto& first_target = *targets_ptr;
                     found = (elements_ptr[offset + j] == first_target);
                 } else {
-                    [[maybe_unused]] auto elements_ptr = (const ValueType*)(elements.raw_data());
+                    auto elements_ptr = (const ValueType*)(elements.raw_data());
                     auto targets_ptr = (const ValueType*)(targets.raw_data());
                     found = (elements_ptr[offset + j] == targets_ptr[i]);
                 }
@@ -558,10 +583,11 @@ private:
             }
             result_ptr[i] = PositionEnabled ? position : found;
         }
+
         return result;
     }
 
-    template <bool NullableElement, bool NullableTarget, bool ConstTarget>
+    template <bool NullableElement, bool NullableTarget, bool ConstElement, bool ConstTarget>
     static StatusOr<ColumnPtr> _array_contains(const Column& array_elements, const UInt32Column& array_offsets,
                                                const Column& argument) {
         const Column* elements_ptr = &array_elements;
@@ -569,7 +595,6 @@ private:
 
         const NullColumn::Container* null_map_elements = nullptr;
         const NullColumn::Container* null_map_targets = nullptr;
-
         if constexpr (NullableElement) {
             const auto& nullable = down_cast<const NullableColumn&>(array_elements);
             elements_ptr = nullable.data_column().get();
@@ -586,7 +611,7 @@ private:
 #define HANDLE_ELEMENT_TYPE(ElementType)                                                                          \
     do {                                                                                                          \
         if (typeid(*elements_ptr) == typeid(ElementType)) {                                                       \
-            return _process<NullableElement, NullableTarget, ConstTarget>(                                        \
+            return _process<NullableElement, NullableTarget, ConstElement, ConstTarget>(                          \
                     *down_cast<const ElementType*>(elements_ptr), array_offsets, *targets_ptr, null_map_elements, \
                     null_map_targets);                                                                            \
         }                                                                                                         \
@@ -608,16 +633,16 @@ private:
         HANDLE_ELEMENT_TYPE(DateColumn);
         HANDLE_ELEMENT_TYPE(TimestampColumn);
         HANDLE_ELEMENT_TYPE(ArrayColumn);
+        HANDLE_ELEMENT_TYPE(JsonColumn);
         HANDLE_ELEMENT_TYPE(MapColumn);
         HANDLE_ELEMENT_TYPE(StructColumn);
+#undef HANDLE_ELEMENT_TYPE
 
-        // TODO(zhuming): demangle class name
-        LOG(ERROR) << "unhandled column type: " << typeid(array_elements).name();
-        DCHECK(false) << "unhandled column type: " << typeid(array_elements).name();
-        return ColumnHelper::create_const_null_column(array_elements.size());
+        return Status::NotSupported("unsupported operation for type: " + array_elements.get_name());
     }
 
     // array is non-nullable.
+    template <bool ConstArray>
     static StatusOr<ColumnPtr> _array_contains_non_nullable(const ArrayColumn& array, const Column& arg) {
         bool nullable_element = false;
         bool nullable_target = false;
@@ -656,39 +681,51 @@ private:
         CHECK(!(const_target && nullable_target));
 
         if (nullable_element && nullable_target) {
-            return _array_contains<true, true, false>(*elements, offsets, *targets);
+            return _array_contains<true, true, ConstArray, false>(*elements, offsets, *targets);
         } else if (nullable_element) {
-            return const_target ? _array_contains<true, false, true>(*elements, offsets, *targets)
-                                : _array_contains<true, false, false>(*elements, offsets, *targets);
+            return const_target ? _array_contains<true, false, ConstArray, true>(*elements, offsets, *targets)
+                                : _array_contains<true, false, ConstArray, false>(*elements, offsets, *targets);
         } else if (nullable_target) {
-            return _array_contains<false, true, false>(*elements, offsets, *targets);
+            return _array_contains<false, true, ConstArray, false>(*elements, offsets, *targets);
         } else {
-            return const_target ? _array_contains<false, false, true>(*elements, offsets, *targets)
-                                : _array_contains<false, false, false>(*elements, offsets, *targets);
+            return const_target ? _array_contains<false, false, ConstArray, true>(*elements, offsets, *targets)
+                                : _array_contains<false, false, ConstArray, false>(*elements, offsets, *targets);
         }
     }
 
     static StatusOr<ColumnPtr> _array_contains_generic(const Column& array, const Column& target) {
-        // array_contains(NULL, xxx) -> NULL
-        if (array.only_null()) {
-            auto result = NullableColumn::create(ReturnType::create(), NullColumn::create());
-            result->append_nulls(array.size());
-            return result;
+        bool is_const_array = array.is_constant();
+        bool is_const_target = target.is_constant();
+        const Column* data_column = &array;
+        if (is_const_array) {
+            data_column = down_cast<const ConstColumn*>(&array)->data_column().get();
         }
-        if (auto nullable = dynamic_cast<const NullableColumn*>(&array); nullable != nullptr) {
-            auto array_col = down_cast<const ArrayColumn*>(nullable->data_column().get());
-            ASSIGN_OR_RETURN(auto result, _array_contains_non_nullable(*array_col, target));
-            DCHECK_EQ(nullable->size(), result->size());
-            if (!nullable->has_null()) {
-                return result;
+
+        const NullableColumn* nullable_column = nullptr;
+        const ArrayColumn* array_column = nullptr;
+        if (data_column->is_nullable()) {
+            nullable_column = down_cast<const NullableColumn*>(data_column);
+            array_column = down_cast<const ArrayColumn*>(nullable_column->data_column().get());
+        } else {
+            array_column = down_cast<const ArrayColumn*>(data_column);
+        }
+
+        ASSIGN_OR_RETURN(ColumnPtr result, is_const_array ? _array_contains_non_nullable<true>(*array_column, target)
+                                                          : _array_contains_non_nullable<false>(*array_column, target));
+
+        if (data_column->is_nullable()) {
+            DCHECK_EQ(nullable_column->size(), result->size());
+            if (nullable_column->has_null()) {
+                result = NullableColumn::create(std::move(result), nullable_column->null_column());
             }
-            return NullableColumn::create(std::move(result), nullable->null_column());
         }
-        return _array_contains_non_nullable(down_cast<const ArrayColumn&>(array), target);
+
+        bool return_const = is_const_array && is_const_target;
+        return return_const ? ConstColumn::create(std::move(result), target.size()) : result;
     }
 };
 
-template <bool Any>
+template <bool Any, bool ContainsSeq>
 class ArrayHasImpl {
 public:
     static StatusOr<ColumnPtr> evaluate(const Column& array, const Column& element) {
@@ -701,10 +738,10 @@ private:
                            const ElementColumn& targets, uint32 target_start, uint32 target_end,
                            const NullColumn::Container* null_map_elements,
                            const NullColumn::Container* null_map_targets) {
-        using ValueType = std::conditional_t<std::is_same_v<ArrayColumn, ElementColumn>, uint8_t,
-                                             typename ElementColumn::ValueType>;
-        [[maybe_unused]] auto elements_ptr = (const ValueType*)(elements.raw_data());
-        [[maybe_unused]] auto targets_ptr = (const ValueType*)(targets.raw_data());
+        using ValueType = std::conditional_t<std::is_same_v<ArrayColumn, ElementColumn> ||
+                                                     std::is_same_v<MapColumn, ElementColumn> ||
+                                                     std::is_same_v<StructColumn, ElementColumn>,
+                                             uint8_t, typename ElementColumn::ValueType>;
 
         [[maybe_unused]] auto is_null = [](const NullColumn::Container* null_map, size_t idx) -> bool {
             return (*null_map)[idx] != 0;
@@ -744,9 +781,13 @@ private:
                     continue;
                 }
                 //[null, x*, x] - [null, x*, x]
-                if constexpr (std::is_same_v<ArrayColumn, ElementColumn>) {
-                    found = (elements.compare_at(j, i, targets, -1) == 0);
+                if constexpr (std::is_same_v<ArrayColumn, ElementColumn> || std::is_same_v<MapColumn, ElementColumn> ||
+                              std::is_same_v<StructColumn, ElementColumn> ||
+                              std::is_same_v<JsonColumn, ElementColumn>) {
+                    found = (elements.equals(j, targets, i) == 1);
                 } else {
+                    auto elements_ptr = (const ValueType*)(elements.raw_data());
+                    auto targets_ptr = (const ValueType*)(targets.raw_data());
                     found = (elements_ptr[j] == targets_ptr[i]);
                 }
                 if (found) {
@@ -768,6 +809,76 @@ private:
             return true;
         }
     }
+
+    template <bool NullableElement, bool NullableTarget, typename ElementColumn>
+    static uint8 __process_seq(const ElementColumn& elements, uint32 element_start, uint32 element_end,
+                               const ElementColumn& targets, uint32 target_start, uint32 target_end,
+                               const NullColumn::Container* null_map_elements,
+                               const NullColumn::Container* null_map_targets) {
+        using ValueType = std::conditional_t<std::is_same_v<ArrayColumn, ElementColumn> ||
+                                                     std::is_same_v<MapColumn, ElementColumn> ||
+                                                     std::is_same_v<StructColumn, ElementColumn>,
+                                             uint8_t, typename ElementColumn::ValueType>;
+        [[maybe_unused]] auto is_null = [](const NullColumn::Container* null_map, size_t idx) -> bool {
+            return (*null_map)[idx] != 0;
+        };
+        if (element_end - element_start < target_end - target_start) {
+            return false;
+        }
+        if (target_end == target_start) {
+            return true;
+        }
+        if (element_end == element_start) {
+            return false;
+        }
+        bool found = false;
+        size_t i = target_start;
+        size_t j = element_start;
+        while (j < element_end) {
+            if (element_end - j < (target_end - target_start)) {
+                return false;
+            }
+            int k = j;
+            i = target_start;
+            while (i < target_end) {
+                bool null_target = false;
+                if constexpr (NullableTarget) {
+                    null_target = is_null(null_map_targets, i);
+                }
+                bool null_element = false;
+                if constexpr (NullableElement) {
+                    null_element = is_null(null_map_elements, k);
+                }
+                if (null_target && null_element) {
+                    found = true;
+                } else if (null_target || null_element) {
+                    found = false;
+                } else {
+                    if constexpr (std::is_same_v<ArrayColumn, ElementColumn> ||
+                                  std::is_same_v<MapColumn, ElementColumn> ||
+                                  std::is_same_v<StructColumn, ElementColumn> ||
+                                  std::is_same_v<JsonColumn, ElementColumn>) {
+                        found = (elements.equals(k, targets, i) == 1);
+                    } else {
+                        auto elements_ptr = (const ValueType*)(elements.raw_data());
+                        auto targets_ptr = (const ValueType*)(targets.raw_data());
+                        found = (elements_ptr[k] == targets_ptr[i]);
+                    }
+                }
+                if (found) {
+                    i++;
+                    k++;
+                } else {
+                    break;
+                }
+            }
+            if (i == target_end) {
+                return true;
+            }
+            j++;
+        }
+        return false;
+    }
     template <bool NullableElement, bool NullableTarget, bool ConstTarget, typename ElementColumn>
     static StatusOr<ColumnPtr> _process(const ElementColumn& elements, const UInt32Column& element_offsets,
                                         const ElementColumn& targets, const UInt32Column& target_offsets,
@@ -785,16 +896,23 @@ private:
 
         for (size_t i = 0; i < num_array; i++) {
             uint8_t found = 0;
-            if constexpr (ConstTarget) {
-                DCHECK_EQ(num_target, 1);
-                found = __process<NullableElement, NullableTarget, ElementColumn>(
-                        elements, element_offsets_ptr[i], element_offsets_ptr[i + 1], targets, target_offsets_ptr[0],
-                        target_offsets_ptr[1], null_map_elements, null_map_targets);
-            } else {
+            if constexpr (ContainsSeq) {
                 DCHECK_EQ(num_array, num_target);
-                found = __process<NullableElement, NullableTarget, ElementColumn>(
+                found = __process_seq<NullableElement, NullableTarget, ElementColumn>(
                         elements, element_offsets_ptr[i], element_offsets_ptr[i + 1], targets, target_offsets_ptr[i],
                         target_offsets_ptr[i + 1], null_map_elements, null_map_targets);
+            } else {
+                if constexpr (ConstTarget) {
+                    DCHECK_EQ(num_target, 1);
+                    found = __process<NullableElement, NullableTarget, ElementColumn>(
+                            elements, element_offsets_ptr[i], element_offsets_ptr[i + 1], targets,
+                            target_offsets_ptr[0], target_offsets_ptr[1], null_map_elements, null_map_targets);
+                } else {
+                    DCHECK_EQ(num_array, num_target);
+                    found = __process<NullableElement, NullableTarget, ElementColumn>(
+                            elements, element_offsets_ptr[i], element_offsets_ptr[i + 1], targets,
+                            target_offsets_ptr[i], target_offsets_ptr[i + 1], null_map_elements, null_map_targets);
+                }
             }
             result_ptr[i] = found;
         }
@@ -848,10 +966,11 @@ private:
         HANDLE_HAS_TYPE(DateColumn);
         HANDLE_HAS_TYPE(TimestampColumn);
         HANDLE_HAS_TYPE(ArrayColumn);
+        HANDLE_HAS_TYPE(JsonColumn);
+        HANDLE_HAS_TYPE(MapColumn);
+        HANDLE_HAS_TYPE(StructColumn);
 
-        LOG(ERROR) << "unhandled column type: " << typeid(array_elements).name();
-        DCHECK(false) << "unhandled column type: " << typeid(array_elements).name();
-        return ColumnHelper::create_const_null_column(array_elements.size());
+        return Status::NotSupported("unsupported operation for type: " + array_elements.get_name());
     }
 
     // array is non-nullable.
@@ -919,12 +1038,6 @@ private:
     }
 
     static StatusOr<ColumnPtr> _array_has_generic(const Column& array, const Column& target) {
-        // has_any(NULL, xxx) | has_any(xxx, NULL) -> NULL
-        if (array.only_null() || target.only_null()) {
-            auto result = NullableColumn::create(Int8Column::create(), NullColumn::create());
-            result->append_nulls(array.size());
-            return result;
-        }
         DCHECK_EQ(array.size(), target.size());
 
         const ArrayColumn* array_col = nullptr;
@@ -955,21 +1068,25 @@ private:
             return _array_has_non_nullable(*array_col, *target_col);
         }
 
-        ASSIGN_OR_RETURN(auto result, _array_has_non_nullable(*array_col, *target_col));
-        DCHECK_EQ(array_nullable->size(), result->size());
+        ASSIGN_OR_RETURN(auto result, _array_has_non_nullable(*array_col, *target_col))
+        DCHECK_EQ(array_col->size(), result->size());
         return NullableColumn::create(std::move(result), merge_nullcolum(array_nullable, target_nullable));
     }
 };
 
-StatusOr<ColumnPtr> ArrayFunctions::array_contains([[maybe_unused]] FunctionContext* context, const Columns& columns) {
-    const ColumnPtr& arg0 = columns[0]; // array
+StatusOr<ColumnPtr> ArrayFunctions::array_contains_generic([[maybe_unused]] FunctionContext* context,
+                                                           const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL({columns[0]});
+    const ColumnPtr& arg0 = columns[0];
     const ColumnPtr& arg1 = columns[1]; // element
 
     return ArrayContainsImpl<false, UInt8Column>::evaluate(*arg0, *arg1);
 }
 
-StatusOr<ColumnPtr> ArrayFunctions::array_position([[maybe_unused]] FunctionContext* context, const Columns& columns) {
-    const ColumnPtr& arg0 = columns[0]; // array
+StatusOr<ColumnPtr> ArrayFunctions::array_position_generic([[maybe_unused]] FunctionContext* context,
+                                                           const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL({columns[0]});
+    const ColumnPtr& arg0 = columns[0];
     const ColumnPtr& arg1 = columns[1]; // element
 
     return ArrayContainsImpl<true, Int32Column>::evaluate(*arg0, *arg1);
@@ -977,18 +1094,29 @@ StatusOr<ColumnPtr> ArrayFunctions::array_position([[maybe_unused]] FunctionCont
 
 StatusOr<ColumnPtr> ArrayFunctions::array_contains_any([[maybe_unused]] FunctionContext* context,
                                                        const Columns& columns) {
-    const ColumnPtr& arg0 = columns[0]; // array
-    const ColumnPtr& arg1 = columns[1]; // element
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    const ColumnPtr& arg0 = ColumnHelper::unpack_and_duplicate_const_column(columns[0]->size(), columns[0]); // array
+    const ColumnPtr& arg1 = ColumnHelper::unpack_and_duplicate_const_column(columns[1]->size(), columns[1]); // element
 
-    return ArrayHasImpl<true>::evaluate(*arg0, *arg1);
+    return ArrayHasImpl<true, false>::evaluate(*arg0, *arg1);
 }
 
 StatusOr<ColumnPtr> ArrayFunctions::array_contains_all([[maybe_unused]] FunctionContext* context,
                                                        const Columns& columns) {
-    const ColumnPtr& arg0 = columns[0]; // array
-    const ColumnPtr& arg1 = columns[1]; // element
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    const ColumnPtr& arg0 = ColumnHelper::unpack_and_duplicate_const_column(columns[0]->size(), columns[0]); // array
+    const ColumnPtr& arg1 = ColumnHelper::unpack_and_duplicate_const_column(columns[1]->size(), columns[1]); // element
 
-    return ArrayHasImpl<false>::evaluate(*arg0, *arg1);
+    return ArrayHasImpl<false, false>::evaluate(*arg0, *arg1);
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::array_contains_seq([[maybe_unused]] FunctionContext* context,
+                                                       const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    const ColumnPtr& arg0 = ColumnHelper::unpack_and_duplicate_const_column(columns[0]->size(), columns[0]); // array
+    const ColumnPtr& arg1 = ColumnHelper::unpack_and_duplicate_const_column(columns[1]->size(), columns[1]); // element
+
+    return ArrayHasImpl<false, true>::evaluate(*arg0, *arg1);
 }
 
 // cannot be called anymore
@@ -1000,12 +1128,18 @@ StatusOr<ColumnPtr> ArrayFunctions::array_filter(FunctionContext* context, const
     return ArrayFilter::process(context, columns);
 }
 
+StatusOr<ColumnPtr> ArrayFunctions::all_match(FunctionContext* context, const Columns& columns) {
+    return ArrayMatch<false>::process(context, columns);
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::any_match(FunctionContext* context, const Columns& columns) {
+    return ArrayMatch<true>::process(context, columns);
+}
+
 StatusOr<ColumnPtr> ArrayFunctions::concat(FunctionContext* ctx, const Columns& columns) {
-    DCHECK(columns.size() > 1);
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
 
     auto num_rows = columns[0]->size();
-
     // compute nulls
     NullColumnPtr nulls;
     for (auto& column : columns) {
@@ -1199,4 +1333,394 @@ StatusOr<ColumnPtr> ArrayFunctions::array_slice(FunctionContext* ctx, const Colu
     }
 }
 
+// unpack array column, return: null_column, element_column, offset_column
+static inline std::tuple<NullColumnPtr, Column*, const UInt32Column*> unpack_array_column(const ColumnPtr& input) {
+    NullColumnPtr array_null = nullptr;
+    ArrayColumn* array_col = nullptr;
+
+    auto array = ColumnHelper::unpack_and_duplicate_const_column(input->size(), input);
+    if (array->is_nullable()) {
+        auto nullable = down_cast<NullableColumn*>(array.get());
+        array_col = down_cast<ArrayColumn*>(nullable->data_column().get());
+        array_null = NullColumn::create(*nullable->null_column());
+    } else {
+        array_null = NullColumn::create(input->size(), 0);
+        array_col = down_cast<ArrayColumn*>(array.get());
+    }
+
+    const UInt32Column* offsets = &array_col->offsets();
+    Column* elements = array_col->elements_column().get();
+
+    return {array_null, elements, offsets};
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::array_distinct_any_type(FunctionContext* ctx, const Columns& columns) {
+    DCHECK_EQ(1, columns.size());
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    auto [array_null, elements, offsets] = unpack_array_column(columns[0]);
+    auto* offsets_ptr = offsets->get_data().data();
+    auto* row_nulls = array_null->get_data().data();
+
+    auto result_elements = elements->clone_empty();
+    auto result_offsets = UInt32Column::create();
+    result_offsets->reserve(offsets->size());
+    result_offsets->append(0);
+
+    phmap::flat_hash_set<uint32_t> sets;
+
+    // TODO: Maybe consume large memory, need optimized later.
+    std::vector<uint32_t> hash(elements->size(), 0);
+    elements->fnv_hash(hash.data(), 0, elements->size());
+
+    size_t rows = columns[0]->size();
+    for (auto i = 0; i < rows; i++) {
+        size_t offset = offsets_ptr[i];
+        int64_t array_size = offsets_ptr[i + 1] - offsets_ptr[i];
+
+        if (row_nulls[i] == 1) {
+            // append offsets directly
+        } else if (array_size <= 1) {
+            for (size_t j = 0; j < array_size; j++) {
+                result_elements->append(*elements, offset + j, 1);
+            }
+        } else {
+            // put first
+            result_elements->append(*elements, offset, 1);
+
+            sets.clear();
+            sets.emplace(hash[offset]);
+
+            for (size_t j = 1; j < array_size; j++) {
+                auto elements_idx = offset + j;
+                // hash check
+                if (!sets.contains(hash[elements_idx])) {
+                    result_elements->append(*elements, elements_idx, 1);
+                    sets.emplace(hash[elements_idx]);
+                    continue;
+                }
+
+                // find same hash
+                bool is_contains = false;
+                for (size_t k = offset; k < elements_idx; k++) {
+                    if (hash[k] == hash[elements_idx] && elements->equals(k, *elements, elements_idx)) {
+                        is_contains = true;
+                        break;
+                    }
+                }
+
+                if (!is_contains) {
+                    result_elements->append(*elements, elements_idx, 1);
+                }
+            }
+        }
+
+        result_offsets->append(result_elements->size());
+    }
+
+    return NullableColumn::create(ArrayColumn::create(std::move(result_elements), result_offsets), array_null);
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::array_reverse_any_types(FunctionContext* ctx, const Columns& columns) {
+    DCHECK_EQ(1, columns.size());
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    auto [array_null, elements, offsets] = unpack_array_column(columns[0]);
+    auto* offsets_ptr = offsets->get_data().data();
+    auto* row_nulls = array_null->get_data().data();
+
+    auto result_elements = elements->clone_empty();
+    auto result_offsets = UInt32Column::create();
+    result_offsets->reserve(offsets->size());
+    result_offsets->append(0);
+
+    size_t rows = columns[0]->size();
+    for (auto i = 0; i < rows; i++) {
+        size_t offset = offsets_ptr[i];
+        int64_t array_size = offsets_ptr[i + 1] - offsets_ptr[i];
+
+        if (row_nulls[i] == 0) {
+            for (int64_t j = array_size - 1; j >= 0; j--) {
+                result_elements->append(*elements, offset + j, 1);
+            }
+        }
+
+        result_offsets->append(result_elements->size());
+    }
+
+    return NullableColumn::create(ArrayColumn::create(std::move(result_elements), std::move(result_offsets)),
+                                  array_null);
+}
+
+inline static void nestloop_intersect(uint8_t* hits, const Column* base, size_t base_start, size_t base_end,
+                                      const Column* cmp, size_t cmp_start, size_t cmp_end) {
+    for (size_t base_ele_idx = base_start; base_ele_idx < base_end; base_ele_idx++) {
+        if (hits[base_ele_idx] == 0) {
+            continue;
+        }
+
+        size_t cmp_idx = cmp_start;
+        for (; cmp_idx < cmp_end; cmp_idx++) {
+            if (base->equals(base_ele_idx, *cmp, cmp_idx)) {
+                break;
+            }
+        }
+
+        if (cmp_idx >= cmp_end) {
+            hits[base_ele_idx] = 0;
+        }
+    }
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::array_intersect_any_type(FunctionContext* ctx, const Columns& columns) {
+    DCHECK_LE(1, columns.size());
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+
+    size_t rows = columns[0]->size();
+    size_t usage = columns[0]->memory_usage();
+    ColumnPtr base_col = columns[0];
+    int base_idx = 0;
+
+    auto nulls = NullColumn::create(rows, 0);
+    // find minimum column
+    for (size_t i = 0; i < columns.size(); i++) {
+        if (columns[i]->memory_usage() < usage) {
+            base_col = columns[i];
+            base_idx = i;
+            usage = columns[i]->memory_usage();
+        }
+
+        FunctionHelper::union_produce_nullable_column(columns[i], &nulls);
+    }
+
+    // do distinct first
+    auto distinct_col = array_distinct_any_type(ctx, {base_col});
+    DCHECK(distinct_col.ok());
+
+    auto* dis_array_col = down_cast<ArrayColumn*>(ColumnHelper::get_data_column(distinct_col.value().get()));
+
+    auto& base_elements = dis_array_col->elements_column();
+    auto* base_offsets = &dis_array_col->offsets();
+    auto* base_offsets_ptr = base_offsets->get_data().data();
+    auto* nulls_ptr = nulls->get_data().data();
+
+    Filter filter;
+    filter.resize(base_elements->size(), 1);
+    auto* hits = filter.data();
+
+    // mark intersect filter
+    for (size_t col_idx = 0; col_idx < columns.size(); col_idx++) {
+        if (col_idx == base_idx) {
+            continue;
+        }
+
+        auto [_2, cmp_elements, cmp_offsets] = unpack_array_column(columns[col_idx]);
+        auto* cmp_offsets_ptr = cmp_offsets->get_data().data();
+
+        for (size_t row_idx = 0; row_idx < rows; row_idx++) {
+            if (nulls_ptr[row_idx] == 1) {
+                continue;
+            }
+
+            size_t base_start = base_offsets_ptr[row_idx];
+            size_t base_end = base_offsets_ptr[row_idx + 1];
+
+            size_t cmp_start = cmp_offsets_ptr[row_idx];
+            size_t cmp_end = cmp_offsets_ptr[row_idx + 1];
+
+            nestloop_intersect(hits, base_elements.get(), base_start, base_end, cmp_elements, cmp_start, cmp_end);
+        }
+    }
+
+    // result column
+    auto result_offsets = UInt32Column::create();
+    base_elements->filter(filter);
+
+    result_offsets->append(0);
+    uint32_t pre_offset = 0;
+    for (size_t row_idx = 0; row_idx < rows; row_idx++) {
+        size_t base_start = base_offsets_ptr[row_idx];
+        size_t size = base_offsets_ptr[row_idx + 1] - base_start;
+
+        auto count = SIMD::count_nonzero(hits + base_start, size);
+        pre_offset += count;
+        result_offsets->append(pre_offset);
+    }
+
+    return NullableColumn::create(ArrayColumn::create(base_elements, result_offsets), nulls);
+}
+
+static Status sort_multi_array_column(FunctionContext* ctx, const Column* src_column, const NullColumn* src_null_column,
+                                      const std::vector<const Column*>& key_columns, Column* dest_column) {
+    const auto* src_elements_column = down_cast<const ArrayColumn*>(src_column)->elements_column().get();
+    const auto* src_offsets_column = &down_cast<const ArrayColumn*>(src_column)->offsets();
+
+    auto* dest_elements_column = down_cast<ArrayColumn*>(dest_column)->elements_column().get();
+    auto* dest_offsets_column = down_cast<ArrayColumn*>(dest_column)->offsets_column().get();
+
+    const auto num_src_element_rows = src_elements_column->size();
+    const size_t num_rows = src_column->size();
+    const size_t num_key_columns = key_columns.size();
+
+    dest_offsets_column->get_data() = src_offsets_column->get_data();
+
+    // Unpack each key array column.
+    std::vector<Column*> elements_per_key_col(num_key_columns);
+    std::vector<std::span<const uint32_t>> offsets_per_key_col(num_key_columns);
+    std::vector<const uint8_t*> nulls_per_key_col(num_key_columns, nullptr);
+    for (size_t i = 0; i < num_key_columns; ++i) {
+        const Column* key_column = key_columns[i];
+        if (key_column->is_nullable()) {
+            const auto* key_nullable_column = down_cast<const NullableColumn*>(key_column);
+            nulls_per_key_col[i] = key_nullable_column->immutable_null_column_data().data();
+            key_column = key_nullable_column->data_column().get();
+        }
+
+        const auto* key_array_column = down_cast<const ArrayColumn*>(key_column);
+        elements_per_key_col[i] = key_array_column->elements_column().get();
+        offsets_per_key_col[i] = key_array_column->offsets().get_data();
+    }
+
+    // Check if the number of elements in each array column of each row is exactly the same.
+    for (size_t row_i = 0; row_i < num_rows; ++row_i) {
+        if (src_null_column != nullptr && src_null_column->get_data()[row_i]) {
+            continue;
+        }
+
+        const auto cur_num_src_elements =
+                src_offsets_column->get_data()[row_i + 1] - src_offsets_column->get_data()[row_i];
+        for (size_t key_col_i = 0; key_col_i < num_key_columns; ++key_col_i) {
+            if (nulls_per_key_col[key_col_i] && nulls_per_key_col[key_col_i][row_i]) {
+                continue;
+            }
+
+            const auto cur_num_key_elements =
+                    offsets_per_key_col[key_col_i][row_i + 1] - offsets_per_key_col[key_col_i][row_i];
+            if (cur_num_src_elements != cur_num_key_elements) {
+                return Status::InvalidArgument("Input arrays' size are not equal in array_sortby.");
+            }
+        }
+    }
+
+    const SortDescs sort_desc = SortDescs::asc_null_first(num_key_columns);
+    const std::atomic<bool>& cancel = ctx->state()->cancelled_ref();
+    SmallPermutation permutation;
+    RETURN_IF_ERROR(sort_and_tie_columns(cancel, elements_per_key_col, sort_desc, permutation,
+                                         src_offsets_column->get_data(), offsets_per_key_col));
+
+    std::vector<uint32_t> key_sort_index;
+    raw::stl_vector_resize_uninitialized(&key_sort_index, num_src_element_rows);
+    for (int i = 0; i < num_src_element_rows; i++) {
+        key_sort_index[i] = permutation[i].index_in_chunk;
+    }
+    dest_elements_column->append_selective(*src_elements_column, key_sort_index);
+
+    return Status::OK();
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::array_sortby_multi(FunctionContext* ctx, const Columns& columns) {
+    DCHECK_GE(columns.size(), 1);
+
+    if (columns[0]->only_null()) {
+        return columns[0];
+    }
+
+    const size_t chunk_size = columns[0]->size();
+    auto* src_column = ColumnHelper::unpack_and_duplicate_const_column(chunk_size, columns[0]).get();
+    ColumnPtr dest_column = src_column->clone_empty();
+
+    std::vector<const Column*> key_columns;
+    key_columns.reserve(columns.size() - 1);
+    for (size_t i = 1; i < columns.size(); ++i) {
+        if (!columns[i]->only_null()) {
+            const auto* key_column = ColumnHelper::unpack_and_duplicate_const_column(chunk_size, columns[i]).get();
+            key_columns.emplace_back(key_column);
+        }
+    }
+
+    if (!src_column->is_nullable()) {
+        RETURN_IF_ERROR(sort_multi_array_column(ctx, src_column, nullptr, key_columns, dest_column.get()));
+    } else {
+        const auto* src_nullable_column = down_cast<const NullableColumn*>(src_column);
+        const auto* src_data_column = src_nullable_column->data_column().get();
+        const auto* src_null_column = src_nullable_column->null_column().get();
+
+        auto* dest_nullable_column = down_cast<NullableColumn*>(dest_column.get());
+        auto* dest_data_column = dest_nullable_column->mutable_data_column();
+        auto* dest_null_column = dest_nullable_column->mutable_null_column();
+
+        if (src_nullable_column->has_null()) {
+            dest_null_column->get_data().assign(src_null_column->get_data().begin(), src_null_column->get_data().end());
+        } else {
+            dest_null_column->get_data().resize(chunk_size, 0);
+            src_null_column = nullptr;
+        }
+        dest_nullable_column->set_has_null(src_nullable_column->has_null());
+
+        RETURN_IF_ERROR(sort_multi_array_column(ctx, src_data_column, src_null_column, key_columns, dest_data_column));
+    }
+
+    return std::move(dest_column);
+}
+
+StatusOr<ColumnPtr> ArrayFunctions::repeat(FunctionContext* ctx, const Columns& columns) {
+    RETURN_IF_COLUMNS_ONLY_NULL(columns);
+    DCHECK(columns.size() == 2);
+
+    const ColumnPtr& src_column = columns[0];
+    size_t num_rows = src_column->size();
+
+    const ColumnPtr& repeat_count_column = columns[1];
+    ColumnViewer<TYPE_INT> repeat_count_viewer(repeat_count_column);
+
+    ColumnPtr dest_column_elements = nullptr;
+    // Because the _elements of ArrayColumn must be nullable, but a non-null ConstColumn cannot be converted to nullable;
+    // therefore, the _data of ConstColumn is extracted as dest_column_elements.
+    if (src_column->is_constant() && !src_column->is_nullable()) {
+        ConstColumn* const_src_column = down_cast<ConstColumn*>(src_column.get());
+        dest_column_elements = const_src_column->data_column()->clone_empty();
+    } else {
+        dest_column_elements = src_column->clone_empty();
+    }
+    auto dest_offsets = UInt32Column::create(1);
+    size_t total_repeated_rows = 0;
+    for (int cur_row = 0; cur_row < num_rows; cur_row++) {
+        if (repeat_count_viewer.is_null(cur_row)) {
+            dest_offsets->append(total_repeated_rows);
+        } else {
+            Datum source_value = src_column->get(cur_row);
+            auto repeat_count = repeat_count_viewer.value(cur_row);
+            if (repeat_count > 0) {
+                for (int repeat_index = 0; repeat_index < repeat_count; repeat_index++) {
+                    TRY_CATCH_BAD_ALLOC(dest_column_elements->append_datum(source_value));
+                }
+                total_repeated_rows = total_repeated_rows + repeat_count;
+                dest_offsets->append(total_repeated_rows);
+            } else {
+                dest_offsets->append(total_repeated_rows);
+            }
+        }
+    }
+
+    ColumnPtr dest_column = nullptr;
+    if (dest_column_elements->is_nullable()) {
+        dest_column = ArrayColumn::create(std::move(dest_column_elements), std::move(dest_offsets));
+    } else {
+        auto nullable_dest_column_elements = NullableColumn::create(
+                dest_column_elements, NullColumn::create(dest_column_elements->size(), DATUM_NOT_NULL));
+        dest_column = ArrayColumn::create(std::move(nullable_dest_column_elements), std::move(dest_offsets));
+    }
+
+    NullColumnPtr null_result = nullptr;
+    if (repeat_count_column->is_nullable()) {
+        const auto* nullable_repeat_count_column = down_cast<const NullableColumn*>(repeat_count_column.get());
+        null_result = NullColumn::create(*nullable_repeat_count_column->null_column());
+    }
+
+    if (null_result) {
+        return NullableColumn::create(dest_column, null_result);
+    } else {
+        return dest_column;
+    }
+}
 } // namespace starrocks

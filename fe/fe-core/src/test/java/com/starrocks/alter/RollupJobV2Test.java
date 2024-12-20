@@ -35,7 +35,6 @@
 package com.starrocks.alter;
 
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.catalog.AggregateType;
@@ -52,18 +51,17 @@ import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.meta.MetaContext;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AlterTableClauseAnalyzer;
 import com.starrocks.sql.analyzer.DDLTestBase;
 import com.starrocks.sql.ast.AddRollupClause;
 import com.starrocks.sql.ast.AlterClause;
-import com.starrocks.sql.ast.CreateMaterializedViewStmt;
+import com.starrocks.sql.ast.ColumnDef;
+import com.starrocks.sql.optimizer.rule.mv.MVUtils;
 import com.starrocks.task.AgentTaskQueue;
-import com.starrocks.thrift.TStorageFormat;
 import org.apache.hadoop.util.ThreadUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -94,12 +92,13 @@ public class RollupJobV2Test extends DDLTestBase {
     public void setUp() throws Exception {
         super.setUp();
         clause = new AddRollupClause(GlobalStateMgrTestUtil.testRollupIndex2, Lists.newArrayList("v1"), null,
-                GlobalStateMgrTestUtil.testTable1, null);
-        clause.analyze(analyzer);
+                    GlobalStateMgrTestUtil.testTable1, null);
+        AlterTableClauseAnalyzer analyzer = new AlterTableClauseAnalyzer(null);
+        analyzer.analyze(null, clause);
 
         clause2 = new AddRollupClause(GlobalStateMgrTestUtil.testRollupIndex3, Lists.newArrayList("v1", "v2"), null,
-                GlobalStateMgrTestUtil.testTable1, null);
-        clause2.analyze(analyzer);
+                    GlobalStateMgrTestUtil.testTable1, null);
+        analyzer.analyze(null, clause2);
 
         AgentTaskQueue.clearAllTasks();
     }
@@ -110,31 +109,33 @@ public class RollupJobV2Test extends DDLTestBase {
     }
 
     @Test
-    public void testRunRollupJobConcurrentLimit() throws UserException {
+    public void testRunRollupJobConcurrentLimit() throws StarRocksException {
         MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
         alterClauses.add(clause2);
-        Database db = GlobalStateMgr.getCurrentState().getDb(GlobalStateMgrTestUtil.testDb1);
-        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTable1);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
         materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
 
         materializedViewHandler.runAfterCatalogReady();
 
         assertEquals(Config.max_running_rollup_job_num_per_table,
-                materializedViewHandler.getTableRunningJobMap().get(olapTable.getId()).size());
+                    materializedViewHandler.getTableRunningJobMap().get(olapTable.getId()).size());
         assertEquals(2, alterJobsV2.size());
         assertEquals(OlapTableState.ROLLUP, olapTable.getState());
     }
 
     @Test
-    public void testAddSchemaChange() throws UserException {
+    public void testAddSchemaChange() throws StarRocksException {
         MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
-        Database db = GlobalStateMgr.getCurrentState().getDb(GlobalStateMgrTestUtil.testDb1);
-        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTable1);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
         materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
         assertEquals(1, alterJobsV2.size());
@@ -149,30 +150,34 @@ public class RollupJobV2Test extends DDLTestBase {
         // add a rollup job
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
-        Database db = GlobalStateMgr.getCurrentState().getDb(GlobalStateMgrTestUtil.testDb1);
-        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTable1);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
         Partition testPartition = olapTable.getPartition(GlobalStateMgrTestUtil.testTable1);
         materializedViewHandler.process(alterClauses, db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
         assertEquals(1, alterJobsV2.size());
         RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
+        materializedViewHandler.clearJobs(); // Disable the execution of job in background thread
 
         // runPendingJob
-        materializedViewHandler.runAfterCatalogReady();
+        rollupJob.runPendingJob();
         assertEquals(AlterJobV2.JobState.WAITING_TXN, rollupJob.getJobState());
-        assertEquals(2, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.ALL).size());
-        assertEquals(1, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE).size());
-        assertEquals(1, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.SHADOW).size());
+        assertEquals(2, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.ALL).size());
+        assertEquals(1, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE).size());
+        assertEquals(1, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.SHADOW).size());
 
         // runWaitingTxnJob
-        materializedViewHandler.runAfterCatalogReady();
+        rollupJob.runWaitingTxnJob();
         assertEquals(AlterJobV2.JobState.RUNNING, rollupJob.getJobState());
 
         int retryCount = 0;
-        int maxRetry = 5;
-        while (retryCount < maxRetry) {
+        while (!rollupJob.getJobState().isFinalState()) {
             ThreadUtil.sleepAtLeastIgnoreInterrupts(2000L);
-            materializedViewHandler.runAfterCatalogReady();
+            rollupJob.runRunningJob();
             if (rollupJob.getJobState() == AlterJobV2.JobState.FINISHED) {
                 break;
             }
@@ -192,8 +197,9 @@ public class RollupJobV2Test extends DDLTestBase {
         ArrayList<AlterClause> alterClauses = new ArrayList<>();
         alterClauses.add(clause);
 
-        Database db = GlobalStateMgr.getCurrentState().getDb(GlobalStateMgrTestUtil.testDb1);
-        OlapTable olapTable = (OlapTable) db.getTable(GlobalStateMgrTestUtil.testTable1);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
         Partition testPartition = olapTable.getPartition(GlobalStateMgrTestUtil.testTable1);
 
         materializedViewHandler.process(alterClauses, db, olapTable);
@@ -201,7 +207,7 @@ public class RollupJobV2Test extends DDLTestBase {
         assertEquals(1, alterJobsV2.size());
         RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
 
-        MaterializedIndex baseIndex = testPartition.getBaseIndex();
+        MaterializedIndex baseIndex = testPartition.getDefaultPhysicalPartition().getBaseIndex();
         assertEquals(MaterializedIndex.IndexState.NORMAL, baseIndex.getState());
         assertEquals(Partition.PartitionState.NORMAL, testPartition.getState());
         assertEquals(OlapTableState.ROLLUP, olapTable.getState());
@@ -216,26 +222,29 @@ public class RollupJobV2Test extends DDLTestBase {
 
         // runPendingJob
         replica1.setState(Replica.ReplicaState.DECOMMISSION);
-        materializedViewHandler.runAfterCatalogReady();
+        rollupJob.runPendingJob();
         assertEquals(AlterJobV2.JobState.PENDING, rollupJob.getJobState());
 
         // table is stable, runPendingJob again
         replica1.setState(Replica.ReplicaState.NORMAL);
-        materializedViewHandler.runAfterCatalogReady();
+        rollupJob.runPendingJob();
         assertEquals(AlterJobV2.JobState.WAITING_TXN, rollupJob.getJobState());
-        assertEquals(2, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.ALL).size());
-        assertEquals(1, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE).size());
-        assertEquals(1, testPartition.getMaterializedIndices(MaterializedIndex.IndexExtState.SHADOW).size());
+        assertEquals(2, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.ALL).size());
+        assertEquals(1, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE).size());
+        assertEquals(1, testPartition.getDefaultPhysicalPartition()
+                .getMaterializedIndices(MaterializedIndex.IndexExtState.SHADOW).size());
 
         // runWaitingTxnJob
-        materializedViewHandler.runAfterCatalogReady();
+        rollupJob.runWaitingTxnJob();
         assertEquals(AlterJobV2.JobState.RUNNING, rollupJob.getJobState());
 
         int retryCount = 0;
         int maxRetry = 5;
         while (retryCount < maxRetry) {
             ThreadUtil.sleepAtLeastIgnoreInterrupts(2000L);
-            materializedViewHandler.runAfterCatalogReady();
+            rollupJob.runRunningJob();
             if (rollupJob.getJobState() == AlterJobV2.JobState.FINISHED) {
                 break;
             }
@@ -246,7 +255,7 @@ public class RollupJobV2Test extends DDLTestBase {
 
     @Test
     public void testSerializeOfRollupJob() throws IOException,
-            AnalysisException {
+                AnalysisException {
         Config.enable_materialized_view = true;
         // prepare file
         String fileName = "./RollupJobV2Test";
@@ -256,15 +265,15 @@ public class RollupJobV2Test extends DDLTestBase {
 
         short keysCount = 1;
         List<Column> columns = Lists.newArrayList();
-        String mvColumnName = CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX + "bitmap_union_" + "c1";
+        String mvColumnName = MVUtils.MATERIALIZED_VIEW_NAME_PREFIX + "bitmap_union_" + "c1";
         Column column = new Column(mvColumnName, Type.BITMAP, false, AggregateType.BITMAP_UNION, false,
-                new ColumnDef.DefaultValueDef(true, new StringLiteral("1")), "");
+                    new ColumnDef.DefaultValueDef(true, new StringLiteral("1")), "");
         columns.add(column);
-        RollupJobV2 rollupJobV2 = new RollupJobV2(1, 1, 1, "test", 1, 1, 1, "test", "rollup", columns, 1, 1,
-                KeysType.AGG_KEYS, keysCount,
-                new OriginStatement("create materialized view rollup as select bitmap_union(to_bitmap(c1)) from test",
-                        0));
-        rollupJobV2.setStorageFormat(TStorageFormat.V2);
+        RollupJobV2 rollupJobV2 = new RollupJobV2(1, 1, 1, "test", 1, 1,
+                    1, "test", "rollup", 0, columns, null, 1, 1,
+                    KeysType.AGG_KEYS, keysCount,
+                    new OriginStatement("create materialized view rollup as select bitmap_union(to_bitmap(c1)) from test",
+                                0), "", false);
 
         // write rollup job
         rollupJobV2.write(out);
@@ -272,20 +281,58 @@ public class RollupJobV2Test extends DDLTestBase {
         out.close();
 
         // read objects from file
-        MetaContext metaContext = new MetaContext();
-        metaContext.setMetaVersion(FeMetaVersion.VERSION_86);
-        metaContext.setThreadLocalInfo();
 
         DataInputStream in = new DataInputStream(new FileInputStream(file));
         RollupJobV2 result = (RollupJobV2) AlterJobV2.read(in);
-        assertEquals(TStorageFormat.V2, Deencapsulation.getField(result, "storageFormat"));
         List<Column> resultColumns = Deencapsulation.getField(result, "rollupSchema");
         assertEquals(1, resultColumns.size());
         Column resultColumn1 = resultColumns.get(0);
         assertEquals(mvColumnName,
-                resultColumn1.getName());
+                    resultColumn1.getName());
         Assert.assertTrue(resultColumn1.getDefineExpr() instanceof FunctionCallExpr);
         FunctionCallExpr resultFunctionCall = (FunctionCallExpr) resultColumn1.getDefineExpr();
         assertEquals("to_bitmap", resultFunctionCall.getFnName().getFunction());
+    }
+
+    @Test
+    public void testReplayPendingRollupJob() throws Exception {
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
+        ArrayList<AlterClause> alterClauses = new ArrayList<>();
+        alterClauses.add(clause);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
+        Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
+        assertEquals(1, alterJobsV2.size());
+
+        RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
+        rollupJob.replay(rollupJob);
+    }
+
+    @Test
+    public void testCancelPendingJobWithFlag() throws Exception {
+        MaterializedViewHandler materializedViewHandler = GlobalStateMgr.getCurrentState().getRollupHandler();
+
+        // add a rollup job
+        ArrayList<AlterClause> alterClauses = new ArrayList<>();
+        alterClauses.add(clause);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(GlobalStateMgrTestUtil.testDb1);
+        OlapTable olapTable = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                    .getTable(db.getFullName(), GlobalStateMgrTestUtil.testTable1);
+        Partition testPartition = olapTable.getPartition(GlobalStateMgrTestUtil.testTable1);
+        materializedViewHandler.process(alterClauses, db, olapTable);
+        Map<Long, AlterJobV2> alterJobsV2 = materializedViewHandler.getAlterJobsV2();
+        assertEquals(1, alterJobsV2.size());
+        RollupJobV2 rollupJob = (RollupJobV2) alterJobsV2.values().stream().findAny().get();
+        materializedViewHandler.clearJobs(); // Disable the execution of job in background thread
+
+        rollupJob.setIsCancelling(true);
+        rollupJob.runPendingJob();
+        rollupJob.setIsCancelling(false);
+
+        rollupJob.setWaitingCreatingReplica(true);
+        rollupJob.cancel("");
+        rollupJob.setWaitingCreatingReplica(false);
     }
 }

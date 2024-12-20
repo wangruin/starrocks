@@ -346,6 +346,10 @@ inline T StringParser::string_to_int_internal(const char* s, int len, int base, 
     case '-':
         negative = true;
         max_val = StringParser::numeric_limits<T>(false) + 1;
+        if (UNLIKELY(len == 1)) {
+            *result = PARSE_FAILURE;
+            return 0;
+        }
     case '+':
         i = 1;
     }
@@ -393,7 +397,7 @@ template <typename T>
 inline T StringParser::string_to_int_no_overflow(const char* s, int len, ParseResult* result) {
     T val = 0;
     if (UNLIKELY(len == 0)) {
-        *result = PARSE_SUCCESS;
+        *result = PARSE_FAILURE;
         return val;
     }
     // Factor out the first char for error handling speeds up the loop.
@@ -566,6 +570,11 @@ T StringParser::numeric_limits(bool negative) {
 
 template <>
 inline int StringParser::StringParseTraits<int8_t>::max_ascii_len() {
+    return 3;
+}
+
+template <>
+inline int StringParser::StringParseTraits<uint8_t>::max_ascii_len() {
     return 3;
 }
 

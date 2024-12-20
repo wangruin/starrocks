@@ -49,14 +49,15 @@ public:
 
     // Append a Chunk for sort.
     Status update(RuntimeState* state, const ChunkPtr& chunk) override;
-    Status done(RuntimeState* state) override;
+    Status do_done(RuntimeState* state) override;
     Status get_next(ChunkPtr* chunk, bool* eos) override;
 
     size_t get_output_rows() const override;
 
     int64_t mem_usage() const override;
 
-    void setup_runtime(starrocks::RuntimeProfile* profile, MemTracker* parent_mem_tracker) override;
+    void setup_runtime(RuntimeState* state, starrocks::RuntimeProfile* profile,
+                       MemTracker* parent_mem_tracker) override;
 
 private:
     // Three stages of sorting procedure:
@@ -67,15 +68,15 @@ private:
     Status _partial_sort(RuntimeState* state, bool done);
     Status _merge_sorted(RuntimeState* state);
     void _split_late_and_early_chunks();
-    static constexpr SlotId ORDINAL_COLUMN_SLOT_ID = -2;
     void _assign_ordinals();
     template <typename T>
     void _assign_ordinals_tmpl();
-    ChunkPtr _late_materialize(const ChunkPtr& chunk);
     template <typename T>
     ChunkPtr _late_materialize_tmpl(const ChunkPtr& chunk);
 
 protected:
+    ChunkPtr _late_materialize(const ChunkPtr& chunk);
+
     size_t _total_rows = 0;        // Total rows of sorting data
     Permutation _sort_permutation; // Temp permutation for sorting
     size_t _staging_unsorted_rows = 0;

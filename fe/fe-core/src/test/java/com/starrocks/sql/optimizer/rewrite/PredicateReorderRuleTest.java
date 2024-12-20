@@ -19,6 +19,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
@@ -71,7 +72,7 @@ public class PredicateReorderRuleTest {
     @BeforeClass
     public static void beforeClass() throws Exception {
 
-        FeConstants.default_scheduler_interval_millisecond = 1;
+        Config.alter_scheduler_interval_millisecond = 1;
         UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
@@ -92,8 +93,7 @@ public class PredicateReorderRuleTest {
                         "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");")
                 .withTable("CREATE TABLE `t1` (\n" +
                         "  `v1` int NULL COMMENT \"\",\n" +
@@ -103,12 +103,11 @@ public class PredicateReorderRuleTest {
                         "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");");
         CreateDbStmt dbStmt = new CreateDbStmt(false, StatsConstants.STATISTICS_DB_NAME);
         try {
-            GlobalStateMgr.getCurrentState().getMetadata().createDb(dbStmt.getFullDbName());
+            GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(dbStmt.getFullDbName());
         } catch (DdlException e) {
             return;
         }
@@ -140,8 +139,8 @@ public class PredicateReorderRuleTest {
 
         GlobalStateMgr catalog = GlobalStateMgr.getCurrentState();
         CachedStatisticStorage cachedStatisticStorage = new CachedStatisticStorage();
-        OlapTable t0 = (OlapTable) catalog.getDb("test").getTable("t0");
-        OlapTable t1 = (OlapTable) catalog.getDb("test").getTable("t1");
+        OlapTable t0 = (OlapTable) catalog.getLocalMetastore().getDb("test").getTable("t0");
+        OlapTable t1 = (OlapTable) catalog.getLocalMetastore().getDb("test").getTable("t1");
         cachedStatisticStorage.addColumnStatistic(t0, v1.getName(), statistics.getColumnStatistic(v1));
         cachedStatisticStorage.addColumnStatistic(t0, v2.getName(), statistics.getColumnStatistic(v2));
         cachedStatisticStorage.addColumnStatistic(t1, v1.getName(), statistics.getColumnStatistic(v1));
@@ -157,7 +156,7 @@ public class PredicateReorderRuleTest {
 
         sessionVariable.enablePredicateReorder();
 
-        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("test").getTable("t0");
+        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t0");
 
         PredicateReorderRule predicateReorderRule = new PredicateReorderRule(sessionVariable);
 
@@ -231,8 +230,8 @@ public class PredicateReorderRuleTest {
     public void testHashJoinPredicateReorder() {
         sessionVariable.enablePredicateReorder();
 
-        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("test").getTable("t0");
-        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("test").getTable("t1");
+        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t0");
+        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t1");
 
         PredicateReorderRule predicateReorderRule = new PredicateReorderRule(sessionVariable);
 
@@ -274,6 +273,7 @@ public class PredicateReorderRuleTest {
                 hashJoinImplementationRule.transform(new OptExpression(logicalJoinOperator1), null).get(0);
         optExpression1.getInputs().add(optExpressionT0);
         optExpression1.getInputs().add(optExpressionT1);
+        optExpression1.setStatistics(statistics);
 
         LogicalJoinOperator.Builder builder2 = new LogicalJoinOperator.Builder();
         builder2.setPredicate(or);
@@ -282,6 +282,7 @@ public class PredicateReorderRuleTest {
                 hashJoinImplementationRule.transform(new OptExpression(logicalJoinOperator2), null).get(0);
         optExpression2.getInputs().add(optExpressionT0);
         optExpression2.getInputs().add(optExpressionT1);
+        optExpression2.setStatistics(statistics);
         //
         optExpression1 = predicateReorderRule.rewrite(optExpression1, null);
         assertEquals(optExpression1.getOp().getPredicate().getChild(0), intEq1);

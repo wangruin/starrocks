@@ -27,7 +27,7 @@ namespace starrocks::pipeline {
 class MockEmptyOperator final : public SourceOperator {
 public:
     MockEmptyOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence)
-            : SourceOperator(factory, id, "mock_empty_operator", plan_node_id, driver_sequence) {}
+            : SourceOperator(factory, id, "mock_empty_operator", plan_node_id, false, driver_sequence) {}
 
     ~MockEmptyOperator() override = default;
 
@@ -82,7 +82,7 @@ PARALLEL_TEST(QuerySharedDriverQueueTest, test_basic) {
 
     // Take drivers from queue.
     for (auto* out_driver : out_drivers) {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.ok());
         ASSERT_EQ(out_driver, maybe_driver.value());
     }
@@ -124,7 +124,7 @@ PARALLEL_TEST(QuerySharedDriverQueueTest, test_cancel) {
 
     for (size_t i = 0; i < out_drivers.size(); i++) {
         ops_before_get[i]();
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.ok());
         ASSERT_EQ(out_drivers[i], maybe_driver.value());
     }
@@ -139,7 +139,7 @@ PARALLEL_TEST(QuerySharedDriverQueueTest, test_take_block) {
     _set_driver_level(driver1.get(), 1);
 
     auto consumer_thread = std::make_shared<std::thread>([&queue, &driver1] {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.ok());
         ASSERT_EQ(driver1.get(), maybe_driver.value());
     });
@@ -155,7 +155,7 @@ PARALLEL_TEST(QuerySharedDriverQueueTest, test_take_close) {
     QuerySharedDriverQueue queue;
 
     auto consumer_thread = std::make_shared<std::thread>([&queue] {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.status().is_cancelled());
     });
 
@@ -169,17 +169,17 @@ class WorkGroupDriverQueueTest : public ::testing::Test {
 public:
     void SetUp() override {
         _wg1 = std::make_shared<workgroup::WorkGroup>("wg100", 100, workgroup::WorkGroup::DEFAULT_VERSION, 1, 0.5, 10,
-                                                      workgroup::WorkGroupType::WG_NORMAL);
+                                                      1.0, workgroup::WorkGroupType::WG_NORMAL);
         _wg2 = std::make_shared<workgroup::WorkGroup>("wg200", 200, workgroup::WorkGroup::DEFAULT_VERSION, 2, 0.5, 10,
-                                                      workgroup::WorkGroupType::WG_NORMAL);
+                                                      1.0, workgroup::WorkGroupType::WG_NORMAL);
         _wg3 = std::make_shared<workgroup::WorkGroup>("wg300", 300, workgroup::WorkGroup::DEFAULT_VERSION, 1, 0.5, 10,
-                                                      workgroup::WorkGroupType::WG_NORMAL);
+                                                      1.0, workgroup::WorkGroupType::WG_NORMAL);
         _wg4 = std::make_shared<workgroup::WorkGroup>("wg400", 400, workgroup::WorkGroup::DEFAULT_VERSION, 1, 0.5, 10,
-                                                      workgroup::WorkGroupType::WG_NORMAL);
-        _wg1 = workgroup::WorkGroupManager::instance()->add_workgroup(_wg1);
-        _wg2 = workgroup::WorkGroupManager::instance()->add_workgroup(_wg2);
-        _wg3 = workgroup::WorkGroupManager::instance()->add_workgroup(_wg3);
-        _wg4 = workgroup::WorkGroupManager::instance()->add_workgroup(_wg4);
+                                                      1.0, workgroup::WorkGroupType::WG_NORMAL);
+        _wg1 = ExecEnv::GetInstance()->workgroup_manager()->add_workgroup(_wg1);
+        _wg2 = ExecEnv::GetInstance()->workgroup_manager()->add_workgroup(_wg2);
+        _wg3 = ExecEnv::GetInstance()->workgroup_manager()->add_workgroup(_wg3);
+        _wg4 = ExecEnv::GetInstance()->workgroup_manager()->add_workgroup(_wg4);
     }
 
 protected:
@@ -263,7 +263,7 @@ TEST_F(WorkGroupDriverQueueTest, test_basic) {
 
     // Take drivers from queue.
     for (auto* out_driver : out_drivers) {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.ok());
         ASSERT_EQ(out_driver, maybe_driver.value());
     }
@@ -279,7 +279,7 @@ TEST_F(WorkGroupDriverQueueTest, test_take_block) {
     driver1->set_workgroup(_wg1);
 
     auto consumer_thread = std::make_shared<std::thread>([&queue, &driver1] {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.ok());
         ASSERT_EQ(driver1.get(), maybe_driver.value());
     });
@@ -295,7 +295,7 @@ TEST_F(WorkGroupDriverQueueTest, test_take_close) {
     WorkGroupDriverQueue queue;
 
     auto consumer_thread = std::make_shared<std::thread>([&queue] {
-        auto maybe_driver = queue.take();
+        auto maybe_driver = queue.take(true);
         ASSERT_TRUE(maybe_driver.status().is_cancelled());
     });
 

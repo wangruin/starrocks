@@ -16,6 +16,7 @@ package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.IntLiteral;
@@ -38,7 +39,7 @@ public class ShowLoadWarningsStmtAnalyzer {
         new ShowLoadWarningsStmtAnalyzerVisitor().visit(statement, context);
     }
 
-    static class ShowLoadWarningsStmtAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class ShowLoadWarningsStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
 
         private String label;
         private long jobId;
@@ -134,7 +135,7 @@ public class ShowLoadWarningsStmtAnalyzer {
 
                 if (subExpr instanceof BinaryPredicate) {
                     BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-                    if (binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+                    if (binaryPredicate.getOp() != BinaryType.EQ) {
                         valid = false;
                         break;
                     }

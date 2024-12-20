@@ -18,20 +18,11 @@
 
 #include "column/column_helper.h"
 #include "column/struct_column.h"
+#include "exprs/mock_vectorized_expr.h"
 
 namespace starrocks {
 
 namespace {
-class FakeConstExpr : public starrocks::Expr {
-public:
-    explicit FakeConstExpr(const TExprNode& dummy) : Expr(dummy) {}
-
-    StatusOr<ColumnPtr> evaluate_checked(ExprContext*, Chunk*) override { return _column; }
-
-    Expr* clone(ObjectPool*) const override { return nullptr; }
-
-    ColumnPtr _column;
-};
 
 std::unique_ptr<Expr> create_subfield_expr(const TypeDescriptor& type,
                                            const std::vector<std::string>& used_subfield_name) {
@@ -142,7 +133,7 @@ TEST_F(SubfieldExprTest, subfield_null_test) {
         EXPECT_TRUE(subfield_column->is_numeric());
         EXPECT_EQ(3, subfield_column->size());
         EXPECT_EQ("1", subfield_column->debug_item(0));
-        EXPECT_EQ("0", subfield_column->debug_item(1));
+        EXPECT_TRUE(result->is_null(1));
         EXPECT_EQ("3", subfield_column->debug_item(2));
     }
 
@@ -203,7 +194,7 @@ TEST_F(SubfieldExprTest, subfield_clone_test) {
     EXPECT_TRUE(subfield_column->is_numeric());
     EXPECT_EQ(3, subfield_column->size());
     EXPECT_EQ("1", subfield_column->debug_item(0));
-    EXPECT_EQ("0", subfield_column->debug_item(1));
+    EXPECT_TRUE(result->is_null(1));
     EXPECT_EQ("3", subfield_column->debug_item(2));
 
     // Column must be cloned
@@ -242,11 +233,10 @@ TEST_F(SubfieldExprTest, subfield_multi_level_test) {
     expr->add_child(new_fake_const_expr(column, struct_type));
     auto result = expr->evaluate(nullptr, nullptr);
     EXPECT_TRUE(result->is_nullable());
-    auto subfield_column = ColumnHelper::get_data_column(result.get());
-    EXPECT_EQ(3, subfield_column->size());
-    EXPECT_EQ("'smith'", subfield_column->debug_item(0));
-    EXPECT_EQ("''", subfield_column->debug_item(1));
-    EXPECT_EQ("'cruise'", subfield_column->debug_item(2));
+    EXPECT_EQ(3, result->size());
+    EXPECT_EQ("'smith'", result->debug_item(0));
+    EXPECT_EQ("NULL", result->debug_item(1));
+    EXPECT_EQ("'cruise'", result->debug_item(2));
 }
 
 } // namespace starrocks

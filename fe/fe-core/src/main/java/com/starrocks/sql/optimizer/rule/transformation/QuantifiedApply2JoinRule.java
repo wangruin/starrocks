@@ -16,6 +16,7 @@
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
@@ -66,7 +67,7 @@ public class QuantifiedApply2JoinRule extends TransformationRule {
                 ScalarOperator left = multiIn.getChild(i);
                 ScalarOperator right = multiIn.getChild(multiIn.getTupleSize() + i);
                 ScalarOperator normalizedConjunct =
-                        rewriter.rewrite(new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ,
+                        rewriter.rewrite(new BinaryPredicateOperator(BinaryType.EQ,
                                 left, right), ScalarOperatorRewriter.DEFAULT_REWRITE_RULES);
                 conjuncts.add(normalizedConjunct);
             }
@@ -75,7 +76,7 @@ public class QuantifiedApply2JoinRule extends TransformationRule {
             // IN/NOT IN
             InPredicateOperator ipo = (InPredicateOperator) apply.getSubqueryOperator();
             BinaryPredicateOperator bpo =
-                    new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, ipo.getChildren());
+                    new BinaryPredicateOperator(BinaryType.EQ, ipo.getChildren());
             isNotIn = ipo.isNotIn();
 
             ScalarOperatorRewriter rewriter = new ScalarOperatorRewriter();
@@ -89,9 +90,11 @@ public class QuantifiedApply2JoinRule extends TransformationRule {
         OptExpression joinExpression;
         if (isNotIn) {
             //@TODO: if will can filter null, use left-anti-join
+            List<ScalarOperator> correlatedConjuncts = Utils.extractConjuncts(apply.getCorrelationConjuncts());
+            correlatedConjuncts.forEach(conjunct -> conjunct.setCorrelated(true));
             joinExpression = new OptExpression(new LogicalJoinOperator(JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN,
                     Utils.compoundAnd(simplifiedPredicate,
-                            Utils.compoundAnd(apply.getCorrelationConjuncts(), apply.getPredicate()))));
+                            Utils.compoundAnd(Utils.compoundAnd(correlatedConjuncts), apply.getPredicate()))));
         } else {
             joinExpression = new OptExpression(new LogicalJoinOperator(JoinOperator.LEFT_SEMI_JOIN,
                     Utils.compoundAnd(simplifiedPredicate,

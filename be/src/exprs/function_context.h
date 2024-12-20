@@ -22,7 +22,8 @@
 #include <string>
 #include <vector>
 
-#include "exprs/function_context.h"
+#include "common/status.h"
+#include "runtime/types.h"
 #include "types/logical_type.h"
 
 namespace starrocks {
@@ -31,22 +32,14 @@ class MemPool;
 class RuntimeState;
 
 class Column;
+class Slice;
 struct JavaUDAFContext;
+struct NgramBloomFilterState;
 using ColumnPtr = std::shared_ptr<Column>;
 
 class FunctionContext {
 public:
-    struct TypeDesc {
-        ::starrocks::LogicalType type = ::starrocks::TYPE_NULL;
-
-        /// Only valid if type == TYPE_DECIMAL
-        int precision = 0;
-        int scale = 0;
-
-        /// Only valid if type == TYPE_FIXED_BUFFER || type == TYPE_VARCHAR
-        int len = 0;
-        std::vector<TypeDesc> children;
-    };
+    using TypeDesc = TypeDescriptor;
 
     enum FunctionStateScope {
         /// Indicates that the function state for this FunctionContext's UDF is shared across
@@ -77,7 +70,7 @@ public:
 
     static FunctionContext* create_context(RuntimeState* state, MemPool* pool,
                                            const FunctionContext::TypeDesc& return_type,
-                                           const std::vector<FunctionContext::TypeDesc>& arg_types,
+                                           const std::vector<FunctionContext::TypeDesc>& arg_types, bool is_distinct,
                                            const std::vector<bool>& isAscOrder, const std::vector<bool>& nullsFirst);
 
     ~FunctionContext();
@@ -114,10 +107,12 @@ public:
 
     std::vector<bool> get_is_asc_order() { return _is_asc_order; }
     std::vector<bool> get_nulls_first() { return _nulls_first; }
+    bool get_is_distinct() { return _is_distinct; }
     // for tests
     void set_is_asc_order(const std::vector<bool>& order) { _is_asc_order = order; }
     void set_nulls_first(const std::vector<bool>& nulls) { _nulls_first = nulls; }
     void set_runtime_state(RuntimeState* const state) { _state = state; }
+    void set_is_distinct(bool is_distinct) { _is_distinct = is_distinct; }
 
     // Returns _constant_columns size
     int get_num_constant_columns() const;
@@ -125,6 +120,8 @@ public:
     // Returns the type information for the arg_idx-th argument (0-indexed, not including
     // the FunctionContext* argument). Returns NULL if arg_idx is invalid.
     const TypeDesc* get_arg_type(int arg_idx) const;
+
+    const std::vector<FunctionContext::TypeDesc>& get_arg_types() const { return _arg_types; }
 
     bool is_constant_column(int arg_idx) const;
 
@@ -135,6 +132,8 @@ public:
 
     bool is_udf() { return _is_udf; }
     void set_is_udf(bool is_udf) { this->_is_udf = is_udf; }
+
+    ColumnPtr create_column(const TypeDesc& type_desc, bool nullable);
 
     // Create a test FunctionContext object. The caller is responsible for calling delete
     // on it. This context has additional debugging validation enabled.
@@ -149,14 +148,35 @@ public:
     void set_constant_columns(std::vector<ColumnPtr> columns) { _constant_columns = std::move(columns); }
 
     MemPool* mem_pool() { return _mem_pool; }
-    size_t mem_usage() { return _mem_usage; }
-    void add_mem_usage(size_t size) { _mem_usage += size; }
+
+    void set_mem_usage_counter(int64_t* mem_usage_counter) { _mem_usage_counter = mem_usage_counter; }
+
+    int64_t mem_usage() const {
+        DCHECK(_mem_usage_counter);
+        return *_mem_usage_counter;
+    }
+    void add_mem_usage(int64_t delta) {
+        DCHECK(_mem_usage_counter);
+        *_mem_usage_counter += delta;
+    }
 
     RuntimeState* state() { return _state; }
     bool has_error() const;
     const char* error_msg() const;
 
     JavaUDAFContext* udaf_ctxs() { return _jvm_udaf_ctxs.get(); }
+
+    void release_mems();
+
+    ssize_t get_group_concat_max_len() { return group_concat_max_len; }
+    // min value is 4, default is 1024
+    void set_group_concat_max_len(ssize_t len) { group_concat_max_len = len < 4 ? 4 : len; }
+
+    bool error_if_overflow() const;
+
+    bool allow_throw_exception() const;
+
+    std::unique_ptr<NgramBloomFilterState>& get_ngram_state() { return _ngramState; }
 
 private:
     friend class ExprContext;
@@ -165,18 +185,18 @@ private:
 
     // We use the query's runtime state to report errors and warnings. NULL for test
     // contexts.
-    RuntimeState* _state;
+    RuntimeState* _state{nullptr};
 
     // Empty if there's no error
     mutable std::mutex _error_msg_mutex;
     std::string _error_msg;
 
     // The number of warnings reported.
-    int64_t _num_warnings;
+    int64_t _num_warnings{0};
 
     /// The function state accessed via FunctionContext::Get/SetFunctionState()
-    void* _thread_local_fn_state;
-    void* _fragment_local_fn_state;
+    void* _thread_local_fn_state{nullptr};
+    void* _fragment_local_fn_state{nullptr};
 
     // Type descriptor for the return type of the function.
     FunctionContext::TypeDesc _return_type;
@@ -190,14 +210,23 @@ private:
     // Indicates whether this context has been closed. Used for verification/debugging.
     bool _is_udf = false;
 
-    // this is used for count memory usage of aggregate state
-    size_t _mem_usage = 0;
+    int64_t _mem_usage = 0;
+    // This is used to count the memory usage of the agg state.
+    // In Aggregator, multiple FunctionContexts can share the same counter.
+    // If it is not explicitly set externally (e.g. AggFuncBasedValueAggregator),
+    // it will point to the internal _mem_usage
+    int64_t* _mem_usage_counter = &_mem_usage;
 
     // UDAF Context
     std::unique_ptr<JavaUDAFContext> _jvm_udaf_ctxs;
 
     std::vector<bool> _is_asc_order;
     std::vector<bool> _nulls_first;
+    bool _is_distinct = false;
+    ssize_t group_concat_max_len = 1024;
+
+    // used for ngram bloom filter to speed up some function
+    std::unique_ptr<NgramBloomFilterState> _ngramState;
 };
 
 } // namespace starrocks

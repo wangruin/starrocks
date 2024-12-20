@@ -15,6 +15,7 @@
 package com.starrocks.sql.common;
 
 import static com.starrocks.sql.common.ErrorMsgProxy.BaseMessage;
+
 public interface ParserErrorMsg {
 
     // --------- error in building AST phase ---------
@@ -27,25 +28,25 @@ public interface ParserErrorMsg {
     @BaseMessage("No viable statement for input ''{0}''")
     String noViableStatement(String a0);
 
-    @BaseMessage("Input ''{0}'' is not valid at this position")
-    String inputMismatch(String a0);
-
     @BaseMessage("Input ''{0}'' is valid only for ''{1}''")
     String failedPredicate(String a0, String a1);
+
+    @BaseMessage("Unexpected input ''{0}'', the most similar input is {1}")
+    String unexpectedInput(String a0, String a1);
 
     @BaseMessage("Statement exceeds maximum length limit, please consider modify ''parse_tokens_limit'' session variable")
     String tokenExceedLimit();
 
     @BaseMessage("The inserted rows are {0} exceeded the maximum limit {1}, please consider modify " +
-            "''expr_children_limit'' in BE conf")
+            "''expr_children_limit'' in FE conf")
     String insertRowsExceedLimit(long a0, int a1);
 
     @BaseMessage("The number of exprs are {0} exceeded the maximum limit {1}, please consider modify " +
-            "''expr_children_limit'' in BE conf")
+            "''expr_children_limit'' in FE conf")
     String exprsExceedLimit(long a0, int a1);
 
     @BaseMessage("The number of children in expr are {0} exceeded the maximum limit {1}, please consider modify " +
-            "''expr_children_limit'' in BE conf")
+            "''expr_children_limit'' in FE conf")
     String argsOfExprExceedLimit(long a0, int a1);
 
     @BaseMessage("Invalid db name format ''{0}''")
@@ -57,17 +58,29 @@ public interface ParserErrorMsg {
     @BaseMessage("Invalid task name format ''{0}''")
     String invalidTaskFormat(String a0);
 
+    @BaseMessage("Invalid pipe name ''{0}''")
+    String invalidPipeName(String a0);
+
     @BaseMessage("Invalid UDF function name ''{0}''")
     String invalidUDFName(String a0);
 
     @BaseMessage("Unsupported type specification: ''{0}''")
     String unsupportedType(String a0);
 
+    @BaseMessage("Unsupported type specification: ''{0}'' {1}")
+    String unsupportedType(String a0, String a1);
+
+    @BaseMessage("Unsupported statement: {0}")
+    String unsupportedStatement(String a0);
+
     @BaseMessage("AUTO_INCREMENT column {0} must be NOT NULL")
     String nullColFoundInPK(String a0);
 
     @BaseMessage("Incorrect number of arguments in expr ''{0}''")
     String wrongNumOfArgs(String a0);
+
+    @BaseMessage("Incorrect number {0} of arguments in expr ''{1}'', {2}")
+    String wrongNumOfArgs(int a0, String a1, String a2);
 
     @BaseMessage("Incorrect type/value of arguments in expr ''{0}''")
     String wrongTypeOfArgs(String a0);
@@ -81,8 +94,8 @@ public interface ParserErrorMsg {
     @BaseMessage("Unsupported expr ''{0}'' in {1} clause. {2}")
     String unsupportedExprWithInfoAndExplain(String a0, String a1, String a2);
 
-    @BaseMessage("Cannot use duplicated {0} clause in building materialized view")
-    String duplicatedClause(String a0);
+    @BaseMessage("Cannot use duplicated {0} clause in {1}")
+    String duplicatedClause(String a0, String a1);
 
     @BaseMessage("''{0}'' cannot support ''{1}'' in materialized view")
     String forbidClauseInMV(String a0, String a1);
@@ -93,8 +106,14 @@ public interface ParserErrorMsg {
     @BaseMessage("Sql to be add black list is empty")
     String emptySql();
 
-    @BaseMessage("Column ''{0}'' can not be AUTO_INCREMENT when {1} COLUMN.")
+    @BaseMessage("Column ''{0}'' can not be AUTO_INCREMENT when {1} COLUMN")
     String autoIncrementForbid(String a0, String a1);
+
+    @BaseMessage("Column ''{0}'' can not be GENERATED COLUMN when {1}")
+    String generatedColumnForbid(String a0, String a1);
+
+    @BaseMessage("{0} can not be set when {1}")
+    String generatedColumnLimit(String a0, String a1);
 
     @BaseMessage("No tables used")
     String noTableUsed();
@@ -114,9 +133,17 @@ public interface ParserErrorMsg {
     @BaseMessage("Binary literal can only contain hexadecimal digits and an even number of digits")
     String invalidBinaryFormat();
 
-    @BaseMessage("Refresh start time must be after current time")
-    String invalidStartTime();
+    @BaseMessage("Invalid map format, which should be key:value")
+    String invalidMapFormat();
 
+    @BaseMessage("{0} must be nullable column")
+    String foundNotNull(String a0);
+
+    @BaseMessage("{0} has no default values")
+    String hasDefaultValue(String a0);
+
+    @BaseMessage("{0} can not be KEY")
+    String isKey(String a0);
 
     // --------- error in analyzing phase ---------
     @BaseMessage("Invalid {0} id format ''{1}''")
@@ -140,12 +167,17 @@ public interface ParserErrorMsg {
     @BaseMessage("Unsupported operation on {0}")
     String unsupportedOpWithInfo(String a0);
 
+    @BaseMessage("Unsupported operation {0}")
+    String unsupportedOp(String a0);
+
     @BaseMessage("Unsupported predicates. Where clause can only be ''{0}''")
     String invalidWhereExpr(String a0);
 
-
     @BaseMessage("''{0}'' must be an aggregate expression or appear in GROUP BY clause")
     String shouldBeAggFunc(String a0);
+
+    @BaseMessage("subquery correlated column ''{0}'' in ''{1}'' must be an aggregate expression or appear in GROUP BY clause")
+    String unsupportedNoGroupBySubquery(String a0, String a1);
 
     @BaseMessage("Exist must have exact one subquery")
     String canOnlyOneExistSub();
@@ -173,4 +205,36 @@ public interface ParserErrorMsg {
 
     @BaseMessage("Invalid column name format ''{0}''")
     String invalidColFormat(String a0);
+
+    @BaseMessage("Conflicted options {0} and {1}")
+    String conflictedOptions(String a0, String a1);
+
+    @BaseMessage("Not support ''{0}'' {1}")
+    String unsupportedSubquery(String a0, String a1);
+
+    @BaseMessage("Invalid hint value ''{0}''")
+    String invalidHintValue(String a0);
+
+    @BaseMessage("Failed to evaluate user variable hint ''{0}'', because {1}")
+    String invalidUserVariableHint(String a0, String a1);
+
+    @BaseMessage("No selected database for cancel BACKUP/RESTORE")
+    String nullIdentifierCancelBackupRestore();
+    @BaseMessage("Value count in PIVOT {0} must match number of FOR columns {1}")
+    String pivotValueArityMismatch(int a0, int a1);
+
+    @BaseMessage("Specifying dbName before snapshot name is forbidden if the DbName is specified explicitly in BACKUP/RESTORE")
+    String unsupportedSepcifyDbNameAfterSnapshotName();
+
+    @BaseMessage("Specifying alias for backup object is forbidden in BACKUP stmt")
+    String unsupportedSepcifyAliasInBackupStmt();
+
+    @BaseMessage("`ON` clause is forbidden if no Database explicitly specified in Restore stmt")
+    String unsupportedOnClauseWithoutAnyDbNameInRestoreStmt();
+
+    @BaseMessage("Can not sepcify database name for external catalog Backup/Restore")
+    String unsupportedSepcifyDbForExternalCatalog();
+
+    @BaseMessage("Can not sepcify `ON` clause for external catalog Backup/Restore")
+    String unsupportedOnForExternalCatalog();
 }

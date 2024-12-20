@@ -37,6 +37,8 @@
 #include "runtime/runtime_state.h"
 #include "runtime/sorted_chunks_merger.h"
 #include "runtime/types.h"
+#include "types/logical_type.h"
+#include "util/runtime_profile.h"
 
 namespace starrocks {
 
@@ -91,6 +93,7 @@ public:
         std::random_device dev;
         std::mt19937 rng(dev());
         UniformInt uniform_int;
+        std::uniform_real_distribution<> niform_real(1, 10);
         if (low_card) {
             uniform_int.param(UniformInt::param_type(1, 100 * std::pow(2, slot_index)));
         } else {
@@ -122,6 +125,8 @@ public:
                 column->append_datum(Datum(x));
             } else if (type_desc.type == TYPE_VARCHAR) {
                 column->append_datum(Datum(gen_rand_str()));
+            } else if (type_desc.type == TYPE_DOUBLE) {
+                column->append_datum(Datum(niform_real(rng)));
             } else {
                 std::cerr << "not supported" << std::endl;
             }
@@ -193,6 +198,8 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
         type_desc = TypeDescriptor(TYPE_INT);
     } else if (data_type == TYPE_VARCHAR) {
         type_desc = TypeDescriptor::create_varchar_type(TypeDescriptor::MAX_VARCHAR_LENGTH);
+    } else if (data_type == TYPE_DOUBLE) {
+        type_desc = TypeDescriptor(TYPE_DOUBLE);
     } else {
         ASSERT_TRUE(false) << "not support type: " << data_type;
     }
@@ -222,8 +229,13 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
     int64_t item_processed = 0;
     int64_t data_size = 0;
     int64_t mem_usage = 0;
+    const int64_t max_buffered_rows = 1024 * 1024;
+    const int64_t max_buffered_bytes = max_buffered_rows * 256;
+    const std::vector<SlotId> early_materialized_slots;
+
     for (auto _ : state) {
         state.PauseTiming();
+        RuntimeProfile profile("dummy");
         std::unique_ptr<ChunksSorter> sorter;
         size_t expected_rows = 0;
         size_t total_rows = chunk->num_rows() * num_chunks;
@@ -232,7 +244,8 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
         switch (sorter_algo) {
         case FullSort: {
             sorter = std::make_unique<ChunksSorterFullSort>(suite._runtime_state.get(), &sort_exprs, &asc_arr,
-                                                            &null_first, "");
+                                                            &null_first, "", max_buffered_rows, max_buffered_bytes,
+                                                            early_materialized_slots);
             expected_rows = total_rows;
             break;
         }
@@ -252,6 +265,7 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
         default:
             ASSERT_TRUE(false) << "unknown algorithm " << (int)sorter_algo;
         }
+        sorter->setup_runtime(suite._runtime_state.get(), &profile, suite._runtime_state->instance_mem_tracker());
 
         int64_t iteration_data_size = 0;
         for (int i = 0; i < num_chunks; i++) {
@@ -263,14 +277,14 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
             // TopN Sorter needs timing when updating
             iteration_data_size += ck->bytes_usage();
             state.ResumeTiming();
-            sorter->update(runtime_state, ck);
+            ASSERT_TRUE(sorter->update(runtime_state, ck).ok());
             state.PauseTiming();
             mem_usage = std::max(mem_usage, sorter->mem_usage());
         }
         data_size = std::max(data_size, iteration_data_size);
 
         state.ResumeTiming();
-        sorter->done(suite._runtime_state.get());
+        ASSERT_TRUE(sorter->done(suite._runtime_state.get()).ok());
         item_processed += total_rows;
         state.PauseTiming();
         mem_usage = std::max(mem_usage, sorter->mem_usage());
@@ -279,13 +293,13 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Logical
         size_t actual_rows = 0;
         while (!eos) {
             ChunkPtr page;
-            sorter->get_next(&page, &eos);
+            ASSERT_TRUE(sorter->get_next(&page, &eos).ok());
             if (eos) break;
             actual_rows += page->num_rows();
         }
         ASSERT_TRUE(eos);
         ASSERT_EQ(expected_rows, actual_rows);
-        sorter->done(suite._runtime_state.get());
+        ASSERT_TRUE(sorter->done(suite._runtime_state.get()).ok());
     }
     state.counters["rows_sorted"] += item_processed;
     state.counters["data_size"] += data_size;
@@ -424,7 +438,7 @@ static void do_merge_columnwise(benchmark::State& state, int num_runs, bool null
             }
         }
         SortedRuns merged;
-        merge_sorted_chunks(sort_desc, &sort_exprs, inputs, &merged);
+        ASSERT_TRUE(merge_sorted_chunks(sort_desc, &sort_exprs, inputs, &merged).ok());
         ASSERT_EQ(input_rows, merged.num_rows());
 
         num_rows += merged.num_rows();
@@ -437,6 +451,9 @@ static void do_merge_columnwise(benchmark::State& state, int num_runs, bool null
 // Sort full data: ORDER BY
 static void BM_fullsort_notnull(benchmark::State& state) {
     do_bench(state, FullSort, TYPE_INT, state.range(0), state.range(1));
+}
+static void BM_fullsort_float_notnull(benchmark::State& state) {
+    do_bench(state, FullSort, TYPE_DOUBLE, state.range(0), state.range(1));
 }
 static void BM_fullsort_nullable(benchmark::State& state) {
     do_bench(state, FullSort, TYPE_INT, state.range(0), state.range(1), SortParameters::with_nullable(true));
@@ -516,6 +533,7 @@ static void CustomArgsLimit(benchmark::internal::Benchmark* b) {
 // Full sort
 BENCHMARK(BM_fullsort_notnull)->Apply(CustomArgsFull);
 BENCHMARK(BM_fullsort_nullable)->Apply(CustomArgsFull);
+BENCHMARK(BM_fullsort_float_notnull)->Apply(CustomArgsFull);
 BENCHMARK(BM_fullsort_varchar_column_incr)->Apply(CustomArgsFull);
 
 // Low-Cardinality Sort

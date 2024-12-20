@@ -14,13 +14,17 @@
 
 package com.starrocks.sql.plan;
 
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.FunctionName;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.TableFunction;
 import com.starrocks.catalog.Type;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.HdfsURI;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.thrift.TFunctionBinaryType;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -97,11 +101,14 @@ public class UDFTest extends PlanTestBase {
     @Test
     public void testMultiUnnest() throws Exception {
         String sql = "with t as (select [1,2,3] as a, [4,5,6] as b, [4,5,6] as c) select * from t,unnest(a,b,c)";
-        PhysicalTableFunctionOperator tp = (PhysicalTableFunctionOperator) getExecPlan(sql).getPhysicalPlan().getOp();
+        ExecPlan execPlan = getExecPlan(sql);
+        PhysicalTableFunctionOperator tp = (PhysicalTableFunctionOperator) execPlan.getPhysicalPlan().getOp();
 
         Assert.assertEquals(3, tp.getFnParamColumnRefs().size());
-        Assert.assertEquals("[6, 8, 8]",
+        Assert.assertEquals("[8, 9, 10]",
                 tp.getFnParamColumnRefs().stream().map(ColumnRefOperator::getId).collect(Collectors.toList()).toString());
+        Assert.assertTrue(execPlan.getOptExpression(2).getStatistics().getColumnStatistics().values()
+                .stream().anyMatch(x -> !x.isUnknown()));
 
         sql = "select * from tarray, unnest(v3, v3)";
         tp = (PhysicalTableFunctionOperator) getExecPlan(sql).getPhysicalPlan().getOp();
@@ -117,7 +124,27 @@ public class UDFTest extends PlanTestBase {
                 "select unnest.a, unnest.b from t, unnest(a, b) as unnest(a, b);";
         tp = (PhysicalTableFunctionOperator) getExecPlan(sql).getPhysicalPlan().getOp();
         Assert.assertEquals(2, tp.getFnParamColumnRefs().size());
-        Assert.assertEquals("[8, 8]",
+        Assert.assertEquals("[4, 4]",
                 tp.getFnParamColumnRefs().stream().map(ColumnRefOperator::getId).collect(Collectors.toList()).toString());
+    }
+
+    @Test
+    public void testFunctionSerialized() {
+        FunctionName functionName = new FunctionName("db", "fn");
+        List<Type> argList = Lists.newArrayList(Type.INT);
+
+        TableFunction tableFunction = new TableFunction(functionName,
+                Lists.newArrayList(functionName.getFunction()),
+                argList, Lists.newArrayList(Type.INT));
+        tableFunction.setBinaryType(TFunctionBinaryType.SRJAR);
+        tableFunction.setChecksum("abc");
+        tableFunction.setLocation(new HdfsURI("file://"));
+        tableFunction.setSymbolName("sysmbol");
+
+        String json = GsonUtils.GSON.toJson(tableFunction);
+        TableFunction tableFunctionReload = GsonUtils.GSON.fromJson(json, TableFunction.class);
+        Assert.assertEquals(tableFunction.getFunctionName(), tableFunctionReload.getFunctionName());
+        Assert.assertEquals(tableFunction.getArgs()[0], tableFunctionReload.getArgs()[0]);
+        Assert.assertEquals(tableFunction.getLocation().toString(), tableFunctionReload.getLocation().toString());
     }
 }

@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "util/slice.h"
 
 #ifndef __StarRocksMysql
 #define __StarRocksMysql void
@@ -79,9 +80,11 @@ public:
 
     int field_num() const { return _field_num; }
 
+    Slice escape(const std::string& value);
+
 private:
     Status _error_status(const std::string& prefix);
-
+    std::string _escape_buffer;
     const MysqlScannerParam& _my_param;
     __StarRocksMysql* _my_conn;
     __StarRocksMysqlRes* _my_result;

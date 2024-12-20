@@ -27,8 +27,13 @@ namespace starrocks {
 
 SizeTieredCompactionPolicy::SizeTieredCompactionPolicy(Tablet* tablet) : _tablet(tablet) {
     _compaction_type = INVALID_COMPACTION;
-    _max_level_size =
-            config::size_tiered_min_level_size * pow(config::size_tiered_level_multiple, config::size_tiered_level_num);
+    if (_tablet->keys_type() == KeysType::DUP_KEYS) {
+        _level_multiple = std::max(config::size_tiered_level_multiple_dupkey, config::size_tiered_level_multiple);
+    } else {
+        _level_multiple = config::size_tiered_level_multiple;
+    }
+
+    _max_level_size = config::size_tiered_min_level_size * pow(_level_multiple, config::size_tiered_level_num);
 }
 
 bool SizeTieredCompactionPolicy::need_compaction(double* score, CompactionType* type) {
@@ -66,6 +71,11 @@ std::shared_ptr<CompactionTask> SizeTieredCompactionPolicy::create_compaction(Ta
         output_version.first = (*_rowsets.begin())->start_version();
         output_version.second = (*_rowsets.rbegin())->end_version();
 
+        // set rowset status to compacting
+        for (const auto& rowset : _rowsets) {
+            rowset->set_is_compacting(true);
+        }
+
         CompactionTaskFactory factory(output_version, tablet, std::move(_rowsets), _score, _compaction_type);
         std::shared_ptr<CompactionTask> compaction_task = factory.create_compaction_task();
         _compaction_type = INVALID_COMPACTION;
@@ -93,7 +103,7 @@ double SizeTieredCompactionPolicy::_cal_compaction_score(int64_t segment_num, in
     // level bonus: The lower the level means the smaller the data volume of the compaction, the higher the execution priority
     int64_t level_bonus = 0;
     for (int64_t v = level_size; v < _max_level_size && level_bonus <= 7; ++level_bonus) {
-        v = v * config::size_tiered_level_multiple;
+        v = v * _level_multiple;
     }
     score += level_bonus;
 
@@ -114,6 +124,8 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
     _tablet->pick_all_candicate_rowsets(&candidate_rowsets);
 
     if (candidate_rowsets.size() <= 1) {
+        VLOG(2) << "no suitable rowset to compact. tablet_id=" << _tablet->tablet_id()
+                << " candidate_rowsets.size=" << candidate_rowsets.size();
         return Status::NotFound("compaction no suitable version error.");
     }
 
@@ -123,6 +135,8 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
         candidate_rowsets[1]->rowset_meta()->get_compaction_score() <= 1) {
         // the tablet is with rowset: [0-1], [2-y]
         // and [0-1] has no data. in this situation, no need to do base compaction.
+        VLOG(2) << "no need to do base compaction. tablet_id=" << _tablet->tablet_id()
+                << " candidate_rowsets.size=" << candidate_rowsets.size();
         return Status::NotFound("compaction no suitable version error.");
     }
 
@@ -159,11 +173,9 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
     std::set<SizeTieredLevel*, LevelComparator> priority_levels;
     std::vector<RowsetSharedPtr> transient_rowsets;
     size_t segment_num = 0;
-    int64_t level_multiple = config::size_tiered_level_multiple;
     auto keys_type = _tablet->keys_type();
     auto min_compaction_segment_num = std::max(
-            static_cast<int64_t>(2),
-            std::min(config::min_cumulative_compaction_num_singleton_deltas, config::size_tiered_level_multiple));
+            static_cast<int64_t>(2), std::min(config::min_cumulative_compaction_num_singleton_deltas, _level_multiple));
     // make sure compact to one nonoverlapping segment
     if (force_base_compaction) {
         min_compaction_segment_num = 2;
@@ -177,11 +189,39 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
     int64_t level_size = -1;
     int64_t total_size = 0;
     int64_t prev_end_version = -1;
-    for (auto rowset : candidate_rowsets) {
+    bool skip_dup_large_base_rowset = true;
+    for (const auto& rowset : candidate_rowsets) {
+        // when duplicate key's base rowset larger than 0.8 * max_segment_file_size, we don't need compact it
+        // if set force_base_compaction, we will compact it to make sure delete version can be compacted
+        if (keys_type == KeysType::DUP_KEYS && skip_dup_large_base_rowset && !force_base_compaction &&
+            !rowset->rowset_meta()->is_segments_overlapping() &&
+            rowset->data_disk_size() > config::max_segment_file_size * 0.8) {
+            continue;
+        } else {
+            skip_dup_large_base_rowset = false;
+        }
+
         int64_t rowset_size = rowset->data_disk_size() > 0 ? rowset->data_disk_size() : 1;
         if (level_size == -1) {
             level_size = rowset_size < _max_level_size ? rowset_size : _max_level_size;
             total_size = 0;
+        }
+
+        // meet version being compacted
+        if (rowset->get_is_compacting()) {
+            if (!transient_rowsets.empty()) {
+                auto level = std::make_unique<SizeTieredLevel>(
+                        transient_rowsets, segment_num, level_size, total_size,
+                        _cal_compaction_score(segment_num, level_size, total_size, keys_type, reached_max_version));
+                priority_levels.emplace(level.get());
+                order_levels.emplace_back(std::move(level));
+            }
+            segment_num = 0;
+            total_size = 0;
+            level_size = -1;
+            prev_end_version = rowset->end_version();
+            transient_rowsets.clear();
+            continue;
         }
 
         // meet missed version
@@ -229,6 +269,11 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
                     auto level = std::make_unique<SizeTieredLevel>(
                             transient_rowsets, segment_num, level_size, total_size,
                             _cal_compaction_score(segment_num, level_size, total_size, keys_type, reached_max_version));
+                    VLOG(2) << "Add level for tablet " << _tablet->tablet_id()
+                            << " for size-tiered compaction rowset version=" << level->rowsets.front()->start_version()
+                            << "-" << level->rowsets.back()->end_version() << " score=" << level->score
+                            << " level_size=" << level->level_size << " total_size=" << level->total_size
+                            << " segment_num=" << level->segment_num;
                     priority_levels.emplace(level.get());
                     order_levels.emplace_back(std::move(level));
                 }
@@ -243,11 +288,16 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
         } else if ((!force_base_compaction ||
                     (!transient_rowsets.empty() && transient_rowsets[0]->start_version() != 0)) &&
                    level_size > config::size_tiered_min_level_size && rowset_size < level_size &&
-                   level_size / rowset_size > (level_multiple - 1)) {
+                   level_size / rowset_size > (_level_multiple - 1)) {
             if (!transient_rowsets.empty()) {
                 auto level = std::make_unique<SizeTieredLevel>(
                         transient_rowsets, segment_num, level_size, total_size,
                         _cal_compaction_score(segment_num, level_size, total_size, keys_type, reached_max_version));
+                VLOG(2) << "Add level for tablet " << _tablet->tablet_id()
+                        << " for size-tiered compaction rowset version=" << level->rowsets.front()->start_version()
+                        << "-" << level->rowsets.back()->end_version() << " score=" << level->score
+                        << " level_size=" << level->level_size << " total_size=" << level->total_size
+                        << " segment_num=" << level->segment_num;
                 priority_levels.emplace(level.get());
                 order_levels.emplace_back(std::move(level));
             }
@@ -267,6 +317,11 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
         auto level = std::make_unique<SizeTieredLevel>(
                 transient_rowsets, segment_num, level_size, total_size,
                 _cal_compaction_score(segment_num, level_size, total_size, keys_type, reached_max_version));
+        VLOG(2) << "Add level for tablet " << _tablet->tablet_id()
+                << " for size-tiered compaction rowset version=" << level->rowsets.front()->start_version() << "-"
+                << level->rowsets.back()->end_version() << " score=" << level->score
+                << " level_size=" << level->level_size << " total_size=" << level->total_size
+                << " segment_num=" << level->segment_num;
         priority_levels.emplace(level.get());
         order_levels.emplace_back(std::move(level));
     }
@@ -287,10 +342,10 @@ Status SizeTieredCompactionPolicy::_pick_rowsets_to_size_tiered_compact(bool for
         }
     }
 
-    // Cumulative compaction will process with at least 1 rowset.
-    // So when there is no rowset being chosen, we should return Status::NotFound("cumulative compaction no suitable version error.");
+    // compaction will process with at least 1 rowset.
+    // So when there is no rowset being chosen, we should return Status::NotFound("compaction no suitable version error.");
     if (input_rowsets->empty()) {
-        return Status::NotFound("cumulative compaction no suitable version error.");
+        return Status::NotFound("compaction no suitable version error.");
     }
 
     RETURN_IF_ERROR(_check_version_continuity(*input_rowsets));

@@ -44,6 +44,8 @@ public:
 
     int32_t to_date_literal() const;
 
+    int64_t to_unixtime() const;
+
     void from_date_literal(int64_t date_literal);
 
     bool from_date_literal_with_check(int64_t date_literal);
@@ -77,6 +79,10 @@ public:
     void trunc_to_year();
     void trunc_to_week();
     void trunc_to_quarter();
+
+    void set_end_of_month();
+    void set_end_of_quarter();
+    void set_end_of_year();
 
     bool is_valid() const;
 

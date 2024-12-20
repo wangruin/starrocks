@@ -48,8 +48,12 @@ public class RangeUtils {
         }
     }
 
-    public static boolean isRangeIntersect(Range<PartitionKey> range1, Range<PartitionKey> range2) {
-        return range2.isConnected(range1) && !range2.intersection(range1).isEmpty();
+    public static <T extends Comparable> boolean isRangeEqual(Range<T> l, Range<T> r) {
+        if (l == null || r == null) {
+            return false;
+        }
+        return l.lowerEndpoint().compareTo(r.lowerEndpoint()) == 0 &&
+                l.upperEndpoint().compareTo(r.upperEndpoint()) == 0;
     }
 
     /*
@@ -79,6 +83,9 @@ public class RangeUtils {
      */
     public static void checkRangeListsMatch(List<Range<PartitionKey>> list1, List<Range<PartitionKey>> list2)
             throws DdlException {
+        if (list1.isEmpty() && list2.isEmpty()) {
+            return;
+        }
         Collections.sort(list1, RangeUtils.RANGE_COMPARATOR);
         Collections.sort(list2, RangeUtils.RANGE_COMPARATOR);
 

@@ -32,7 +32,6 @@ public class CreateDbStmtTest {
     @BeforeClass
     public static void beforeClass() throws Exception {
         UtFrameUtils.createMinStarRocksCluster();
-
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
     }

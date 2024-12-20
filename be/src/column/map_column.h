@@ -29,7 +29,7 @@ class MapColumn final : public ColumnFactory<Column, MapColumn> {
 public:
     using ValueType = void;
 
-    MapColumn(ColumnPtr keys, ColumnPtr values, UInt32Column::Ptr offests);
+    MapColumn(ColumnPtr keys, ColumnPtr values, UInt32Column::Ptr offsets);
 
     MapColumn(const MapColumn& rhs)
             : _keys(rhs._keys->clone_shared()),
@@ -86,8 +86,6 @@ public:
 
     bool append_nulls(size_t count) override;
 
-    bool append_strings(const Buffer<Slice>& strs) override { return false; }
-
     size_t append_numbers(const void* buff, size_t length) override { return -1; }
 
     void append_value_multiple_times(const void* value, size_t count) override;
@@ -98,9 +96,9 @@ public:
 
     void fill_default(const Filter& filter) override;
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
-    void remove_first_n_values(size_t count) override {}
+    void remove_first_n_values(size_t count) override;
 
     uint32_t max_one_element_serialize_size() const override;
 
@@ -123,7 +121,7 @@ public:
 
     int compare_at(size_t left, size_t right, const Column& right_column, int nan_direction_hint) const override;
 
-    bool equals(size_t left, const Column& rhs, size_t right) const override;
+    int equals(size_t left, const Column& rhs, size_t right, bool safe_eq = true) const override;
 
     void crc32_hash_at(uint32_t* seed, uint32_t idx) const override;
     void fnv_hash_at(uint32_t* seed, uint32_t idx) const override;
@@ -133,7 +131,7 @@ public:
 
     int64_t xor_checksum(uint32_t from, uint32_t to) const override;
 
-    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx) const override;
+    void put_mysql_row_buffer(MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol = false) const override;
 
     std::string get_name() const override { return "map"; }
 
@@ -164,9 +162,10 @@ public:
 
     std::string debug_string() const override;
 
-    bool capacity_limit_reached(std::string* msg = nullptr) const override {
-        return _keys->capacity_limit_reached(msg) || _values->capacity_limit_reached(msg) ||
-               _offsets->capacity_limit_reached(msg);
+    Status capacity_limit_reached() const override {
+        RETURN_IF_ERROR(_keys->capacity_limit_reached());
+        RETURN_IF_ERROR(_values->capacity_limit_reached());
+        return _offsets->capacity_limit_reached();
     }
 
     StatusOr<ColumnPtr> upgrade_if_overflow() override;
@@ -190,7 +189,7 @@ public:
 
     Status unfold_const_children(const starrocks::TypeDescriptor& type) override;
 
-    void remove_duplicated_keys();
+    void remove_duplicated_keys(bool need_recursive = false);
 
 private:
     // Keys must be NullableColumn to facilitate handling nested types.

@@ -16,7 +16,7 @@
 package com.starrocks.sql.ast;
 
 import com.starrocks.alter.AlterOpType;
-import com.starrocks.analysis.ColumnDef;
+import com.starrocks.analysis.ColumnPosition;
 import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
@@ -25,6 +25,16 @@ import java.util.Map;
 // add some columns to one index.
 public class AddColumnsClause extends AlterTableColumnClause {
     private final List<ColumnDef> columnDefs;
+
+    private ColumnPosition generatedColumnPos = null;
+
+    public ColumnPosition getGeneratedColumnPos() {
+        return generatedColumnPos;
+    }
+
+    public void setGeneratedColumnPos(ColumnPosition colPos) {
+        this.generatedColumnPos = colPos;
+    }
 
     public List<ColumnDef> getColumnDefs() {
         return columnDefs;

@@ -24,23 +24,33 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import java.util.List;
 
 public class LogicalUnionOperator extends LogicalSetOperator {
-    private final boolean isUnionAll;
+    private boolean isUnionAll;
+
+    // record if this union is derived from IcebergEqualityDeleteRewriteRule
+    private boolean fromIcebergEqualityDeleteRewrite;
 
     public LogicalUnionOperator(List<ColumnRefOperator> result, List<List<ColumnRefOperator>> childOutputColumns,
                                 boolean isUnionAll) {
-        super(OperatorType.LOGICAL_UNION, result, childOutputColumns, Operator.DEFAULT_LIMIT, null);
-        this.isUnionAll = isUnionAll;
+        this(result, childOutputColumns, isUnionAll, false);
     }
 
-    private LogicalUnionOperator(LogicalUnionOperator.Builder builder) {
-        super(OperatorType.LOGICAL_UNION, builder.outputColumnRefOp, builder.childOutputColumns,
-                builder.getLimit(),
-                builder.getProjection());
-        this.isUnionAll = builder.isUnionAll;
+    public LogicalUnionOperator(List<ColumnRefOperator> result, List<List<ColumnRefOperator>> childOutputColumns,
+                                boolean isUnionAll, boolean fromIcebergEqualityDeleteRewrite) {
+        super(OperatorType.LOGICAL_UNION, result, childOutputColumns, Operator.DEFAULT_LIMIT, null);
+        this.isUnionAll = isUnionAll;
+        this.fromIcebergEqualityDeleteRewrite = fromIcebergEqualityDeleteRewrite;
+    }
+
+    private LogicalUnionOperator() {
+        super(OperatorType.LOGICAL_UNION);
     }
 
     public boolean isUnionAll() {
         return isUnionAll;
+    }
+
+    public boolean isFromIcebergEqualityDeleteRewrite() {
+        return fromIcebergEqualityDeleteRewrite;
     }
 
     @Override
@@ -77,22 +87,26 @@ public class LogicalUnionOperator extends LogicalSetOperator {
     }
 
     public static class Builder extends LogicalSetOperator.Builder<LogicalUnionOperator, LogicalUnionOperator.Builder> {
-        private boolean isUnionAll;
-
         @Override
-        public LogicalUnionOperator build() {
-            return new LogicalUnionOperator(this);
+        protected LogicalUnionOperator newInstance() {
+            return new LogicalUnionOperator();
         }
 
         @Override
         public Builder withOperator(LogicalUnionOperator unionOperator) {
             super.withOperator(unionOperator);
-            isUnionAll = unionOperator.isUnionAll;
+            builder.isUnionAll = unionOperator.isUnionAll;
+            builder.fromIcebergEqualityDeleteRewrite = unionOperator.fromIcebergEqualityDeleteRewrite;
             return this;
         }
 
         public Builder isUnionAll(boolean isUnionAll) {
-            this.isUnionAll = isUnionAll;
+            builder.isUnionAll = isUnionAll;
+            return this;
+        }
+
+        public Builder isFromIcebergEqualityDeleteRewrite(boolean isFromIcebergEqualityDeleteRewrite) {
+            builder.fromIcebergEqualityDeleteRewrite = isFromIcebergEqualityDeleteRewrite;
             return this;
         }
     }

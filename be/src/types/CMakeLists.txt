@@ -19,8 +19,12 @@ add_library(Types STATIC
     bitmap_value.cpp
     date_value.cpp
     hll.cpp
+    hll_sketch.cpp
+    large_int_value.cpp
     logical_type.cpp
     map_type_info.cpp
     struct_type_info.cpp
     timestamp_value.cpp
+    checker/type_checker.cpp
+    type_checker_manager.cpp
 )

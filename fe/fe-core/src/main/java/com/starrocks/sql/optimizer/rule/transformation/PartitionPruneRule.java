@@ -27,28 +27,30 @@ import com.starrocks.sql.optimizer.rule.RuleType;
 import java.util.Collections;
 import java.util.List;
 
+import static com.starrocks.sql.optimizer.operator.OpRuleBit.OP_PARTITION_PRUNED;
+
 /**
  * This class does:
  * 1. Prune the Olap table partition ids, Dependency predicates push down scan node
  * 2. Prune predicate if the data of partitions meets the predicate, to avoid execute predicate.
- *
- *  Note:
- *   Partition value range always be Left-Closed-Right-Open interval
- *
- *  Attention:
- *   1. Only support single partition column
- *   2. Only support prune BinaryType predicate
- *
- *  e.g.
- *  select partitions:
- *   PARTITION p3 VALUES [2020-04-01, 2020-07-01)
- *   PARTITION p4 VALUES [2020-07-01, 2020-12-01)
- *
- *  predicate:
- *   d = 2020-02-02 AND d > 2020-08-01, None prune
- *   d >= 2020-04-01 AND d > 2020-09-01, All Prune
- *   d >= 2020-04-01 AND d < 2020-09-01, "d >= 2020-04-01" prune, "d < 2020-09-01" not prune
- *   d IN (2020-05-01, 2020-06-01), None prune
+ * <p>
+ * Note:
+ * Partition value range always be Left-Closed-Right-Open interval
+ * <p>
+ * Attention:
+ * 1. Only support single partition column
+ * 2. Only support prune BinaryType predicate
+ * <p>
+ * e.g.
+ * select partitions:
+ * PARTITION p3 VALUES [2020-04-01, 2020-07-01)
+ * PARTITION p4 VALUES [2020-07-01, 2020-12-01)
+ * <p>
+ * predicate:
+ * d = 2020-02-02 AND d > 2020-08-01, None prune
+ * d >= 2020-04-01 AND d > 2020-09-01, All Prune
+ * d >= 2020-04-01 AND d < 2020-09-01, "d >= 2020-04-01" prune, "d < 2020-09-01" not prune
+ * d IN (2020-05-01, 2020-06-01), None prune
  */
 public class PartitionPruneRule extends TransformationRule {
 
@@ -59,12 +61,18 @@ public class PartitionPruneRule extends TransformationRule {
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         LogicalOlapScanOperator logicalOlapScanOperator = (LogicalOlapScanOperator) input.getOp();
-        if (logicalOlapScanOperator.getSelectedPartitionId() != null) {
+        if (logicalOlapScanOperator.isOpRuleBitSet(OP_PARTITION_PRUNED)) {
             return Collections.emptyList();
         }
 
-        final LogicalOlapScanOperator prunedOlapScanOperator =
-                new OptOlapPartitionPruner().prunePartitions(logicalOlapScanOperator);
+        LogicalOlapScanOperator prunedOlapScanOperator = null;
+        if (logicalOlapScanOperator.getSelectedPartitionId() == null) {
+            prunedOlapScanOperator = OptOlapPartitionPruner.prunePartitions(logicalOlapScanOperator);
+        } else {
+            // do merge pruned partitions with new pruned partitions
+            prunedOlapScanOperator = OptOlapPartitionPruner.mergePartitionPrune(logicalOlapScanOperator);
+        }
+        prunedOlapScanOperator.setOpRuleBit(OP_PARTITION_PRUNED);
         return Lists.newArrayList(OptExpression.create(prunedOlapScanOperator, input.getInputs()));
     }
 }

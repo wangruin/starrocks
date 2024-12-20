@@ -15,26 +15,37 @@
 package com.starrocks.sql.ast;
 
 import com.starrocks.analysis.TableName;
+import com.starrocks.catalog.Column;
+import com.starrocks.catalog.ScalarType;
+import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.sql.common.PListCell;
 import com.starrocks.sql.parser.NodePosition;
+import com.starrocks.sql.util.EitherOr;
+
+import java.util.Set;
 
 public class RefreshMaterializedViewStatement extends DdlStmt {
+
     private final TableName mvName;
-    private final PartitionRangeDesc partitionRangeDesc;
+    private EitherOr<PartitionRangeDesc, Set<PListCell>> partitionDesc;
     private final boolean forceRefresh;
+    private final boolean isSync;
+    private final Integer priority;
+
+    public static final ShowResultSetMetaData META_DATA =
+            ShowResultSetMetaData.builder()
+                    .addColumn(new Column("QUERY_ID", ScalarType.createVarchar(60)))
+                    .build();
 
     public RefreshMaterializedViewStatement(TableName mvName,
-                                            PartitionRangeDesc partitionRangeDesc,
-                                            boolean forceRefresh) {
-        this(mvName, partitionRangeDesc, forceRefresh, NodePosition.ZERO);
-    }
-
-    public RefreshMaterializedViewStatement(TableName mvName,
-                                            PartitionRangeDesc partitionRangeDesc,
-                                            boolean forceRefresh, NodePosition pos) {
+                                            EitherOr<PartitionRangeDesc, Set<PListCell>> partitionDesc,
+                                            boolean forceRefresh, boolean isSync, Integer priority, NodePosition pos) {
         super(pos);
         this.mvName = mvName;
-        this.partitionRangeDesc = partitionRangeDesc;
+        this.partitionDesc = partitionDesc;
         this.forceRefresh = forceRefresh;
+        this.isSync = isSync;
+        this.priority = priority;
     }
 
     public TableName getMvName() {
@@ -46,11 +57,33 @@ public class RefreshMaterializedViewStatement extends DdlStmt {
         return visitor.visitRefreshMaterializedViewStatement(this, context);
     }
 
+    public EitherOr<PartitionRangeDesc, Set<PListCell>> getPartitionDesc() {
+        return partitionDesc;
+    }
+
     public PartitionRangeDesc getPartitionRangeDesc() {
-        return partitionRangeDesc;
+        if (partitionDesc == null) {
+            return null;
+        }
+        return partitionDesc.left();
+    }
+
+    public Set<PListCell> getPartitionListDesc() {
+        if (partitionDesc == null) {
+            return null;
+        }
+        return partitionDesc.right();
     }
 
     public boolean isForceRefresh() {
         return forceRefresh;
+    }
+
+    public boolean isSync() {
+        return isSync;
+    }
+
+    public Integer getPriority() {
+        return priority;
     }
 }

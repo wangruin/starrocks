@@ -16,6 +16,7 @@
 
 #include "column/vectorized_fwd.h"
 #include "connector/connector.h"
+#include "connector_chunk_sink.h"
 #include "exec/file_scanner.h"
 
 namespace starrocks::connector {
@@ -26,6 +27,8 @@ public:
 
     DataSourceProviderPtr create_data_source_provider(starrocks::ConnectorScanNode* scan_node,
                                                       const TPlanNode& plan_node) const override;
+
+    std::unique_ptr<ConnectorChunkSinkProvider> create_data_sink_provider() const override;
 
     ConnectorType connector_type() const override { return ConnectorType::FILE; }
 };
@@ -42,6 +45,7 @@ public:
 
     bool insert_local_exchange_operator() const override { return true; }
     bool accept_empty_scan_ranges() const override { return false; }
+    const TupleDescriptor* tuple_descriptor(RuntimeState* state) const override;
 
 protected:
     ConnectorScanNode* _scan_node;
@@ -53,9 +57,11 @@ public:
     ~FileDataSource() override = default;
 
     FileDataSource(const FileDataSourceProvider* provider, const TScanRange& scan_range);
+    std::string name() const override;
     Status open(RuntimeState* state) override;
     void close(RuntimeState* state) override;
     Status get_next(RuntimeState* state, ChunkPtr* chunk) override;
+    const std::string get_custom_coredump_msg() const override;
 
     int64_t raw_rows_read() const override;
     int64_t num_rows_read() const override;
@@ -82,6 +88,7 @@ private:
     RuntimeProfile::Counter* _scanner_materialize_timer = nullptr;
     RuntimeProfile::Counter* _scanner_init_chunk_timer = nullptr;
     RuntimeProfile::Counter* _scanner_file_reader_timer = nullptr;
+    RuntimeProfile::Counter* _scanner_file_read_count = nullptr;
 
     // =========================
     Status _create_scanner();

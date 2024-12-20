@@ -50,7 +50,7 @@ import com.starrocks.analysis.TupleId;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
@@ -66,12 +66,15 @@ import org.apache.commons.collections.CollectionUtils;
 
 import java.nio.ByteBuffer;
 import java.util.List;
-import java.util.Optional;
 import java.util.Map;
-import java.util.Set;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.stream.Stream;
+
+import static com.starrocks.qe.SessionVariableConstants.FORCE_PREAGGREGATION;
+import static com.starrocks.qe.SessionVariableConstants.FORCE_STREAMING;
+import static com.starrocks.qe.SessionVariableConstants.LIMITED;
 
 public class AggregationNode extends PlanNode {
     private final AggregateInfo aggInfo;
@@ -86,7 +89,8 @@ public class AggregationNode extends PlanNode {
     private String streamingPreaggregationMode = "auto";
 
     private boolean useSortAgg = false;
-    
+    private boolean usePerBucketOptimize = false;
+
     private boolean withLocalShuffle = false;
 
     // identicallyDistributed meanings the PlanNode above OlapScanNode are cases as follows:
@@ -121,12 +125,16 @@ public class AggregationNode extends PlanNode {
      * Sets this node as a preaggregation. Only valid to call this if it is not marked
      * as a preaggregation
      */
-    public void setIsPreagg(boolean canUseStreamingPreAgg) {
-        useStreamingPreagg = canUseStreamingPreAgg && aggInfo.getGroupingExprs().size() > 0;
+    public void setIsPreagg(boolean useStreamingPreAgg) {
+        useStreamingPreagg = useStreamingPreAgg;
     }
 
     public AggregateInfo getAggInfo() {
         return aggInfo;
+    }
+
+    public boolean isNeedsFinalize() {
+        return needsFinalize;
     }
 
     /**
@@ -145,7 +153,7 @@ public class AggregationNode extends PlanNode {
     }
 
     @Override
-    public void init(Analyzer analyzer) throws UserException {
+    public void init(Analyzer analyzer) throws StarRocksException {
     }
 
     public void setStreamingPreaggregationMode(String mode) {
@@ -154,6 +162,15 @@ public class AggregationNode extends PlanNode {
 
     public void setUseSortAgg(boolean useSortAgg) {
         this.useSortAgg = useSortAgg;
+    }
+
+    public void setUsePerBucketOptimize(boolean usePerBucketOptimize) {
+        this.usePerBucketOptimize = usePerBucketOptimize;
+    }
+
+    public void disablePhysicalPropertyOptimize() {
+        setUseSortAgg(false);
+        setUsePerBucketOptimize(false);
     }
 
     @Override
@@ -217,6 +234,7 @@ public class AggregationNode extends PlanNode {
             msg.agg_node.setSql_aggregate_functions(sqlAggFuncBuilder.toString());
         }
         msg.agg_node.setUse_sort_agg(useSortAgg);
+        msg.agg_node.setUse_per_bucket_optimize(usePerBucketOptimize);
 
         List<Expr> groupingExprs = aggInfo.getGroupingExprs();
         if (groupingExprs != null) {
@@ -239,10 +257,12 @@ public class AggregationNode extends PlanNode {
         }
 
         msg.agg_node.setHas_outer_join_child(hasNullableGenerateChild);
-        if (streamingPreaggregationMode.equalsIgnoreCase("force_streaming")) {
+        if (streamingPreaggregationMode.equalsIgnoreCase(FORCE_STREAMING)) {
             msg.agg_node.setStreaming_preaggregation_mode(TStreamingPreaggregationMode.FORCE_STREAMING);
-        } else if (streamingPreaggregationMode.equalsIgnoreCase("force_preaggregation")) {
+        } else if (streamingPreaggregationMode.equalsIgnoreCase(FORCE_PREAGGREGATION)) {
             msg.agg_node.setStreaming_preaggregation_mode(TStreamingPreaggregationMode.FORCE_PREAGGREGATION);
+        } else if (streamingPreaggregationMode.equalsIgnoreCase(LIMITED)) {
+            msg.agg_node.setStreaming_preaggregation_mode(TStreamingPreaggregationMode.LIMITED_MEM);
         } else {
             msg.agg_node.setStreaming_preaggregation_mode(TStreamingPreaggregationMode.AUTO);
         }
@@ -250,6 +270,7 @@ public class AggregationNode extends PlanNode {
         msg.agg_node.setAgg_func_set_version(FeConstants.AGG_FUNC_VERSION);
         msg.agg_node.setInterpolate_passthrough(
                 useStreamingPreagg && ConnectContext.get().getSessionVariable().isInterpolatePassthrough());
+        msg.agg_node.setEnable_pipeline_share_limit(ConnectContext.get().getSessionVariable().getEnableAggregationPipelineShareLimit());
     }
 
     protected String getDisplayLabelDetail() {
@@ -301,13 +322,8 @@ public class AggregationNode extends PlanNode {
     }
 
     @Override
-    public int getNumInstances() {
-        return children.get(0).getNumInstances();
-    }
-
-    @Override
-    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr) {
-        if (!expr.isBoundByTupleIds(getTupleIds())) {
+    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr, Function<Expr, Boolean> couldBound) {
+        if (!couldBound.apply(expr)) {
             return Optional.empty();
         }
         if (!(expr instanceof SlotRef)) {
@@ -326,18 +342,22 @@ public class AggregationNode extends PlanNode {
     }
 
     @Override
-    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description, Expr probeExpr,
+    public boolean pushDownRuntimeFilters(RuntimeFilterPushDownContext context, Expr probeExpr,
                                           List<Expr> partitionByExprs) {
+        RuntimeFilterDescription description = context.getDescription();
+        DescriptorTable descTbl = context.getDescTbl();
         if (!canPushDownRuntimeFilter()) {
             return false;
         }
 
-        if (!probeExpr.isBoundByTupleIds(getTupleIds())) {
+        if (!couldBound(probeExpr, description, descTbl)) {
             return false;
         }
 
-        return pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr, candidatesOfSlotExpr(probeExpr),
-                partitionByExprs, candidatesOfSlotExprs(partitionByExprs), 0, true);
+        Function<Expr, Boolean> couldBoundChecker = couldBound(description, descTbl);
+        return pushdownRuntimeFilterForChildOrAccept(context, probeExpr,
+                candidatesOfSlotExpr(probeExpr, couldBoundChecker),
+                partitionByExprs, candidatesOfSlotExprs(partitionByExprs, couldBoundForPartitionExpr()), 0, true);
     }
 
     @Override
@@ -445,5 +465,10 @@ public class AggregationNode extends PlanNode {
         TupleId tupleId = needsFinalize ? aggInfo.getOutputTupleId() : aggInfo.getIntermediateTupleId();
         return descriptorTable.getTupleDesc(tupleId).getSlots().subList(0, numGroupingExprs + numAggExprs)
                 .stream().map(SlotDescriptor::getId).collect(Collectors.toList());
+    }
+
+    @Override
+    public boolean needCollectExecStats() {
+        return true;
     }
 }

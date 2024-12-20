@@ -16,14 +16,12 @@
 package com.starrocks.sql.ast;
 
 import com.google.common.base.Strings;
-import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
-import com.starrocks.common.UserException;
 import com.starrocks.common.proc.LoadProcDir;
 import com.starrocks.common.util.OrderByPair;
 import com.starrocks.load.loadv2.JobState;
@@ -46,6 +44,7 @@ public class ShowLoadStmt extends ShowStmt {
     private final LimitElement limitElement;
     private final List<OrderByElement> orderByElements;
 
+    private boolean all = false;
     private String labelValue;
     private String stateValue;
     private boolean isAccurateMatch;
@@ -139,8 +138,12 @@ public class ShowLoadStmt extends ShowStmt {
         this.isAccurateMatch = isAccurateMatch;
     }
 
-    @Override
-    public void analyze(Analyzer analyzer) throws UserException {
+    public void setAll(boolean all) {
+        this.all = all;
+    }
+
+    public boolean isAll() {
+        return this.all;
     }
 
     @Override

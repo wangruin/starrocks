@@ -17,6 +17,8 @@
 #include <variant>
 
 #include "column/vectorized_fwd.h"
+#include "common/config.h"
+#include "exec/pipeline/pipeline_fwd.h"
 #include "runtime/current_thread.h"
 #include "simd/simd.h"
 namespace starrocks::pipeline {
@@ -24,6 +26,9 @@ namespace starrocks::pipeline {
 Status AggregateStreamingSinkOperator::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(Operator::prepare(state));
     RETURN_IF_ERROR(_aggregator->prepare(state, state->obj_pool(), _unique_metrics.get()));
+    if (_aggregator->streaming_preaggregation_mode() == TStreamingPreaggregationMode::LIMITED_MEM) {
+        _limited_mem_state.limited_memory_size = config::streaming_agg_limited_memory_size;
+    }
     return _aggregator->open(state);
 }
 
@@ -37,6 +42,11 @@ void AggregateStreamingSinkOperator::close(RuntimeState* state) {
 Status AggregateStreamingSinkOperator::set_finishing(RuntimeState* state) {
     _is_finished = true;
 
+    // skip processing if cancelled
+    if (state->is_cancelled()) {
+        return Status::OK();
+    }
+
     if (_aggregator->hash_map_variant().size() == 0) {
         _aggregator->set_ht_eos();
     }
@@ -49,17 +59,32 @@ StatusOr<ChunkPtr> AggregateStreamingSinkOperator::pull_chunk(RuntimeState* stat
     return Status::InternalError("Not support");
 }
 
+void AggregateStreamingSinkOperator::set_execute_mode(int performance_level) {
+    if (_aggregator->streaming_preaggregation_mode() == TStreamingPreaggregationMode::AUTO) {
+        _aggregator->streaming_preaggregation_mode() = TStreamingPreaggregationMode::LIMITED_MEM;
+    }
+    if (_aggregator->hash_map_memory_usage() > config::streaming_agg_limited_memory_size) {
+        _limited_mem_state.limited_memory_size = config::streaming_agg_limited_memory_size;
+    } else {
+        _limited_mem_state.limited_memory_size = _aggregator->hash_map_memory_usage();
+    }
+}
+
 Status AggregateStreamingSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    DeferOp update_revocable_bytes{[this]() {
+        set_revocable_mem_bytes(_aggregator->hash_map_variant().allocated_memory_usage(_aggregator->mem_pool()));
+    }};
     size_t chunk_size = chunk->num_rows();
     _aggregator->update_num_input_rows(chunk_size);
     COUNTER_SET(_aggregator->input_row_count(), _aggregator->num_input_rows());
 
     RETURN_IF_ERROR(_aggregator->evaluate_groupby_exprs(chunk.get()));
-
     if (_aggregator->streaming_preaggregation_mode() == TStreamingPreaggregationMode::FORCE_STREAMING) {
         RETURN_IF_ERROR(_push_chunk_by_force_streaming(chunk));
     } else if (_aggregator->streaming_preaggregation_mode() == TStreamingPreaggregationMode::FORCE_PREAGGREGATION) {
         RETURN_IF_ERROR(_push_chunk_by_force_preaggregation(chunk, chunk->num_rows()));
+    } else if (_aggregator->streaming_preaggregation_mode() == TStreamingPreaggregationMode::LIMITED_MEM) {
+        RETURN_IF_ERROR(_push_chunk_by_limited_memory(chunk, chunk_size));
     } else {
         RETURN_IF_ERROR(_push_chunk_by_auto(chunk, chunk->num_rows()));
     }
@@ -148,10 +173,7 @@ Status AggregateStreamingSinkOperator::_push_chunk_by_auto(const ChunkPtr& chunk
     const size_t continuous_limit = _auto_context.get_continuous_limit();
     switch (_auto_state) {
     case AggrAutoState::INIT_PREAGG: {
-        size_t real_capacity =
-                _aggregator->hash_map_variant().capacity() - _aggregator->hash_map_variant().capacity() / 8;
-        size_t remain_size = real_capacity - _aggregator->hash_map_variant().size();
-        bool ht_needs_expansion = remain_size < chunk_size;
+        bool ht_needs_expansion = _aggregator->hash_map_variant().need_expand(chunk_size);
         _auto_context.init_preagg_count++;
         if (!ht_needs_expansion ||
             _aggregator->should_expand_preagg_hash_tables(_aggregator->num_input_rows(), chunk_size, allocated_bytes,
@@ -274,6 +296,16 @@ Status AggregateStreamingSinkOperator::_push_chunk_by_auto(const ChunkPtr& chunk
         }
         break;
     }
+    }
+    return Status::OK();
+}
+
+Status AggregateStreamingSinkOperator::_push_chunk_by_limited_memory(const ChunkPtr& chunk, const size_t chunk_size) {
+    if (_limited_mem_state.has_limited(*_aggregator)) {
+        RETURN_IF_ERROR(_push_chunk_by_force_streaming(chunk));
+        _aggregator->set_streaming_all_states(true);
+    } else {
+        RETURN_IF_ERROR(_push_chunk_by_auto(chunk, chunk_size));
     }
     return Status::OK();
 }

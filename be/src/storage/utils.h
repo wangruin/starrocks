@@ -58,6 +58,8 @@
 
 namespace starrocks {
 
+class MemTracker;
+
 const static int32_t g_power_table[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
 
 class OlapStopWatch {
@@ -158,6 +160,11 @@ bool valid_decimal(const std::string& value_str, uint32_t precision, uint32_t fr
 bool valid_datetime(const std::string& value_str);
 
 bool valid_bool(const std::string& value_str);
+
+std::string parent_name(const std::string& fullpath);
+std::string file_name(const std::string& fullpath);
+
+bool is_tracker_hit_hard_limit(MemTracker* tracker, double hard_limit_ratio);
 
 // Util used to get string name of thrift enum item
 #define EnumToString(enum_type, index, out)                   \

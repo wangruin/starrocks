@@ -15,10 +15,10 @@
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
-import com.starrocks.common.AnalysisException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.ast.AlterDatabaseRenameStatement;
 
+import static com.starrocks.catalog.InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
 import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
 
 public class AlterDatabaseRenameStatementAnalyzer {
@@ -30,12 +30,11 @@ public class AlterDatabaseRenameStatementAnalyzer {
             statement.setCatalogName(context.getCurrentCatalog());
         }
 
-        String newName = statement.getNewDbName();
-
-        try {
-            FeNameFormat.checkDbName(newName);
-        } catch (AnalysisException e) {
-            throw new SemanticException(PARSER_ERROR_MSG.invalidDbFormat(newName));
+        if (!DEFAULT_INTERNAL_CATALOG_NAME.equalsIgnoreCase(statement.getCatalogName())) {
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedOp("rename db under external catalog"));
         }
+
+        String newName = statement.getNewDbName();
+        FeNameFormat.checkDbName(newName);
     }
 }

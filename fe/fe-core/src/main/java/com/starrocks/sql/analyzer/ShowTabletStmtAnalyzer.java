@@ -17,6 +17,7 @@ package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.IntLiteral;
@@ -27,9 +28,11 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.proc.LakeTabletsProcNode;
+import com.starrocks.common.proc.LakeTabletsProcDir;
 import com.starrocks.common.proc.LocalTabletsProcDir;
 import com.starrocks.common.util.OrderByPair;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
@@ -45,7 +48,7 @@ public class ShowTabletStmtAnalyzer {
         new ShowTabletStmtAnalyzerVisitor().visit(statement, context);
     }
 
-    static class ShowTabletStmtAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class ShowTabletStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
 
         private long version = -1;
         private long backendId = -1;
@@ -91,20 +94,21 @@ public class ShowTabletStmtAnalyzer {
             // order by
             List<OrderByElement> orderByElements = statement.getOrderByElements();
             if (orderByElements != null && !orderByElements.isEmpty()) {
-                Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+                Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
                 if (db == null) {
                     throw new SemanticException("Database %s is not found", dbName);
                 }
                 String tableName = statement.getTableName();
                 Table table = null;
-                db.readLock();
+                Locker locker = new Locker();
+                locker.lockDatabase(db.getId(), LockType.READ);
                 try {
-                    table = db.getTable(tableName);
+                    table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), tableName);
                     if (table == null) {
                         throw new SemanticException("Table %s is not found", tableName);
                     }
                 } finally {
-                    db.readUnlock();
+                    locker.unLockDatabase(db.getId(), LockType.READ);
                 }
 
                 orderByPairs = new ArrayList<>();
@@ -115,8 +119,8 @@ public class ShowTabletStmtAnalyzer {
                     SlotRef slotRef = (SlotRef) orderByElement.getExpr();
                     int index = 0;
                     try {
-                        if (table.isCloudNativeTable()) {
-                            index = LakeTabletsProcNode.analyzeColumn(slotRef.getColumnName());
+                        if (table.isCloudNativeTableOrMaterializedView()) {
+                            index = LakeTabletsProcDir.analyzeColumn(slotRef.getColumnName());
                         } else {
                             index = LocalTabletsProcDir.analyzeColumn(slotRef.getColumnName());
                         }
@@ -158,7 +162,7 @@ public class ShowTabletStmtAnalyzer {
                     break;
                 }
                 BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-                if (binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+                if (binaryPredicate.getOp() != BinaryType.EQ) {
                     valid = false;
                     break;
                 }

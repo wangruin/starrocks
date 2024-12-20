@@ -32,7 +32,10 @@ class TimestampValue {
 public:
     using type = Timestamp;
 
-    inline static TimestampValue create(int year, int month, int day, int hour, int minute, int second);
+    inline static TimestampValue create(int year, int month, int day, int hour, int minute, int second,
+                                        int microsecond);
+
+    static TimestampValue create_from_unixtime(int64_t ts, const cctz::time_zone& ctz);
 
     inline Timestamp timestamp() const { return _timestamp; }
 
@@ -83,6 +86,7 @@ public:
 
     void to_timestamp(int* year, int* month, int* day, int* hour, int* minute, int* second, int* usec) const;
 
+    void trunc_to_millisecond();
     void trunc_to_second();
     void trunc_to_minute();
     void trunc_to_hour();
@@ -93,31 +97,37 @@ public:
     void trunc_to_quarter();
 
     template <bool end>
-    void floor_to_second_period(int period);
+    void floor_to_microsecond_period(long period);
     template <bool end>
-    void floor_to_minute_period(int period);
+    void floor_to_millisecond_period(long period);
     template <bool end>
-    void floor_to_hour_period(int period);
+    void floor_to_second_period(long period);
     template <bool end>
-    void floor_to_day_period(int period);
+    void floor_to_minute_period(long period);
     template <bool end>
-    void floor_to_month_period(int period);
+    void floor_to_hour_period(long period);
     template <bool end>
-    void floor_to_year_period(int period);
+    void floor_to_day_period(long period);
     template <bool end>
-    void floor_to_week_period(int period);
+    void floor_to_month_period(long period);
     template <bool end>
-    void floor_to_quarter_period(int period);
+    void floor_to_year_period(long period);
+    template <bool end>
+    void floor_to_week_period(long period);
+    template <bool end>
+    void floor_to_quarter_period(long period);
 
     bool from_string(const char* date_str, size_t len);
 
     int64_t to_unix_second() const;
+    int64_t to_unixtime() const;
+    int64_t to_unixtime(const cctz::time_zone& ctz) const;
 
     bool from_unixtime(int64_t second, const std::string& timezone);
     void from_unixtime(int64_t second, const cctz::time_zone& ctz);
     void from_unixtime(int64_t second, int64_t microsecond, const cctz::time_zone& ctz);
 
-    void from_unix_second(int64_t second);
+    void from_unix_second(int64_t second, int64_t microsecond = 0);
 
     template <TimeUnit UNIT>
     TimestampValue add(int count) const {
@@ -145,20 +155,42 @@ public:
     static TimestampValue MIN_TIMESTAMP_VALUE;
 
     /**
-     * Milliseconds since January 1, 2000, 00:00:00. A negative number indicates the number of
-     * milliseconds before January 1, 2000, 00:00:00.
+     * Microseconds since January 1, 2000, 00:00:00. A negative number indicates the number of
+     * microseconds before January 1, 2000, 00:00:00.
      */
     Timestamp _timestamp;
 };
 
-TimestampValue TimestampValue::create(int year, int month, int day, int hour, int minute, int second) {
+TimestampValue TimestampValue::create(int year, int month, int day, int hour, int minute, int second,
+                                      int microsecond = 0) {
     TimestampValue ts;
-    ts.from_timestamp(year, month, day, hour, minute, second, 0);
+    ts.from_timestamp(year, month, day, hour, minute, second, microsecond);
     return ts;
 }
 
 template <bool end>
-void TimestampValue::floor_to_second_period(int period) {
+void TimestampValue::floor_to_microsecond_period(long period) {
+    int64_t microseconds = ((timestamp::to_julian(_timestamp) - date::AD_EPOCH_JULIAN) * SECS_PER_DAY * USECS_PER_SEC) +
+                           (timestamp::to_time(_timestamp));
+
+    microseconds -= microseconds % period;
+    if constexpr (end) {
+        microseconds += period;
+    }
+
+    JulianDate days = microseconds / (USECS_PER_SEC * SECS_PER_DAY) + date::AD_EPOCH_JULIAN;
+    microseconds %= (USECS_PER_SEC * SECS_PER_DAY);
+
+    _timestamp = timestamp::from_julian_and_time(days, microseconds);
+}
+
+template <bool end>
+void TimestampValue::floor_to_millisecond_period(long period) {
+    TimestampValue::floor_to_microsecond_period<end>(period * 1000);
+}
+
+template <bool end>
+void TimestampValue::floor_to_second_period(long period) {
     int64_t seconds = timestamp::to_julian(_timestamp);
     seconds -= date::AD_EPOCH_JULIAN;
     seconds *= SECS_PER_DAY;
@@ -174,17 +206,17 @@ void TimestampValue::floor_to_second_period(int period) {
 }
 
 template <bool end>
-void TimestampValue::floor_to_minute_period(int period) {
+void TimestampValue::floor_to_minute_period(long period) {
     TimestampValue::floor_to_second_period<end>(period * 60);
 }
 
 template <bool end>
-void TimestampValue::floor_to_hour_period(int period) {
+void TimestampValue::floor_to_hour_period(long period) {
     TimestampValue::floor_to_second_period<end>(period * 60 * 60);
 }
 
 template <bool end>
-void TimestampValue::floor_to_day_period(int period) {
+void TimestampValue::floor_to_day_period(long period) {
     int64_t days = timestamp::to_julian(_timestamp);
     days -= date::AD_EPOCH_JULIAN;
     days -= days % period;
@@ -196,7 +228,7 @@ void TimestampValue::floor_to_day_period(int period) {
 }
 
 template <bool end>
-void TimestampValue::floor_to_month_period(int period) {
+void TimestampValue::floor_to_month_period(long period) {
     int year, month, day;
     date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
 
@@ -211,7 +243,7 @@ void TimestampValue::floor_to_month_period(int period) {
 }
 
 template <bool end>
-void TimestampValue::floor_to_year_period(int period) {
+void TimestampValue::floor_to_year_period(long period) {
     int year, month, day;
     date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
 
@@ -223,12 +255,12 @@ void TimestampValue::floor_to_year_period(int period) {
 }
 
 template <bool end>
-void TimestampValue::floor_to_week_period(int period) {
+void TimestampValue::floor_to_week_period(long period) {
     TimestampValue::floor_to_day_period<end>(period * 7);
 }
 
 template <bool end>
-void TimestampValue::floor_to_quarter_period(int period) {
+void TimestampValue::floor_to_quarter_period(long period) {
     TimestampValue::floor_to_month_period<end>(period * 3);
 }
 

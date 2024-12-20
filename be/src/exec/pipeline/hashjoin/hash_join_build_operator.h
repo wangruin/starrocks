@@ -18,18 +18,19 @@
 
 #include <atomic>
 
-#include "exec/hash_joiner.h"
-#include "exec/pipeline/hashjoin/hash_joiner_factory.h"
+#include "exec/pipeline/hashjoin/hash_joiner_fwd.h"
 #include "exec/pipeline/operator.h"
 #include "exec/pipeline/pipeline_fwd.h"
+#include "exec/pipeline/spill_process_channel.h"
 #include "exprs/expr.h"
 #include "runtime/descriptors.h"
+#include "util/race_detect.h"
 
 namespace starrocks::pipeline {
 
 using HashJoiner = starrocks::HashJoiner;
 
-class HashJoinBuildOperator final : public Operator {
+class HashJoinBuildOperator : public Operator {
 public:
     HashJoinBuildOperator(OperatorFactory* factory, int32_t id, const string& name, int32_t plan_node_id,
                           int32_t driver_sequence, HashJoinerPtr join_builder,
@@ -37,16 +38,18 @@ public:
     ~HashJoinBuildOperator() override = default;
 
     Status prepare(RuntimeState* state) override;
+
     void close(RuntimeState* state) override;
 
     bool has_output() const override {
         CHECK(false) << "has_output not supported in HashJoinBuildOperator";
         return false;
     }
+
     bool need_input() const override { return !is_finished(); }
 
     Status set_finishing(RuntimeState* state) override;
-    bool is_finished() const override { return _is_finished || _join_builder->is_finished(); }
+    bool is_finished() const override;
 
     Status push_chunk(RuntimeState* state, const ChunkPtr& chunk) override;
     StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
@@ -56,32 +59,38 @@ public:
     }
 
     size_t output_amplification_factor() const override;
+    void update_exec_stats(RuntimeState* state) override {}
 
-private:
+protected:
     HashJoinerPtr _join_builder;
     PartialRuntimeFilterMerger* _partial_rf_merger;
-    mutable size_t _avg_keys_perf_bucket = 0;
+    mutable size_t _avg_keys_per_bucket = 0;
     std::atomic<bool> _is_finished = false;
+    DECLARE_ONCE_DETECTOR(_set_finishing_once);
 
     const TJoinDistributionMode::type _distribution_mode;
 };
 
-class HashJoinBuildOperatorFactory final : public OperatorFactory {
+class HashJoinBuildOperatorFactory : public OperatorFactory {
 public:
     HashJoinBuildOperatorFactory(int32_t id, int32_t plan_node_id, HashJoinerFactoryPtr hash_joiner_factory,
                                  std::unique_ptr<PartialRuntimeFilterMerger>&& partial_rf_merger,
-                                 TJoinDistributionMode::type distribution_mode);
+                                 TJoinDistributionMode::type distribution_mode,
+                                 SpillProcessChannelFactoryPtr spill_channel_factory);
     ~HashJoinBuildOperatorFactory() override = default;
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
     OperatorPtr create(int32_t degree_of_parallelism, int32_t driver_sequence) override;
     void retain_string_key_columns(int32_t driver_sequence, Columns&& columns);
 
-private:
+    const auto& hash_joiner_factory() { return _hash_joiner_factory; }
+
+protected:
     HashJoinerFactoryPtr _hash_joiner_factory;
     std::unique_ptr<PartialRuntimeFilterMerger> _partial_rf_merger;
     std::vector<Columns> _string_key_columns;
     const TJoinDistributionMode::type _distribution_mode;
+    SpillProcessChannelFactoryPtr _spill_channel_factory;
 };
 
 } // namespace starrocks::pipeline

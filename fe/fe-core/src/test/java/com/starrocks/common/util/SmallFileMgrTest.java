@@ -40,12 +40,17 @@ import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.common.util.SmallFileMgr.SmallFile;
 import com.starrocks.persist.EditLog;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
+import com.starrocks.persist.metablock.SRMetaBlockReaderV2;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.CreateFileStmt;
+import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
 import mockit.Injectable;
 import mockit.Mocked;
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
@@ -58,6 +63,16 @@ public class SmallFileMgrTest {
     @Mocked
     Database db;
 
+    @Before
+    public void setUp() {
+        UtFrameUtils.setUpForPersistTest();
+    }
+
+    @After
+    public void teardown() {
+        UtFrameUtils.tearDownForPersisTest();
+    }
+
     @Ignore // Could not find a way to mock a private method
     @Test
     public void test(@Injectable CreateFileStmt stmt1, @Injectable CreateFileStmt stmt2) throws DdlException {
@@ -66,7 +81,7 @@ public class SmallFileMgrTest {
                 db.getId();
                 minTimes = 0;
                 result = 1L;
-                globalStateMgr.getDb(anyString);
+                globalStateMgr.getLocalMetastore().getDb(anyString);
                 minTimes = 0;
                 result = db;
                 stmt1.getDbName();
@@ -155,4 +170,20 @@ public class SmallFileMgrTest {
         Assert.assertEquals(10001L, gotFile.id);
     }
 
+    @Test
+    public void testSaveLoadJsonFormatImage() throws Exception {
+        SmallFileMgr smallFileMgr = new SmallFileMgr();
+        SmallFile smallFile = new SmallFile(1L, "c1", "f1", 2L, "xxx", 3, "xxx", true);
+        smallFileMgr.replayCreateFile(smallFile);
+
+        UtFrameUtils.PseudoImage image = new UtFrameUtils.PseudoImage();
+        smallFileMgr.saveSmallFilesV2(image.getImageWriter());
+
+        SmallFileMgr followerMgr = new SmallFileMgr();
+        SRMetaBlockReader reader = new SRMetaBlockReaderV2(image.getJsonReader());
+        followerMgr.loadSmallFilesV2(reader);
+        reader.close();
+
+        Assert.assertNotNull(followerMgr.getSmallFile(2L));
+    }
 }

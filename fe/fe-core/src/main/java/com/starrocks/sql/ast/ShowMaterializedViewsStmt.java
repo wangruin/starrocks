@@ -16,14 +16,18 @@
 package com.starrocks.sql.ast;
 
 import com.google.common.collect.ImmutableMap;
+import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
+import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.ExprSubstitutionMap;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.InfoSchemaDb;
 import com.starrocks.catalog.ScalarType;
+import com.starrocks.catalog.system.information.InfoSchemaDb;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.qe.ShowResultSetMetaData;
 import com.starrocks.sql.parser.NodePosition;
@@ -42,6 +46,7 @@ public class ShowMaterializedViewsStmt extends ShowStmt {
                     .column("name", ScalarType.createVarchar(50))
                     .column("refresh_type", ScalarType.createVarchar(10))
                     .column("is_active", ScalarType.createVarchar(10))
+                    .column("inactive_reason", ScalarType.createVarcharType(64))
                     .column("partition_type", ScalarType.createVarchar(16))
                     .column("task_id", ScalarType.createVarchar(20))
                     .column("task_name", ScalarType.createVarchar(50))
@@ -58,6 +63,9 @@ public class ShowMaterializedViewsStmt extends ShowStmt {
                     .column("last_refresh_error_message", ScalarType.createVarchar(1024))
                     .column("rows", ScalarType.createVarchar(50))
                     .column("text", ScalarType.createVarchar(1024))
+                    .column("extra_message", ScalarType.createVarchar(1024))
+                    .column("query_rewrite_status", ScalarType.createVarchar(64))
+                    .column("creator", ScalarType.createVarchar(64))
                     .build();
 
     private static final Map<String, String> ALIAS_MAP = ImmutableMap.of(
@@ -128,8 +136,19 @@ public class ShowMaterializedViewsStmt extends ShowStmt {
             }
         }
         where = where.substitute(aliasMap);
+
+        // where databases_name = currentdb
+        Expr whereDbEQ = new BinaryPredicate(
+                BinaryType.EQ,
+                new SlotRef(TABLE_NAME, "TABLE_SCHEMA"),
+                new StringLiteral(db));
+        // old where + and + db where
+        Expr finalWhere = new CompoundPredicate(
+                CompoundPredicate.Operator.AND,
+                whereDbEQ,
+                where);
         return new QueryStatement(new SelectRelation(selectList, new TableRelation(TABLE_NAME),
-                where, null, null));
+                finalWhere, null, null), this.getOrigStmt());
     }
 
     @Override

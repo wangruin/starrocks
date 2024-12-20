@@ -42,7 +42,6 @@
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "exec/data_sink.h"
-#include "gen_cpp/doris_internal_service.pb.h"
 #include "gen_cpp/internal_service.pb.h"
 #include "serde/protobuf_serde.h"
 #include "util/raw_container.h"
@@ -75,12 +74,10 @@ class DataStreamSender final : public DataSink {
 public:
     // Construct a sender according to the output specification (sink),
     // sending to the given destinations.
-    // Per_channel_buffer_size is the buffer size allocated to each channel
-    // and is specified in bytes.
     // The RowDescriptor must live until close() is called.
     // NOTE: supported partition types are UNPARTITIONED (broadcast) and HASH_PARTITIONED
     DataStreamSender(RuntimeState* state, int sender_id, const RowDescriptor& row_desc, const TDataStreamSink& sink,
-                     const std::vector<TPlanFragmentDestination>& destinations, int per_channel_buffer_size,
+                     const std::vector<TPlanFragmentDestination>& destinations,
                      bool send_query_statistics_with_every_batch, bool enable_exchange_pass_through,
                      bool enable_exchange_perf);
     ~DataStreamSender() override;
@@ -108,17 +105,11 @@ public:
 
     void construct_brpc_attachment(PTransmitChunkParams* _chunk_request, butil::IOBuf* attachment);
 
-    // Return total number of bytes sent in TRowBatch.data. If batches are
-    // broadcast to multiple receivers, they are counted once per receiver.
-    [[maybe_unused]] int64_t get_num_data_bytes_sent() const;
-
     RuntimeProfile* profile() override { return _profile; }
 
     TPartitionType::type get_partition_type() const { return _part_type; }
 
     const std::vector<ExprContext*>& get_partition_exprs() const { return _partition_expr_ctxs; }
-
-    int32_t get_destinations_size() const { return _channels.size(); }
 
     PlanNodeId get_dest_node_id() const { return _dest_node_id; }
 

@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.starrocks.analysis.SubfieldExpr;
+import com.google.common.collect.Lists;
 import com.starrocks.catalog.StructField;
 import com.starrocks.catalog.StructType;
 import com.starrocks.catalog.Type;
@@ -32,13 +31,9 @@ import java.util.Objects;
 public class SubfieldOperator extends ScalarOperator {
 
     // Only one child
-    private final List<ScalarOperator> children = new ArrayList<>();
+    private List<ScalarOperator> children = new ArrayList<>();
     private final ImmutableList<String> fieldNames;
-
-    // Build based on SubfieldExpr
-    public static SubfieldOperator build(ScalarOperator child, SubfieldExpr expr) {
-        return new SubfieldOperator(child, expr.getType(), expr.getFieldNames());
-    }
+    private boolean copyFlag = true;
 
     // Build based on SlotRef which contains struct subfield access information
     public static SubfieldOperator build(ScalarOperator child, Type type, List<Integer> usedSubfieldPos) {
@@ -55,15 +50,29 @@ public class SubfieldOperator extends ScalarOperator {
         return new SubfieldOperator(child, tmpType, ImmutableList.copyOf(usedSubfieldNames));
     }
 
-    private SubfieldOperator(ScalarOperator child, Type type, ImmutableList<String> fieldNames) {
-        super(OperatorType.SUBFIELD, type);
-        this.children.add(child);
-        this.fieldNames = fieldNames.stream().map(String::toLowerCase).collect(ImmutableList.toImmutableList());
+    public SubfieldOperator(ScalarOperator child, Type type, List<String> fieldNames) {
+        this(child, type, fieldNames, true);
     }
 
-    public ImmutableList<String> getFieldNames() {
+    public SubfieldOperator(ScalarOperator child, Type type, List<String> fieldNames, boolean copyFlag) {
+        super(OperatorType.SUBFIELD, type);
+        this.children.add(child);
+        this.fieldNames = ImmutableList.copyOf(fieldNames);
+        this.copyFlag = copyFlag;
+    }
+
+    public List<String> getFieldNames() {
         return fieldNames;
     }
+
+    public boolean getCopyFlag() {
+        return copyFlag;
+    }
+
+    public void setCopyFlag(boolean copyFlag) {
+        this.copyFlag = copyFlag;
+    }
+
 
     @Override
     public boolean isNullable() {
@@ -88,13 +97,23 @@ public class SubfieldOperator extends ScalarOperator {
     }
 
     @Override
+    public ScalarOperator clone() {
+        SubfieldOperator subfieldOperator = (SubfieldOperator) super.clone();
+        // Deep copy here
+        List<ScalarOperator> newChildren = Lists.newArrayList();
+        this.children.forEach(p -> newChildren.add(p.clone()));
+        subfieldOperator.children = newChildren;
+        return subfieldOperator;
+    }
+
+    @Override
     public String toString() {
         return String.format("Subfield([%s], \"%s\")", getChild(0).toString(), Joiner.on('.').join(fieldNames));
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(getChild(0), fieldNames);
+        return Objects.hash(getChild(0), fieldNames, copyFlag);
     }
 
     @Override
@@ -107,7 +126,8 @@ public class SubfieldOperator extends ScalarOperator {
             return false;
         }
         SubfieldOperator otherOp = (SubfieldOperator) other;
-        return fieldNames.equals(otherOp.fieldNames) && getChild(0).equals(otherOp.getChild(0));
+        return fieldNames.equals(otherOp.fieldNames) && getChild(0).equals(otherOp.getChild(0))
+                && copyFlag == otherOp.getCopyFlag();
     }
 
     @Override
@@ -118,5 +138,17 @@ public class SubfieldOperator extends ScalarOperator {
     @Override
     public ColumnRefSet getUsedColumns() {
         return getChild(0).getUsedColumns();
+    }
+
+    public String getPath() {
+        String childPath = getChildPath();
+        return childPath + "." + Joiner.on('.').join(fieldNames);
+    }
+
+    private String getChildPath() {
+        if (children.get(0) instanceof ColumnRefOperator) {
+            return ((ColumnRefOperator) children.get(0)).getName();
+        }
+        return children.get(0).toString();
     }
 }

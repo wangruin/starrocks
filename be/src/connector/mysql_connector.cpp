@@ -49,13 +49,17 @@ DataSourcePtr MySQLDataSourceProvider::create_data_source(const TScanRange& scan
     return std::make_unique<MySQLDataSource>(this, scan_range);
 }
 
+const TupleDescriptor* MySQLDataSourceProvider::tuple_descriptor(RuntimeState* state) const {
+    return state->desc_tbl().get_tuple_descriptor(_mysql_scan_node.tuple_id);
+}
+
 // ================================
 
 MySQLDataSource::MySQLDataSource(const MySQLDataSourceProvider* provider, const TScanRange& scan_range)
         : _provider(provider) {}
 
 Status MySQLDataSource::_init_params(RuntimeState* state) {
-    VLOG(1) << "MySQLDataSource::init mysql scan params";
+    VLOG(2) << "MySQLDataSource::init mysql scan params";
 
     DCHECK(state != nullptr);
 
@@ -86,8 +90,12 @@ Status MySQLDataSource::_init_params(RuntimeState* state) {
     return Status::OK();
 }
 
+std::string MySQLDataSource::name() const {
+    return "MySQLDataSource";
+}
+
 Status MySQLDataSource::open(RuntimeState* state) {
-    _init_params(state);
+    RETURN_IF_ERROR(_init_params(state));
     DCHECK(state != nullptr);
     RETURN_IF_CANCELLED(state);
     SCOPED_TIMER(_runtime_profile->total_time_counter());
@@ -150,15 +158,7 @@ Status MySQLDataSource::open(RuntimeState* state) {
 #undef APPLY_FOR_NUMERICAL_TYPE
 #undef DIRECT_APPEND_TO_SQL
 
-#define CONVERT_APPEND_TO_SQL          \
-    std::stringstream ss;              \
-    for (char c : value.to_string()) { \
-        if (c == '"') {                \
-            ss << '\\';                \
-        }                              \
-        ss << c;                       \
-    }                                  \
-    vector_values.emplace_back(fmt::format("'{}'", ss.str()));
+#define CONVERT_APPEND_TO_SQL vector_values.emplace_back(_mysql_scanner->escape(value.to_string()).to_string());
                 APPLY_FOR_VARCHAR_DATE_TYPE(READ_CONST_PREDICATE, CONVERT_APPEND_TO_SQL)
 #undef APPLY_FOR_VARCHAR_DATE_TYPE
 #undef CONVERT_APPEND_TO_SQL
@@ -217,7 +217,7 @@ Status MySQLDataSource::open(RuntimeState* state) {
 }
 
 Status MySQLDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
-    VLOG(1) << "MySQLDataSource::GetNext";
+    VLOG(2) << "MySQLDataSource::GetNext";
 
     DCHECK(state != nullptr && chunk != nullptr);
 
@@ -227,7 +227,7 @@ Status MySQLDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
         return Status::EndOfFile("finished!");
     }
 
-    _init_chunk(chunk, 0);
+    RETURN_IF_ERROR(_init_chunk_if_needed(chunk, 0));
     // indicates whether there are more rows to process. Set in _hbase_scanner.next().
     bool mysql_eos = false;
     int row_num = 0;

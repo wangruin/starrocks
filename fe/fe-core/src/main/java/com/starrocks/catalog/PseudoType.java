@@ -42,7 +42,17 @@ public class PseudoType extends Type {
     }
 
     @Override
+    public boolean isFullyCompatible(Type other) {
+        return matchesType(other);
+    }
+
+    @Override
     protected String toSql(int depth) {
+        return toString();
+    }
+
+    @Override
+    protected String toTypeString(int depth) {
         return toString();
     }
 }

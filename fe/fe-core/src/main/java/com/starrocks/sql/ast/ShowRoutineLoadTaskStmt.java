@@ -17,6 +17,7 @@ package com.starrocks.sql.ast;
 
 import com.google.common.collect.ImmutableList;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.analysis.SlotRef;
@@ -25,6 +26,7 @@ import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.server.RunMode;
 import com.starrocks.sql.parser.NodePosition;
 
 import java.util.Arrays;
@@ -38,20 +40,26 @@ import java.util.List;
  */
 public class ShowRoutineLoadTaskStmt extends ShowStmt {
     private static final List<String> SUPPORT_COLUMN = Arrays.asList("jobname");
-    private static final ImmutableList<String> TITLE_NAMES =
-            new ImmutableList.Builder<String>()
-                    .add("TaskId")
-                    .add("TxnId")
-                    .add("TxnStatus")
-                    .add("JobId")
-                    .add("CreateTime")
-                    .add("LastScheduledTime")
-                    .add("ExecuteStartTime")
-                    .add("Timeout")
-                    .add("BeId")
-                    .add("DataSourceProperties")
-                    .add("Message")
-                    .build();
+    private static final ImmutableList<String> TITLE_NAMES;
+
+    static {
+        ImmutableList.Builder<String> builder = new ImmutableList.Builder<String>()
+                .add("TaskId")
+                .add("TxnId")
+                .add("TxnStatus")
+                .add("JobId")
+                .add("CreateTime")
+                .add("LastScheduledTime")
+                .add("ExecuteStartTime")
+                .add("Timeout")
+                .add("BeId")
+                .add("DataSourceProperties")
+                .add("Message");
+        if (RunMode.getCurrentRunMode() == RunMode.SHARED_DATA) {
+            builder.add("Warehouse");
+        }
+        TITLE_NAMES = builder.build();
+    }
 
     private final Expr jobNameExpr;
 
@@ -94,7 +102,7 @@ public class ShowRoutineLoadTaskStmt extends ShowStmt {
                 break CHECK;
             }
             BinaryPredicate binaryPredicate = (BinaryPredicate) jobNameExpr;
-            if (binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+            if (binaryPredicate.getOp() != BinaryType.EQ) {
                 valid = false;
                 break CHECK;
             }

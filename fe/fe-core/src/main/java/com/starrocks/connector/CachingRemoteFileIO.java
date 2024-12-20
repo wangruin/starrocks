@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector;
 
 import com.google.common.cache.CacheBuilder;
@@ -21,9 +20,12 @@ import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.starrocks.connector.exception.StarRocksConnectorException;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.Path;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
@@ -43,17 +45,23 @@ public class CachingRemoteFileIO implements RemoteFileIO {
     private final LoadingCache<RemotePathKey, List<RemoteFileDesc>> cache;
 
     protected CachingRemoteFileIO(RemoteFileIO fileIO,
-                               Executor executor,
-                               long expireAfterWriteSec,
-                               long refreshIntervalSec,
-                               long maxSize) {
+                                  Executor executor,
+                                  long expireAfterWriteSec,
+                                  long refreshIntervalSec,
+                                  long maxSize) {
         this.fileIO = fileIO;
         this.cache = newCacheBuilder(expireAfterWriteSec, refreshIntervalSec, maxSize)
-                .build(asyncReloading(CacheLoader.from(this::loadRemoteFiles), executor));
+                .build(asyncReloading(new CacheLoader<RemotePathKey, List<RemoteFileDesc>>() {
+                    @Override
+                    public List<RemoteFileDesc> load(RemotePathKey key) throws Exception {
+                        List<RemoteFileDesc> res = loadRemoteFiles(key);
+                        return res;
+                    }
+                }, executor));
     }
 
     public static CachingRemoteFileIO createCatalogLevelInstance(RemoteFileIO fileIO, Executor executor,
-                                                        long expireAfterWrite, long refreshInterval, long maxSize) {
+                                                                 long expireAfterWrite, long refreshInterval, long maxSize) {
         return new CachingRemoteFileIO(fileIO, executor, expireAfterWrite, refreshInterval, maxSize);
     }
 
@@ -67,7 +75,14 @@ public class CachingRemoteFileIO implements RemoteFileIO {
     }
 
     public Map<RemotePathKey, List<RemoteFileDesc>> getRemoteFiles(RemotePathKey pathKey) {
+        return getRemoteFiles(pathKey, true);
+    }
+
+    public Map<RemotePathKey, List<RemoteFileDesc>> getRemoteFiles(RemotePathKey pathKey, boolean useCache) {
         try {
+            if (!useCache) {
+                invalidatePartition(pathKey);
+            }
             return ImmutableMap.of(pathKey, cache.getUnchecked(pathKey));
         } catch (UncheckedExecutionException e) {
             LOG.error("Error occurred when getting remote files from cache", e);
@@ -95,7 +110,11 @@ public class CachingRemoteFileIO implements RemoteFileIO {
     }
 
     public void updateRemoteFiles(RemotePathKey pathKey) {
-        cache.put(pathKey, loadRemoteFiles(pathKey));
+        if (fileIO instanceof CachingRemoteFileIO) {
+            ((CachingRemoteFileIO) fileIO).updateRemoteFiles(pathKey);
+        } else {
+            cache.put(pathKey, loadRemoteFiles(pathKey));
+        }
     }
 
     public synchronized void invalidateAll() {
@@ -103,7 +122,14 @@ public class CachingRemoteFileIO implements RemoteFileIO {
     }
 
     public void invalidatePartition(RemotePathKey pathKey) {
-        cache.invalidate(pathKey);
+        // fileIO is a CachingRemoteFileIO instance means that the current level is query level metadata,
+        // otherwise it's catalog level metadata. Both of two level metadata should be invalidated.
+        if (fileIO instanceof CachingRemoteFileIO) {
+            ((CachingRemoteFileIO) fileIO).invalidatePartition(pathKey);
+            cache.invalidate(pathKey);
+        } else {
+            cache.invalidate(pathKey);
+        }
     }
 
     private static CacheBuilder<Object, Object> newCacheBuilder(long expiresAfterWriteSec, long refreshSec, long maximumSize) {
@@ -118,5 +144,10 @@ public class CachingRemoteFileIO implements RemoteFileIO {
 
         cacheBuilder.maximumSize(maximumSize);
         return cacheBuilder;
+    }
+
+    @Override
+    public FileStatus[] getFileStatus(Path... files) throws IOException {
+        return fileIO.getFileStatus(files);
     }
 }

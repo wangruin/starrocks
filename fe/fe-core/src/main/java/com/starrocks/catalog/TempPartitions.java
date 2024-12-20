@@ -39,7 +39,6 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonPostProcessable;
@@ -57,7 +56,7 @@ import java.util.Set;
 // temp partition is used to implement the overwrite load.
 // user can load data into some of the temp partitions,
 // and then replace the formal partitions with these temp partitions
-// to make a overwrite load.
+// to make an overwrite load.
 public class TempPartitions implements Writable, GsonPostProcessable {
     @SerializedName(value = "idToPartition")
     private Map<Long, Partition> idToPartition = Maps.newHashMap();
@@ -85,8 +84,9 @@ public class TempPartitions implements Writable, GsonPostProcessable {
             idToPartition.remove(partition.getId());
             nameToPartition.remove(partitionName);
             if (!GlobalStateMgr.isCheckpointThread() && needDropTablet) {
-                TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
-                for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.ALL)) {
+                TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
+                for (MaterializedIndex index :
+                        partition.getDefaultPhysicalPartition().getMaterializedIndices(IndexExtState.ALL)) {
                     for (Tablet tablet : index.getTablets()) {
                         invertedIndex.deleteTablet(tablet.getId());
                     }
@@ -140,26 +140,8 @@ public class TempPartitions implements Writable, GsonPostProcessable {
     }
 
     public static TempPartitions read(DataInput in) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_77) {
-            TempPartitions tempPartitions = new TempPartitions();
-            tempPartitions.readFields(in);
-            return tempPartitions;
-        } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, TempPartitions.class);
-        }
-    }
-
-    private void readFields(DataInput in) throws IOException {
-        int size = in.readInt();
-        for (int i = 0; i < size; i++) {
-            Partition partition = Partition.read(in);
-            idToPartition.put(partition.getId(), partition);
-            nameToPartition.put(partition.getName(), partition);
-        }
-        if (in.readBoolean()) {
-            partitionInfo = (RangePartitionInfo) RangePartitionInfo.read(in);
-        }
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, TempPartitions.class);
     }
 
     @Override

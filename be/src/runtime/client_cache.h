@@ -98,8 +98,6 @@ public:
 
     std::string debug_string();
 
-    void test_shutdown();
-
     void init_metrics(MetricRegistry* metrics, const std::string& key_prefix);
 
 private:
@@ -178,6 +176,9 @@ public:
         }
     }
 
+    // Test only
+    ClientConnection() : _client(nullptr) {}
+
     ClientConnection(const ClientConnection&) = delete;
     void operator=(const ClientConnection&) = delete;
 
@@ -218,9 +219,6 @@ public:
 
     // Helper method which returns a debug string
     std::string debug_string() { return _client_cache_helper.debug_string(); }
-
-    // For testing only: shutdown all clients
-    void test_shutdown() { return _client_cache_helper.test_shutdown(); }
 
     // Adds metrics for this cache to the supplied MetricRegistry instance. The
     // metrics have keys that are prefixed by the key_prefix argument

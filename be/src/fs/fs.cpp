@@ -16,21 +16,43 @@
 
 #include <fmt/format.h>
 
+#include "fs/encrypt_file.h"
 #include "fs/fs_posix.h"
 #include "fs/fs_s3.h"
 #include "fs/fs_util.h"
 #include "fs/hdfs/fs_hdfs.h"
 #include "runtime/file_result_writer.h"
-#ifdef USE_STAROS
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
 #include "fs/fs_starlet.h"
 #endif
 
 namespace starrocks {
 
+std::unique_ptr<SequentialFile> SequentialFile::from(std::unique_ptr<io::SeekableInputStream> stream,
+                                                     const std::string& name, const FileEncryptionInfo& info) {
+    if (info.is_encrypted()) {
+        return std::make_unique<SequentialFile>(std::make_unique<EncryptSeekableInputStream>(std::move(stream), info),
+                                                name);
+    } else {
+        return std::make_unique<SequentialFile>(std::move(stream), name);
+    }
+}
+
+std::unique_ptr<RandomAccessFile> RandomAccessFile::from(std::unique_ptr<io::SeekableInputStream> stream,
+                                                         const std::string& name, bool is_cache_hit,
+                                                         const FileEncryptionInfo& info) {
+    if (info.is_encrypted()) {
+        return std::make_unique<RandomAccessFile>(std::make_unique<EncryptSeekableInputStream>(std::move(stream), info),
+                                                  name, is_cache_hit);
+    } else {
+        return std::make_unique<RandomAccessFile>(std::move(stream), name, is_cache_hit);
+    }
+}
+
 static thread_local std::shared_ptr<FileSystem> tls_fs_posix;
 static thread_local std::shared_ptr<FileSystem> tls_fs_s3;
 static thread_local std::shared_ptr<FileSystem> tls_fs_hdfs;
-#ifdef USE_STAROS
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
 static thread_local std::shared_ptr<FileSystem> tls_fs_starlet;
 #endif
 
@@ -55,7 +77,7 @@ inline std::shared_ptr<FileSystem> get_tls_fs_s3() {
     return tls_fs_s3;
 }
 
-#ifdef USE_STAROS
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
 inline std::shared_ptr<FileSystem> get_tls_fs_starlet() {
     if (tls_fs_starlet == nullptr) {
         tls_fs_starlet.reset(new_fs_starlet().release());
@@ -64,7 +86,19 @@ inline std::shared_ptr<FileSystem> get_tls_fs_starlet() {
 }
 #endif
 
-StatusOr<std::unique_ptr<FileSystem>> FileSystem::CreateUniqueFromString(std::string_view uri, FSOptions options) {
+StatusOr<std::shared_ptr<FileSystem>> FileSystem::Create(std::string_view uri, const FSOptions& options) {
+    if (!options._fs_options.empty()) {
+        return FileSystem::CreateUniqueFromString(uri, options);
+    } else {
+        return FileSystem::CreateSharedFromString(uri);
+    }
+}
+
+StatusOr<std::unique_ptr<FileSystem>> FileSystem::CreateUniqueFromString(std::string_view uri,
+                                                                         const FSOptions& options) {
+    if (fs::is_fallback_to_hadoop_fs(uri)) {
+        return new_fs_hdfs(options);
+    }
     if (fs::is_posix_uri(uri)) {
         return new_fs_posix();
     }
@@ -76,7 +110,7 @@ StatusOr<std::unique_ptr<FileSystem>> FileSystem::CreateUniqueFromString(std::st
         // Now Azure storage and Google Cloud Storage both are using LibHdfs, we can use cpp sdk instead in the future.
         return new_fs_hdfs(options);
     }
-#ifdef USE_STAROS
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
     if (is_starlet_uri(uri)) {
         return new_fs_starlet();
     }
@@ -87,13 +121,16 @@ StatusOr<std::unique_ptr<FileSystem>> FileSystem::CreateUniqueFromString(std::st
 }
 
 StatusOr<std::shared_ptr<FileSystem>> FileSystem::CreateSharedFromString(std::string_view uri) {
+    if (fs::is_fallback_to_hadoop_fs(uri)) {
+        return get_tls_fs_hdfs();
+    }
     if (fs::is_posix_uri(uri)) {
         return get_tls_fs_posix();
     }
     if (fs::is_s3_uri(uri)) {
         return get_tls_fs_s3();
     }
-#ifdef USE_STAROS
+#if defined(USE_STAROS) && !defined(BUILD_FORMAT_LIB)
     if (is_starlet_uri(uri)) {
         return get_tls_fs_starlet();
     }
@@ -116,6 +153,41 @@ const THdfsProperties* FSOptions::hdfs_properties() const {
         return &download->hdfs_properties;
     }
     return nullptr;
+}
+
+static std::deque<FileWriteStat> file_write_history;
+static std::unordered_map<uint64_t, FileWriteStat> file_writes;
+static std::mutex file_writes_mutex;
+
+void FileSystem::get_file_write_history(std::vector<FileWriteStat>* stats) {
+    std::lock_guard<std::mutex> l(file_writes_mutex);
+    stats->assign(file_write_history.begin(), file_write_history.end());
+    for (auto& it : file_writes) {
+        stats->push_back(it.second);
+    }
+}
+
+void FileSystem::on_file_write_open(WritableFile* file) {
+    std::lock_guard<std::mutex> l(file_writes_mutex);
+    FileWriteStat stat;
+    stat.path = file->filename();
+    stat.open_time = time(nullptr);
+    file_writes[reinterpret_cast<uint64_t>(file)] = stat;
+}
+
+void FileSystem::on_file_write_close(WritableFile* file) {
+    std::lock_guard<std::mutex> l(file_writes_mutex);
+    auto it = file_writes.find(reinterpret_cast<uint64_t>(file));
+    if (it == file_writes.end()) {
+        return;
+    }
+    it->second.close_time = time(nullptr);
+    it->second.size = file->size();
+    file_write_history.push_back(it->second);
+    file_writes.erase(it);
+    while (file_write_history.size() > config::file_write_history_size) {
+        file_write_history.pop_front();
+    }
 }
 
 } // namespace starrocks

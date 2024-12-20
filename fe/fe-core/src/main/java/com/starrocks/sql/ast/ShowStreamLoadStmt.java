@@ -23,7 +23,6 @@ import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
-import com.starrocks.common.AnalysisException;
 import com.starrocks.load.streamload.StreamLoadFunctionalExprProvider;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
@@ -88,6 +87,8 @@ public class ShowStreamLoadStmt extends ShowStmt {
                     .add("FinishPreparingTimeMs")
                     .add("EndTimeMs")
                     .add("ChannelState")
+                    .add("Type")
+                    .add("TrackingSQL")
                     .build();
 
     private final LabelName labelName;
@@ -117,7 +118,6 @@ public class ShowStreamLoadStmt extends ShowStmt {
     }
 
 
-
     public String getDbFullName() {
         return labelName.getDbName();
     }
@@ -130,7 +130,7 @@ public class ShowStreamLoadStmt extends ShowStmt {
         return includeHistory;
     }
 
-    public StreamLoadFunctionalExprProvider getFunctionalExprProvider(ConnectContext context) throws AnalysisException {
+    public StreamLoadFunctionalExprProvider getFunctionalExprProvider(ConnectContext context) {
         if (null == functionalExprProvider) {
             functionalExprProvider = new StreamLoadFunctionalExprProvider();
         }

@@ -35,8 +35,6 @@
 package com.starrocks.analysis;
 
 import com.google.common.collect.Maps;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.AlterRoutineLoadAnalyzer;
 import com.starrocks.sql.analyzer.SemanticException;
@@ -44,8 +42,6 @@ import com.starrocks.sql.ast.AlterRoutineLoadStmt;
 import com.starrocks.sql.ast.CreateRoutineLoadStmt;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.utframe.UtFrameUtils;
-import mockit.Expectations;
-import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -63,28 +59,9 @@ public class AlterRoutineLoadStmtTest {
 
     private static ConnectContext connectContext;
 
-    @Mocked
-    private Auth auth;
-
     @Before
     public void setUp() throws IOException {
         connectContext = UtFrameUtils.createDefaultCtx();
-
-        new Expectations() {
-            {
-                auth.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-
-                auth.checkDbPriv((ConnectContext) any, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-
-                auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-            }
-        };
     }
 
     @Test
@@ -98,30 +75,39 @@ public class AlterRoutineLoadStmtTest {
                 + "(\n"
                 + "\"max_batch_rows\"=\"200000\",\n"
                 + "\"max_error_number\"=\"1\",\n"
+                + "\"max_filter_ratio\"=\"0.3\",\n"
                 + "\"desired_concurrent_number\"=\"3\",\n"
                 + "\"max_batch_interval\" = \"21\",\n"
                 + "\"strict_mode\" = \"false\",\n"
+                + "\"task_consume_second\" = \"5\",\n"
                 + "\"timezone\" = \"Africa/Abidjan\"\n"
                 + ")\n"
                 + "FROM KAFKA\n"
                 + "(\n"
                 + "\"kafka_partitions\" = \"0, 1, 2\",\n"
                 + "\"kafka_offsets\" = \"100, 200, 100\",\n"
-                + "\"property.group.id\" = \"group1\"\n"
+                + "\"property.group.id\" = \"group1\",\n"
+                + "\"confluent.schema.registry.url\" = \"https://key:passwrod@addr\"\n"
                 + ");";
         List<StatementBase> stmts = com.starrocks.sql.parser.SqlParser.parse(sql, 32);
         AlterRoutineLoadStmt stmt = (AlterRoutineLoadStmt)stmts.get(0);
         AlterRoutineLoadAnalyzer.analyze(stmt, connectContext);
 
-        Assert.assertEquals(6, stmt.getAnalyzedJobProperties().size());
+        Assert.assertEquals(9, stmt.getAnalyzedJobProperties().size());
         Assert.assertTrue(
                 stmt.getAnalyzedJobProperties().containsKey(CreateRoutineLoadStmt.MAX_ERROR_NUMBER_PROPERTY));
         Assert.assertTrue(
+            stmt.getAnalyzedJobProperties().containsKey(CreateRoutineLoadStmt.MAX_FILTER_RATIO_PROPERTY));
+        Assert.assertEquals("0.3", stmt.getAnalyzedJobProperties().get(CreateRoutineLoadStmt.MAX_FILTER_RATIO_PROPERTY));
+        Assert.assertTrue(
                 stmt.getAnalyzedJobProperties().containsKey(CreateRoutineLoadStmt.MAX_BATCH_ROWS_PROPERTY));
+        Assert.assertEquals("5", stmt.getAnalyzedJobProperties().get(CreateRoutineLoadStmt.TASK_CONSUME_SECOND));
+        Assert.assertEquals("20", stmt.getAnalyzedJobProperties().get(CreateRoutineLoadStmt.TASK_TIMEOUT_SECOND));
         Assert.assertTrue(stmt.hasDataSourceProperty());
         Assert.assertEquals(1, stmt.getDataSourceProperties().getCustomKafkaProperties().size());
         Assert.assertTrue(stmt.getDataSourceProperties().getCustomKafkaProperties().containsKey("group.id"));
         Assert.assertEquals(3, stmt.getDataSourceProperties().getKafkaPartitionOffsets().size());
+        Assert.assertEquals("https://key:passwrod@addr", stmt.getDataSourceProperties().getConfluentSchemaRegistryUrl());
     }
 
     @Test

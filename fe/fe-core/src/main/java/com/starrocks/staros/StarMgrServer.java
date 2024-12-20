@@ -17,13 +17,18 @@ package com.starrocks.staros;
 
 import com.staros.manager.StarManager;
 import com.staros.manager.StarManagerServer;
+import com.staros.metrics.MetricsSystem;
 import com.starrocks.common.Config;
 import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.ha.StateChangeExecution;
+import com.starrocks.journal.CheckpointWorker;
+import com.starrocks.journal.StarMgrCheckpointWorker;
 import com.starrocks.journal.bdbje.BDBEnvironment;
 import com.starrocks.journal.bdbje.BDBJEJournal;
 import com.starrocks.lake.StarOSAgent;
-import com.starrocks.leader.Checkpoint;
+import com.starrocks.leader.CheckpointController;
+import com.starrocks.metric.MetricVisitor;
+import com.starrocks.metric.PrometheusRegistryHelper;
 import com.starrocks.persist.Storage;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
@@ -45,7 +50,9 @@ public class StarMgrServer {
     private static final Logger LOG = LogManager.getLogger(StarMgrServer.class);
 
     private static StarMgrServer CHECKPOINT = null;
-    private Checkpoint checkpointer = null;
+    private CheckpointController checkpointController = null;
+    private CheckpointWorker checkpointWorker = null;
+    private boolean checkpointWorkerStarted = false;
     private static long checkpointThreadId = -1;
     private String imageDir;
     private StateChangeExecution execution;
@@ -77,8 +84,12 @@ public class StarMgrServer {
         }
     }
 
+    public static StarMgrServer getServingState() {
+        return SingletonHolder.INSTANCE;
+    }
+
     private StarManagerServer starMgrServer;
-    private BDBJEJournalSystem journalSystem;
+    private StarOSBDBJEJournalSystem journalSystem;
 
     public StarMgrServer() {
         execution = new StateChangeExecution() {
@@ -96,7 +107,7 @@ public class StarMgrServer {
 
     // for checkpoint thread only
     public StarMgrServer(BDBJEJournal journal) {
-        journalSystem = new BDBJEJournalSystem(journal);
+        journalSystem = new StarOSBDBJEJournalSystem(journal);
         starMgrServer = new StarManagerServer(journalSystem);
     }
 
@@ -104,7 +115,7 @@ public class StarMgrServer {
         return starMgrServer.getStarManager();
     }
 
-    public BDBJEJournalSystem getJournalSystem() {
+    public StarOSBDBJEJournalSystem getJournalSystem() {
         return journalSystem;
     }
 
@@ -113,7 +124,7 @@ public class StarMgrServer {
     }
 
     public void initialize(BDBEnvironment environment, String baseImageDir) throws IOException {
-        journalSystem = new BDBJEJournalSystem(environment);
+        journalSystem = new StarOSBDBJEJournalSystem(environment);
         imageDir = baseImageDir + IMAGE_SUBDIR;
 
         // TODO: remove separate deployment capability for now
@@ -122,41 +133,7 @@ public class StarMgrServer {
         com.staros.util.Config.STARMGR_RPC_PORT = Config.cloud_native_meta_port;
 
         // Storage fs type
-        com.staros.util.Config.DEFAULT_FS_TYPE = Config.cloud_native_storage_type;
-        if (com.staros.util.Config.DEFAULT_FS_TYPE.equalsIgnoreCase("HDFS")) {
-            // HDFS related configuration
-            com.staros.util.Config.HDFS_URL = Config.cloud_native_hdfs_url;
-            if (com.staros.util.Config.HDFS_URL.isEmpty()) {
-                LOG.error("The configuration item \"cloud_native_hdfs_url\" is empty.");
-                System.exit(-1);
-            }
-        } else if (com.staros.util.Config.DEFAULT_FS_TYPE.equalsIgnoreCase("S3")) {
-            // AWS related configuration
-            String[] bucketAndPrefix = getBucketAndPrefix();
-            com.staros.util.Config.S3_BUCKET = bucketAndPrefix[0];
-            com.staros.util.Config.S3_PATH_PREFIX = bucketAndPrefix[1];
-            com.staros.util.Config.S3_REGION = Config.aws_s3_region;
-            com.staros.util.Config.S3_ENDPOINT = Config.aws_s3_endpoint;
-            if (com.staros.util.Config.S3_BUCKET.isEmpty()) {
-                LOG.error("The configuration item \"aws_s3_path = {}\" is invalid, s3 bucket is empty.", Config.aws_s3_path);
-                System.exit(-1);
-            }
-            // aws credential related configuration
-            String credentialType = getAwsCredentialType();
-            if (credentialType == null) {
-                LOG.error("Invalid aws credential configuration.");
-                System.exit(-1);
-            }
-            com.staros.util.Config.AWS_CREDENTIAL_TYPE = credentialType;
-            com.staros.util.Config.SIMPLE_CREDENTIAL_ACCESS_KEY_ID = Config.aws_s3_access_key;
-            com.staros.util.Config.SIMPLE_CREDENTIAL_ACCESS_KEY_SECRET = Config.aws_s3_secret_key;
-            com.staros.util.Config.ASSUME_ROLE_CREDENTIAL_ARN = Config.aws_s3_iam_role_arn;
-            com.staros.util.Config.ASSUME_ROLE_CREDENTIAL_EXTERNAL_ID = Config.aws_s3_external_id;
-        } else {
-            LOG.error("The configuration item \"cloud_native_storage_type = {}\" is invalid, must be HDFS or S3.", 
-                    Config.cloud_native_storage_type);
-            System.exit(-1);
-        }
+        com.staros.util.Config.DEFAULT_FS_TYPE = "";
 
         // use tablet_sched_disable_balance
         com.staros.util.Config.DISABLE_BACKGROUND_SHARD_SCHEDULE_CHECK = Config.tablet_sched_disable_balance;
@@ -165,12 +142,18 @@ public class StarMgrServer {
         // set the same heartbeat configuration to starmgr, but not able to change in runtime.
         com.staros.util.Config.WORKER_HEARTBEAT_INTERVAL_SEC = Config.heartbeat_timeout_second;
         com.staros.util.Config.WORKER_HEARTBEAT_RETRY_COUNT = Config.heartbeat_retry_times;
+        com.staros.util.Config.GRPC_RPC_TIME_OUT_SEC = Config.starmgr_grpc_timeout_seconds;
+        com.staros.util.Config.ENABLE_BALANCE_SHARD_NUM_BETWEEN_WORKERS = Config.lake_enable_balance_tablets_between_workers;
+        com.staros.util.Config.BALANCE_WORKER_SHARDS_THRESHOLD_IN_PERCENT = Config.lake_balance_tablets_threshold;
 
         // sync the mutable configVar to StarMgr in case any changes
         GlobalStateMgr.getCurrentState().getConfigRefreshDaemon().registerListener(() -> {
             com.staros.util.Config.DISABLE_BACKGROUND_SHARD_SCHEDULE_CHECK = Config.tablet_sched_disable_balance;
             com.staros.util.Config.WORKER_HEARTBEAT_INTERVAL_SEC = Config.heartbeat_timeout_second;
             com.staros.util.Config.WORKER_HEARTBEAT_RETRY_COUNT = Config.heartbeat_retry_times;
+            com.staros.util.Config.GRPC_RPC_TIME_OUT_SEC = Config.starmgr_grpc_timeout_seconds;
+            com.staros.util.Config.ENABLE_BALANCE_SHARD_NUM_BETWEEN_WORKERS = Config.lake_enable_balance_tablets_between_workers;
+            com.staros.util.Config.BALANCE_WORKER_SHARDS_THRESHOLD_IN_PERCENT = Config.lake_balance_tablets_threshold;
         });
         // set the following config, in order to provide a customized worker group definition
         // com.staros.util.Config.RESOURCE_MANAGER_WORKER_GROUP_SPEC_RESOURCE_FILE = "";
@@ -201,17 +184,27 @@ public class StarMgrServer {
 
     private void becomeLeader() {
         getStarMgr().becomeLeader();
+    }
 
+    public void startCheckpointController() {
         // start checkpoint thread after everything is ready
-        checkpointer = new Checkpoint("star mgr LeaderCheckpointer", getJournalSystem().getJournal(), IMAGE_SUBDIR,
-                false /* belongToGlobalStateMgr */);
-        checkpointThreadId = checkpointer.getId();
-        checkpointer.start();
-        LOG.info("star mgr checkpointer thread started. thread id is {}.", checkpointThreadId);
+        checkpointController = new CheckpointController(
+                "star_os_checkpoint_controller", getJournalSystem().getJournal(), IMAGE_SUBDIR);
+        checkpointController.start();
     }
 
     private void becomeFollower() {
         getStarMgr().becomeFollower();
+    }
+
+    public void startCheckpointWorker() {
+        if (!checkpointWorkerStarted) {
+            checkpointWorker = new StarMgrCheckpointWorker(getJournalSystem().getJournal());
+            checkpointThreadId = checkpointWorker.getId();
+            checkpointWorker.start();
+            checkpointWorkerStarted = true;
+            LOG.info("star mgr checkpoint worker thread started. thread id is {}.", checkpointThreadId);
+        }
     }
 
     private void loadImage(String imageDir) throws IOException {
@@ -232,16 +225,15 @@ public class StarMgrServer {
         }
     }
 
-    public boolean replayAndGenerateImage(String imageDir, long checkPointVersion) throws IOException {
+    public void replayAndGenerateImage(String imageDir, long checkPointVersion) throws IOException {
         // 1. load base image
         loadImage(imageDir);
 
         // 2. replay incremental journal
         getJournalSystem().replayTo(checkPointVersion);
         if (getJournalSystem().getReplayId() != checkPointVersion) {
-            LOG.error("star mgr checkpoint version should be {}, actual replayed journal id is {}",
-                    checkPointVersion, getJournalSystem().getReplayId());
-            return false;
+            throw new IOException(String.format("star mgr checkpoint version should be %d, actual replayed journal id is %d",
+                    checkPointVersion, getJournalSystem().getReplayId()));
         }
 
         // 3. write new image
@@ -253,8 +245,10 @@ public class StarMgrServer {
             if (!ckpt.getParentFile().exists()) {
                 LOG.info("create image dir for star mgr, {}.", ckpt.getParentFile().getAbsolutePath());
                 if (!ckpt.getParentFile().mkdir()) {
-                    LOG.warn("fail to create image dir {} for star mgr." + ckpt.getAbsolutePath());
-                    throw new IOException();
+                    String errorMessage = String.format("fail to create image dir %s for star mgr.",
+                            ckpt.getAbsolutePath());
+                    LOG.warn(errorMessage);
+                    throw new IOException(errorMessage);
                 }
             }
             if (!ckpt.createNewFile()) {
@@ -267,13 +261,19 @@ public class StarMgrServer {
         // Move image.ckpt to image.dataVersion
         LOG.info("move star mgr " + ckpt.getAbsolutePath() + " to " + imageFile.getAbsolutePath());
         if (!ckpt.renameTo(imageFile)) {
-            if (ckpt.delete()) {
+            if (!ckpt.delete()) {
                 LOG.warn("rename failed, fail to delete middle star mgr image " + ckpt.getAbsolutePath() + ".");
             }
-            throw new IOException();
+            throw new IOException(String.format("failed to remove file %s to %s",
+                    ckpt.getAbsolutePath(), imageFile.getAbsolutePath()));
         }
+    }
 
-        return true;
+    public void visitMetrics(MetricVisitor visitor) {
+        if (starMgrServer == null) {
+            return;
+        }
+        PrometheusRegistryHelper.visitPrometheusRegistry(MetricsSystem.METRIC_REGISTRY, visitor);
     }
 
     public long getMaxJournalId() {
@@ -284,39 +284,11 @@ public class StarMgrServer {
         return getJournalSystem().getReplayId();
     }
 
-    public static String[] getBucketAndPrefix() {
-        int index = Config.aws_s3_path.indexOf('/');
-        if (index < 0) {
-            return new String[] {Config.aws_s3_path, ""};
-        }
-
-        return new String[] {Config.aws_s3_path.substring(0, index), 
-                Config.aws_s3_path.substring(index + 1)};
+    public CheckpointController getCheckpointController() {
+        return checkpointController;
     }
 
-    public static String getAwsCredentialType() {
-        if (Config.aws_s3_use_aws_sdk_default_behavior) {
-            return "default";
-        }
-
-        if (Config.aws_s3_use_instance_profile) {
-            if (Config.aws_s3_iam_role_arn.isEmpty()) {
-                return "instance_profile";
-            }
-
-            return "assume_role";
-        }
-
-        if (Config.aws_s3_access_key.isEmpty() || Config.aws_s3_secret_key.isEmpty()) {
-            // invalid credential configuration
-            return null;
-        }
-
-        if (Config.aws_s3_iam_role_arn.isEmpty()) {
-            return "simple";
-        }
-
-        //assume_role with ak sk, not supported now, just return null
-        return null;
+    public CheckpointWorker getCheckpointWorker() {
+        return checkpointWorker;
     }
 }

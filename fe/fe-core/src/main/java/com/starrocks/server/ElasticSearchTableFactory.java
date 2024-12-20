@@ -27,6 +27,7 @@ import com.starrocks.sql.ast.PartitionDesc;
 
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import javax.validation.constraints.NotNull;
 
 public class ElasticSearchTableFactory implements AbstractTableFactory {
@@ -43,16 +44,27 @@ public class ElasticSearchTableFactory implements AbstractTableFactory {
         String tableName = stmt.getTableName();
 
         // create columns
-        List<Column> baseSchema = stmt.getColumns();
-        metastore.validateColumns(baseSchema);
+        List<Column> baseSchema = stmt.getColumnDefs().stream()
+                .map(ref -> new Column(ref.getName(),
+                        ref.getType(),
+                        ref.isKey(),
+                        ref.getAggregateType(),
+                        ref.isAllowNull(),
+                        ref.getDefaultValueDef(),
+                        "by es comment"))
+                .collect(Collectors.toList());
+        // metastore is null when external table
+        if (null != metastore) {
+            metastore.validateColumns(baseSchema);
+        }
 
         // create partition info
         PartitionDesc partitionDesc = stmt.getPartitionDesc();
         PartitionInfo partitionInfo = null;
         Map<String, Long> partitionNameToId = Maps.newHashMap();
         if (partitionDesc != null) {
-            partitionInfo = partitionDesc.toPartitionInfo(baseSchema, partitionNameToId, false, false);
-        } else {
+            partitionInfo = partitionDesc.toPartitionInfo(baseSchema, partitionNameToId, false);
+        } else if (null != metastore) {
             long partitionId = metastore.getNextId();
             // use table name as single partition name
             partitionNameToId.put(tableName, partitionId);

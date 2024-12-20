@@ -17,15 +17,20 @@
 
 package com.starrocks.persist;
 
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.persist.gson.GsonUtils;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 public class RecoverInfo implements Writable {
+    @SerializedName("db")
     private long dbId;
+    @SerializedName("tb")
     private long tableId;
+    @SerializedName("pi")
     private long partitionId;
 
     public RecoverInfo() {
@@ -52,15 +57,6 @@ public class RecoverInfo implements Writable {
 
     @Override
     public void write(DataOutput out) throws IOException {
-        out.writeLong(dbId);
-        out.writeLong(tableId);
-        out.writeLong(partitionId);
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
-
-    public void readFields(DataInput in) throws IOException {
-        dbId = in.readLong();
-        tableId = in.readLong();
-        partitionId = in.readLong();
-    }
-
 }

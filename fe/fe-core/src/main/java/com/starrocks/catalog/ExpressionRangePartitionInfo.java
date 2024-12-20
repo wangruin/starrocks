@@ -14,25 +14,34 @@
 
 package com.starrocks.catalog;
 
-
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.reflect.TypeToken;
+import com.google.common.base.Strings;
+import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
-import com.starrocks.common.io.Text;
-import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.persist.ColumnIdExpr;
+import com.starrocks.persist.ExpressionSerializedObject;
+import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.persist.gson.GsonPreProcessable;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.PartitionExprAnalyzer;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.common.MetaUtils;
+import com.starrocks.sql.optimizer.rule.transformation.materialization.MvUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static java.util.stream.Collectors.toList;
 
@@ -40,22 +49,118 @@ import static java.util.stream.Collectors.toList;
  * ExpressionRangePartitionInfo replace columns with expressions
  * Some Descriptions:
  * 1. no overwrite old serialized method: read、write and readFields, because we use gson now
+ * 2. As of 2023-09, it's still used to describe auto range using expr like PARTITION BY date_trunc('day', col).
  */
-public class ExpressionRangePartitionInfo extends RangePartitionInfo {
+@Deprecated
+public class ExpressionRangePartitionInfo extends RangePartitionInfo implements GsonPreProcessable, GsonPostProcessable {
 
+    private static final Logger LOG = LogManager.getLogger(ExpressionRangePartitionInfo.class);
 
     public static final String AUTOMATIC_SHADOW_PARTITION_NAME = "$shadow_automatic_partition";
     public static final String SHADOW_PARTITION_PREFIX = "$";
 
+    private List<ColumnIdExpr> partitionExprs;
+
     @SerializedName(value = "partitionExprs")
-    private List<Expr> partitionExprs;
+    private List<ExpressionSerializedObject> serializedPartitionExprs;
 
     public ExpressionRangePartitionInfo() {
         this.type = PartitionType.EXPR_RANGE;
     }
 
+    @Override
+    public void gsonPreProcess() throws IOException {
+        super.gsonPreProcess();
+        List<ExpressionSerializedObject> serializedPartitionExprs = Lists.newArrayList();
+        for (ColumnIdExpr partitionExpr : partitionExprs) {
+            if (partitionExpr != null) {
+                serializedPartitionExprs.add(ExpressionSerializedObject.create(partitionExpr));
+            }
+        }
+        this.serializedPartitionExprs = serializedPartitionExprs;
+    }
 
-    public ExpressionRangePartitionInfo(List<Expr> partitionExprs, List<Column> columns, PartitionType type) {
+    @Override
+    public void gsonPostProcess() throws IOException {
+        super.gsonPostProcess();
+        List<ColumnIdExpr> partitionExprs = Lists.newArrayList();
+        for (ExpressionSerializedObject expressionSql : serializedPartitionExprs) {
+            partitionExprs.add(expressionSql.deserialize());
+        }
+        this.partitionExprs = partitionExprs;
+    }
+
+    public void updateSlotRef(Map<String, Column> nameToColumn) {
+        for (ColumnIdExpr columnIdExpr : partitionExprs) {
+            Expr expr = columnIdExpr.getExpr();
+            SlotRef slotRef = getPartitionExprSlotRef(expr);
+            if (slotRef == null) {
+                LOG.warn("Unknown expr type: {}", expr.toSql());
+                continue;
+            }
+            // FIXME: use the slot ref's column name to find the partition column which maybe not the same as the slot ref's
+            //  column name.
+            String slotRefName = slotRef.getColumnName();
+            if (!nameToColumn.containsKey(slotRefName)) {
+                continue;
+            }
+            Column partitionColumn = nameToColumn.get(slotRefName);
+            // analyze partition expression
+            analyzePartitionExpressionExpr(slotRef, partitionColumn, expr);
+        }
+    }
+
+    /**
+     * NOTE: only one slot ref is allowed in partition expression for now.
+     * @param expr the partition expression.
+     * @return Return the input slotRef of partition expression, which is used to analyze partition expression.
+     */
+    private SlotRef getPartitionExprSlotRef(Expr expr) {
+        if (expr == null) {
+            return null;
+        }
+        if (expr instanceof SlotRef) {
+            return (SlotRef) expr;
+        } else if (expr instanceof FunctionCallExpr) {
+            return AnalyzerUtils.getSlotRefFromFunctionCall(expr);
+        } else if (expr instanceof CastExpr) {
+            return AnalyzerUtils.getSlotRefFromCast(expr);
+        }
+        return null;
+    }
+
+    /**
+     * Analyze partition expression slot ref.
+     * @param slotRef the partition expression's argument slot ref.
+     * @param partitionColumn the partition column.
+     * @param partitionExpr the partition expression
+     */
+    private void analyzePartitionExpressionExpr(SlotRef slotRef, Column partitionColumn, Expr partitionExpr) {
+        // TODO: Later, for automatically partitioned tables,
+        //  partitions of materialized views (also created automatically),
+        //  and partition by expr tables will use ExpressionRangePartitionInfoV2
+        if (slotRef.getType() == Type.INVALID) {
+            if (partitionExpr instanceof FunctionCallExpr) {
+                if (MvUtils.isStr2Date(partitionExpr)) {
+                    // `str2date`'s input argument type should always be string
+                    slotRef.setType(Type.STRING);
+                } else {
+                    // otherwise input argument type is the same as the partition column's type
+                    slotRef.setType(partitionColumn.getType());
+                }
+            } else {
+                slotRef.setType(partitionColumn.getType());
+            }
+        }
+        slotRef.setNullable(partitionColumn.isAllowNull());
+        try {
+            PartitionExprAnalyzer.analyzePartitionExpr(partitionExpr, slotRef);
+        } catch (SemanticException ex) {
+            LOG.warn("Failed to analyze partition expr: {}", partitionExpr.toSql(), ex);
+        }
+    }
+
+    public ExpressionRangePartitionInfo(List<ColumnIdExpr> partitionExprs, List<Column> columns, PartitionType type) {
         super(columns);
         Preconditions.checkState(partitionExprs != null);
         Preconditions.checkState(partitionExprs.size() > 0);
@@ -65,12 +170,50 @@ public class ExpressionRangePartitionInfo extends RangePartitionInfo {
         this.type = type;
     }
 
-    public List<Expr> getPartitionExprs() {
+    @VisibleForTesting
+    public List<ColumnIdExpr> getPartitionExprs() {
         return partitionExprs;
     }
 
-    public void setPartitionExprs(List<Expr> partitionExprs) {
-        this.partitionExprs = partitionExprs;
+    public List<Expr> getPartitionExprs(Map<ColumnId, Column> idToColumn) {
+        List<Expr> result = new ArrayList<>(partitionExprs.size());
+        for (ColumnIdExpr columnIdExpr : partitionExprs) {
+            result.add(columnIdExpr.convertToColumnNameExpr(idToColumn));
+        }
+        return result;
+    }
+
+    @Override
+    public List<Column> getPartitionColumns(Map<ColumnId, Column> idToColumn) {
+        List<Column> columns = MetaUtils.getColumnsByColumnIds(idToColumn, partitionColumnIds);
+        for (int i = 0; i < columns.size(); i++) {
+            Expr expr = partitionExprs.get(i).convertToColumnNameExpr(idToColumn);
+            Column column = columns.get(i);
+            if (expr.getType().getPrimitiveType() != PrimitiveType.INVALID_TYPE
+                    && expr.getType().getPrimitiveType() != column.getType().getPrimitiveType()) {
+                Column newColumn = new Column(column);
+                newColumn.setType(expr.getType());
+                columns.set(i, newColumn);
+            }
+        }
+        return columns;
+    }
+
+    @Override
+    public int getPartitionColumnsSize() {
+        return partitionColumnIds.size();
+    }
+
+    public List<Expr> getPartitionExprs(List<Column> schema) {
+        List<Expr> result = new ArrayList<>(partitionExprs.size());
+        for (ColumnIdExpr columnIdExpr : partitionExprs) {
+            result.add(columnIdExpr.convertToColumnNameExpr(schema));
+        }
+        return result;
+    }
+
+    public int getPartitionExprsSize() {
+        return partitionExprs.size();
     }
 
     @Override
@@ -79,7 +222,8 @@ public class ExpressionRangePartitionInfo extends RangePartitionInfo {
         sb.append("PARTITION BY ");
         if (table instanceof MaterializedView) {
             sb.append("(");
-            for (Expr expr : partitionExprs) {
+            for (ColumnIdExpr columnIdExpr : partitionExprs) {
+                Expr expr = columnIdExpr.convertToColumnNameExpr(table.getIdToColumn());
                 if (expr instanceof SlotRef) {
                     SlotRef slotRef = (SlotRef) expr.clone();
                     sb.append("`").append(slotRef.getColumnName()).append("`").append(",");
@@ -100,38 +244,20 @@ public class ExpressionRangePartitionInfo extends RangePartitionInfo {
             sb.append(")");
             return sb.toString();
         }
-        sb.append(Joiner.on(", ").join(partitionExprs.stream().map(Expr::toSql).collect(toList())));
+        sb.append(Joiner.on(", ").join(partitionExprs
+                .stream()
+                .map(columnIdExpr -> columnIdExpr.convertToColumnNameExpr(table.getIdToColumn()).toSql())
+                .collect(toList())));
         return sb.toString();
     }
 
-    public static PartitionInfo read(DataInput in) throws IOException {
-        ExpressionRangePartitionInfo info = new ExpressionRangePartitionInfo();
-        info.readFields(in);
-        String json = Text.readString(in);
-        List<Expr> exprs = GsonUtils.GSON.fromJson(json, new TypeToken<List<Expr>>(){}.getType());
-        List<Column> partitionColumns = info.getPartitionColumns();
-        for (Expr expr : exprs) {
-            if (expr instanceof FunctionCallExpr) {
-                SlotRef slotRef = AnalyzerUtils.getSlotRefFromFunctionCall(expr);
-                for (Column partitionColumn : partitionColumns) {
-                    if (slotRef.getColumnName().equalsIgnoreCase(partitionColumn.getName())) {
-                        PartitionExprAnalyzer.analyzePartitionExpr(expr, partitionColumn.getType());
-                        slotRef.setType(partitionColumn.getType());
-                    }
-                }
-            }
-        }
-        info.setPartitionExprs(exprs);
-        return info;
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        Text.writeString(out, GsonUtils.GSON.toJson(partitionExprs));
-    }
-
-    public void renameTableName(String newTableName) {
+    /**
+     * Do actions when rename referred table's db or table name.
+     * @param dbName        : new db name which can be null or empty and will be not updated then.
+     * @param newTableName  : new table name which must be not null or empty.
+     */
+    public void renameTableName(String dbName, String newTableName) {
+        Preconditions.checkArgument(!Strings.isNullOrEmpty(newTableName));
         AstVisitor<Void, Void> renameVisitor = new AstVisitor<Void, Void>() {
             @Override
             public Void visitExpression(Expr expr, Void context) {
@@ -145,14 +271,23 @@ public class ExpressionRangePartitionInfo extends RangePartitionInfo {
             public Void visitSlot(SlotRef node, Void context) {
                 TableName tableName = node.getTblNameWithoutAnalyzed();
                 if (tableName != null) {
+                    if (!Strings.isNullOrEmpty(dbName)) {
+                        tableName.setDb(dbName);
+                    }
                     tableName.setTbl(newTableName);
                 }
                 return null;
             }
         };
-        for (Expr expr : partitionExprs) {
-            expr.accept(renameVisitor, null);
+        for (ColumnIdExpr expr : partitionExprs) {
+            expr.getExpr().accept(renameVisitor, null);
         }
     }
+
+    @Override
+    public boolean isAutomaticPartition() {
+        return type == PartitionType.EXPR_RANGE;
+    }
+
 }
 

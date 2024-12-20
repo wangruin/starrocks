@@ -45,6 +45,7 @@
 #include "roaring/containers/containers.h"
 #include "roaring/roaring.h"
 #include "roaring/roaring_array.h"
+#include "util/coding.h"
 
 namespace starrocks {
 
@@ -89,6 +90,13 @@ struct BitmapTypeCode {
 };
 
 namespace detail {
+
+// https://github.com/RoaringBitmap/CRoaring/blob/5d6dd2342d9e3ffaf481aa5ebe344e19984faa4a/src/roaring.c#L21
+// The tow macro is not in .h file, so copy to here.
+#define SERIALIZATION_ARRAY_UINT32 1
+#define SERIALIZATION_CONTAINER 2
+
+using Roaring = roaring::Roaring;
 
 class Roaring64MapSetBitForwardIterator;
 
@@ -162,11 +170,10 @@ public:
      *
      */
     void addMany(size_t n_args, const uint32_t* vals) {
-        for (size_t lcv = 0; lcv < n_args; lcv++) {
-            roarings[0].add(vals[lcv]);
-            roarings[0].setCopyOnWrite(copyOnWrite);
-        }
+        roarings[0].addMany(n_args, vals);
+        roarings[0].setCopyOnWrite(copyOnWrite);
     }
+
     void addMany(size_t n_args, const uint64_t* vals) {
         for (size_t lcv = 0; lcv < n_args; lcv++) {
             roarings[highBytes(vals[lcv])].add(lowBytes(vals[lcv]));
@@ -960,22 +967,22 @@ public:
     }
 
     type_of_iterator& operator++() { // ++i, must returned inc. value
-        if (i.has_value == true) roaring_advance_uint32_iterator(&i);
+        if (i.has_value == true) roaring_uint32_iterator_advance(&i);
         while (!i.has_value) {
             map_iter++;
             if (map_iter == map_end) return *this;
-            roaring_init_iterator(&map_iter->second.roaring, &i);
+            roaring_iterator_init(&map_iter->second.roaring, &i);
         }
         return *this;
     }
 
     type_of_iterator operator++(int) { // i++, must return orig. value
         Roaring64MapSetBitForwardIterator orig(*this);
-        roaring_advance_uint32_iterator(&i);
+        roaring_uint32_iterator_advance(&i);
         while (!i.has_value) {
             map_iter++;
             if (map_iter == map_end) return orig;
-            roaring_init_iterator(&map_iter->second.roaring, &i);
+            roaring_iterator_init(&map_iter->second.roaring, &i);
         }
         return orig;
     }
@@ -998,11 +1005,11 @@ public:
             map_iter = parent.roarings.cend();
         } else {
             map_iter = parent.roarings.cbegin();
-            roaring_init_iterator(&map_iter->second.roaring, &i);
+            roaring_iterator_init(&map_iter->second.roaring, &i);
             while (!i.has_value) {
                 map_iter++;
                 if (map_iter == map_end) return;
-                roaring_init_iterator(&map_iter->second.roaring, &i);
+                roaring_iterator_init(&map_iter->second.roaring, &i);
             }
         }
     }

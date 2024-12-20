@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 #include <pthread.h>
 #include <rapidjson/document.h>
 
@@ -61,12 +63,13 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet.h"
+#include "util/countdown_latch.h"
 #include "util/lru_cache.h"
 #include "util/time.h"
 
 namespace starrocks {
 
-class TxnInfo;
+struct TxnInfo;
 
 struct TabletTxnInfo {
     PUniqueId load_id;
@@ -94,7 +97,12 @@ public:
                       const PUniqueId& load_id, const RowsetSharedPtr& rowset_ptr, bool is_recovery);
 
     Status publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                       int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0);
+                       int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0,
+                       bool is_double_write = false);
+
+    Status publish_overwrite_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                 TTransactionId transaction_id, int64_t version, const RowsetSharedPtr& rowset,
+                                 uint32_t wait_time);
 
     // persist_tablet_related_txns persists the tablets' meta and make it crash-safe.
     Status persist_tablet_related_txns(const std::vector<TabletSharedPtr>& tablets);
@@ -152,6 +160,7 @@ public:
 
 private:
     using TxnKey = std::pair<int64_t, int64_t>; // partition_id, transaction_id;
+    using BThreadCountDownLatch = GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable>;
 
     // implement TxnKey hash function to support TxnKey as a key for unordered_map
     struct TxnKeyHash {

@@ -35,29 +35,36 @@
 package com.starrocks.analysis;
 
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.SchemaTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.system.information.MaterializedViewsSystemTable;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.AstToStringBuilder;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.ShowMaterializedViewsStmt;
+import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
-import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.platform.commons.util.Preconditions;
 
 import java.util.List;
 
 public class ShowMaterializedViewTest {
-    private ConnectContext ctx;
 
-    @Before
-    public void setUp() {
+    private static final String TEST_DB_NAME = "db_show_materialized_view";
+    private static ConnectContext ctx;
+    private static StarRocksAssert starRocksAssert;
+
+    @BeforeClass
+    public static void setUp() throws Exception {
+        UtFrameUtils.createMinStarRocksCluster();
+        ctx = UtFrameUtils.createDefaultCtx();
+        starRocksAssert = new StarRocksAssert(ctx);
     }
 
     @Test
     public void testNormal() throws Exception {
-        ctx = UtFrameUtils.createDefaultCtx();
         ctx.setDatabase("testDb");
 
         ShowMaterializedViewsStmt stmt = new ShowMaterializedViewsStmt("");
@@ -79,6 +86,8 @@ public class ShowMaterializedViewTest {
 
         stmt = (ShowMaterializedViewsStmt) UtFrameUtils.parseStmtWithNewParser(
                 "SHOW MATERIALIZED VIEWS FROM abc where name = 'mv1';", ctx);
+        Preconditions.notNull(stmt.toSelectStmt().getOrigStmt(), "stmt's original stmt should not be null");
+
         Assert.assertEquals("abc", stmt.getDb());
         Assert.assertEquals(
                 "SELECT information_schema.materialized_views.MATERIALIZED_VIEW_ID AS id, " +
@@ -86,6 +95,7 @@ public class ShowMaterializedViewTest {
                         "information_schema.materialized_views.TABLE_NAME AS name, " +
                         "information_schema.materialized_views.refresh_type AS refresh_type, " +
                         "information_schema.materialized_views.is_active AS is_active, " +
+                        "information_schema.materialized_views.inactive_reason AS inactive_reason, " +
                         "information_schema.materialized_views.partition_type AS partition_type, " +
                         "information_schema.materialized_views.task_id AS task_id, " +
                         "information_schema.materialized_views.task_name AS task_name, " +
@@ -103,15 +113,19 @@ public class ShowMaterializedViewTest {
                         "information_schema.materialized_views.last_refresh_error_code AS last_refresh_error_code, " +
                         "information_schema.materialized_views.last_refresh_error_message AS last_refresh_error_message, " +
                         "information_schema.materialized_views.TABLE_ROWS AS rows, " +
-                        "information_schema.materialized_views.MATERIALIZED_VIEW_DEFINITION AS text " +
+                        "information_schema.materialized_views.MATERIALIZED_VIEW_DEFINITION AS text, " +
+                        "information_schema.materialized_views.extra_message AS extra_message, " +
+                        "information_schema.materialized_views.query_rewrite_status AS query_rewrite_status, " +
+                        "information_schema.materialized_views.creator AS creator " +
                         "FROM information_schema.materialized_views " +
-                        "WHERE information_schema.materialized_views.TABLE_NAME = 'mv1'",
+                        "WHERE (information_schema.materialized_views.TABLE_SCHEMA = 'abc') " +
+                        "AND (information_schema.materialized_views.TABLE_NAME = 'mv1')",
                 AstToStringBuilder.toString(stmt.toSelectStmt()));
         checkShowMaterializedViewsStmt(stmt);
     }
 
     private void checkShowMaterializedViewsStmt(ShowMaterializedViewsStmt stmt) {
-        Table schemaMVTable = SchemaTable.getSchemaTable("materialized_views");
+        Table schemaMVTable = MaterializedViewsSystemTable.create();
         Assert.assertEquals(schemaMVTable.getBaseSchema().size(), stmt.getMetaData().getColumnCount());
 
         List<Column> schemaCols = schemaMVTable.getFullSchema();

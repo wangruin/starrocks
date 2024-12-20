@@ -16,49 +16,81 @@ package com.starrocks.connector.iceberg.hive;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.google.common.collect.Maps;
 import com.starrocks.catalog.Database;
-import com.starrocks.catalog.IcebergTable;
+import com.starrocks.common.Config;
+import com.starrocks.common.MetaNotFoundException;
+import com.starrocks.common.util.Util;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.iceberg.IcebergCatalog;
 import com.starrocks.connector.iceberg.IcebergCatalogType;
+import com.starrocks.connector.iceberg.cost.IcebergMetricsReporter;
 import com.starrocks.connector.iceberg.io.IcebergCachingFileIO;
+import com.starrocks.connector.share.iceberg.IcebergAwsClientFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.metastore.IMetaStoreClient;
-import org.apache.iceberg.BaseMetastoreCatalog;
-import org.apache.iceberg.BaseTable;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
-import org.apache.iceberg.ClientPool;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.hadoop.Configurable;
-import org.apache.iceberg.hadoop.HadoopFileIO;
-import org.apache.iceberg.io.FileIO;
-import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
+import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.thrift.TException;
 
+import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import static com.starrocks.connector.hive.HiveMetastoreApiConverter.CONNECTOR_ID_GENERATOR;
+import static com.starrocks.connector.ConnectorTableId.CONNECTOR_ID_GENERATOR;
+import static com.starrocks.connector.iceberg.IcebergCatalogProperties.HIVE_METASTORE_TIMEOUT;
+import static com.starrocks.connector.iceberg.IcebergCatalogProperties.HIVE_METASTORE_URIS;
+import static com.starrocks.connector.iceberg.IcebergCatalogProperties.ICEBERG_METASTORE_URIS;
+import static com.starrocks.connector.iceberg.IcebergMetadata.LOCATION_PROPERTY;
+import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTOREWAREHOUSE;
 
-public class IcebergHiveCatalog extends BaseMetastoreCatalog implements IcebergCatalog, Configurable<Configuration> {
+public class IcebergHiveCatalog implements IcebergCatalog {
     private static final Logger LOG = LogManager.getLogger(IcebergHiveCatalog.class);
 
-    private String name;
-    private Configuration conf;
-    private FileIO fileIO;
-    private ClientPool<IMetaStoreClient, TException> clients;
+    private final Configuration conf;
+    private final HiveCatalog delegate;
 
     @VisibleForTesting
-    public IcebergHiveCatalog() {
+    public IcebergHiveCatalog(String name, Configuration conf, Map<String, String> properties) {
+        this.conf = conf;
+        String hmsTimeout = properties.getOrDefault(HIVE_METASTORE_TIMEOUT, String.valueOf(Config.hive_meta_store_timeout_s));
+        this.conf.set(MetastoreConf.ConfVars.CLIENT_SOCKET_TIMEOUT.getHiveName(), hmsTimeout);
+        if (conf.get(METASTOREWAREHOUSE.varname) == null) {
+            this.conf.set(METASTOREWAREHOUSE.varname, METASTOREWAREHOUSE.getDefaultValue());
+        }
+
+        Map<String, String> copiedProperties = Maps.newHashMap(properties);
+
+        String metastoreURI = properties.get(HIVE_METASTORE_URIS);
+        if (metastoreURI == null) {
+            metastoreURI = properties.get(ICEBERG_METASTORE_URIS);
+        }
+        Util.validateMetastoreUris(metastoreURI);
+
+        copiedProperties.put(CatalogProperties.URI, metastoreURI);
+        copiedProperties.put(CatalogProperties.FILE_IO_IMPL, IcebergCachingFileIO.class.getName());
+        copiedProperties.put(AwsProperties.CLIENT_FACTORY, IcebergAwsClientFactory.class.getName());
+        copiedProperties.put(CatalogProperties.METRICS_REPORTER_IMPL, IcebergMetricsReporter.class.getName());
+        // The property is false by default, in such case, when we execute SHOW TABLES FROM CATALOG.DB,
+        // it will request all Table Objects from Hive Metastore, when there are lots of tables under the
+        // database, timeout may happen.
+        copiedProperties.putIfAbsent(HiveCatalog.LIST_ALL_TABLES, "true");
+
+        delegate = (HiveCatalog) CatalogUtil.loadCatalog(HiveCatalog.class.getName(), name, copiedProperties, conf);
     }
 
     @Override
@@ -67,129 +99,127 @@ public class IcebergHiveCatalog extends BaseMetastoreCatalog implements IcebergC
     }
 
     @Override
-    public Table loadTable(IcebergTable table) throws StarRocksConnectorException {
-        TableIdentifier tableId = TableIdentifier.of(table.getRemoteDbName(), table.getRemoteTableName());
-        return loadTable(tableId, null, null);
+    public Table getTable(String dbName, String tableName) throws StarRocksConnectorException {
+        return delegate.loadTable(TableIdentifier.of(dbName, tableName));
     }
 
     @Override
-    public Table loadTable(TableIdentifier tableIdentifier) throws StarRocksConnectorException {
-        return loadTable(tableIdentifier, null, null);
-    }
-
-    @Override
-    public Table loadTable(TableIdentifier tableId, String tableLocation,
-                           Map<String, String> properties) throws StarRocksConnectorException {
-        Preconditions.checkState(tableId != null);
-        try {
-            TableOperations ops = this.newTableOps(tableId);
-            return new BaseTable(ops, fullTableName(this.name(), tableId));
-        } catch (Exception e) {
-            throw new StarRocksConnectorException(String.format(
-                    "Failed to load Iceberg table with id: %s", tableId), e);
-        }
-    }
-
-    @Override
-    public void initialize(String inputName, Map<String, String> properties) {
-        this.name = inputName;
-        if (conf == null) {
-            LOG.warn("No Hadoop Configuration was set, using the default environment Configuration");
-            this.conf = new Configuration();
-        }
-
-        if (properties.containsKey(CatalogProperties.URI)) {
-            this.conf.set(HiveConf.ConfVars.METASTOREURIS.varname, properties.get(CatalogProperties.URI));
-        }
-
-        if (properties.containsKey(CatalogProperties.WAREHOUSE_LOCATION)) {
-            this.conf.set(HiveConf.ConfVars.METASTOREWAREHOUSE.varname,
-                    properties.get(CatalogProperties.WAREHOUSE_LOCATION));
-        }
-
-        String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
-        this.fileIO =
-                fileIOImpl == null ? new HadoopFileIO(conf) : CatalogUtil.loadFileIO(fileIOImpl, properties, conf);
-
-        // warp cache fileIO
-        IcebergCachingFileIO cachingFileIO = new IcebergCachingFileIO(fileIO);
-        cachingFileIO.initialize(properties);
-        this.fileIO = cachingFileIO;
-
-        this.clients = new CachedClientPool(conf, properties);
-    }
-
-    @Override
-    public String name() {
-        return name;
-    }
-
-    @Override
-    protected boolean isValidIdentifier(TableIdentifier tableIdentifier) {
-        return tableIdentifier.namespace().levels().length == 1;
-    }
-
-    @Override
-    public TableOperations newTableOps(TableIdentifier tableIdentifier) {
-        String dbName = tableIdentifier.namespace().level(0);
-        String tableName = tableIdentifier.name();
-        return new HiveTableOperations(conf, clients, fileIO, name, dbName, tableName);
-    }
-
-    @Override
-    protected String defaultWarehouseLocation(TableIdentifier tableIdentifier) {
-        throw new UnsupportedOperationException("Not implemented");
+    public boolean tableExists(String dbName, String tableName) throws StarRocksConnectorException {
+        return delegate.tableExists(TableIdentifier.of(dbName, tableName));
     }
 
     @Override
     public List<String> listAllDatabases() {
+        return delegate.listNamespaces().stream()
+                .map(ns -> ns.level(0))
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    public void createDB(String dbName, Map<String, String> properties) {
+        properties = properties == null ? new HashMap<>() : properties;
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+            if (key.equalsIgnoreCase(LOCATION_PROPERTY)) {
+                try {
+                    URI uri = new Path(value).toUri();
+                    FileSystem fileSystem = FileSystem.get(uri, conf);
+                    fileSystem.exists(new Path(value));
+                } catch (Exception e) {
+                    LOG.error("Invalid location URI: {}", value, e);
+                    throw new StarRocksConnectorException("Invalid location URI: %s. msg: %s", value, e.getMessage());
+                }
+            } else {
+                throw new IllegalArgumentException("Unrecognized property: " + key);
+            }
+        }
+
+        Namespace ns = Namespace.of(dbName);
+        delegate.createNamespace(ns, properties);
+    }
+
+    @Override
+    public void dropDB(String dbName) throws MetaNotFoundException {
+        Database database;
         try {
-            return new ArrayList<>(clients.run(IMetaStoreClient::getAllDatabases));
-        } catch (TException | InterruptedException e) {
-            throw new RuntimeException(e);
+            database = getDB(dbName);
+        } catch (Exception e) {
+            LOG.error("Failed to access database {}", dbName, e);
+            throw new MetaNotFoundException("Failed to access database " + dbName);
         }
+
+        if (database == null) {
+            throw new MetaNotFoundException("Not found database " + dbName);
+        }
+
+        String dbLocation = database.getLocation();
+        if (Strings.isNullOrEmpty(dbLocation)) {
+            throw new MetaNotFoundException("Database location is empty");
+        }
+
+        delegate.dropNamespace(Namespace.of(dbName));
     }
 
     @Override
-    public Database getDB(String dbName) throws InterruptedException, TException {
-        org.apache.hadoop.hive.metastore.api.Database db = clients.run(client -> client.getDatabase(dbName));
-        if (db == null || db.getName() == null) {
-            throw new TException("Hive db " + dbName + " doesn't exist");
-        }
-        return new Database(CONNECTOR_ID_GENERATOR.getNextId().asInt(), dbName);
+    public Database getDB(String dbName) {
+        Map<String, String> dbMeta = delegate.loadNamespaceMetadata(Namespace.of(dbName));
+        Preconditions.checkNotNull(dbMeta.get(LOCATION_PROPERTY), "Database " + dbName + " doesn't exist location");
+        return new Database(CONNECTOR_ID_GENERATOR.getNextId().asInt(), dbName, dbMeta.get(LOCATION_PROPERTY));
     }
 
     @Override
-    public List<TableIdentifier> listTables(Namespace namespace) {
-        String database = namespace.level(0);
+    public List<String> listTables(String dbName) {
+        List<TableIdentifier> tableIdentifiers = delegate.listTables(Namespace.of(dbName));
+        return tableIdentifiers.stream().map(TableIdentifier::name).collect(Collectors.toCollection(ArrayList::new));
+    }
+
+    @Override
+    public boolean createTable(
+            String dbName,
+            String tableName,
+            Schema schema,
+            PartitionSpec partitionSpec,
+            String location,
+            Map<String, String> properties) {
+        Table nativeTable =  delegate.buildTable(TableIdentifier.of(dbName, tableName), schema)
+                .withLocation(location)
+                .withPartitionSpec(partitionSpec)
+                .withProperties(properties)
+                .create();
+
+        return nativeTable != null;
+    }
+
+    @Override
+    public boolean dropTable(String dbName, String tableName, boolean purge) {
+        return delegate.dropTable(TableIdentifier.of(dbName, tableName), purge);
+    }
+
+    @Override
+    public void renameTable(String dbName, String tblName, String newTblName) throws StarRocksConnectorException {
+        delegate.renameTable(TableIdentifier.of(dbName, tblName), TableIdentifier.of(dbName, newTblName));
+    }
+
+    @Override
+    public void deleteUncommittedDataFiles(List<String> fileLocations) {
+        if (fileLocations.isEmpty()) {
+            return;
+        }
+
+        URI uri = new Path(fileLocations.get(0)).toUri();
         try {
-            List<String> tableNames = clients.run(client -> client.getAllTables(database));
-            return tableNames.stream().map(tblName -> TableIdentifier.of(namespace, tblName)).collect(Collectors.toList());
-        } catch (TException | InterruptedException e) {
-            throw new RuntimeException(e);
+            FileSystem fileSystem = FileSystem.get(uri, conf);
+            for (String location : fileLocations) {
+                Path path = new Path(location);
+                fileSystem.delete(path, false);
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to delete uncommitted files", e);
         }
     }
 
-    @Override
-    public boolean dropTable(TableIdentifier tableIdentifier, boolean b) {
-        throw new UnsupportedOperationException("Not implemented");
-    }
-
-    @Override
-    public void renameTable(TableIdentifier tableIdentifier, TableIdentifier tableIdentifier1) {
-        throw new UnsupportedOperationException("Not implemented");
-    }
-
-    @Override
-    public void setConf(Configuration conf) {
-        this.conf = conf;
-    }
-
-    @Override
     public String toString() {
-        return MoreObjects.toStringHelper(this)
-                .add("name", name)
-                .add("uri", this.conf == null ? "" : this.conf.get(HiveConf.ConfVars.METASTOREURIS.varname))
-                .toString();
+        return delegate.toString();
     }
 }

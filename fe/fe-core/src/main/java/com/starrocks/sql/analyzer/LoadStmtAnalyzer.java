@@ -25,8 +25,9 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.load.EtlJobType;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
@@ -47,7 +48,7 @@ public class LoadStmtAnalyzer {
         new LoadStmtAnalyzerVisitor().analyze(statement, context);
     }
 
-    static class LoadStmtAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class LoadStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
 
         private static final String VERSION = "version";
 
@@ -111,18 +112,6 @@ public class LoadStmtAnalyzer {
                 if (resourceDesc != null) {
                     resourceDesc.analyze();
                     etlJobType = resourceDesc.getEtlJobType();
-                    // check resource usage privilege, for new RBAC privilege framework, resource privilege is checked
-                    // in PrivilegeCheckerV2.
-                    if (!GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-                        if (!GlobalStateMgr.getCurrentState().getAuth().checkResourcePriv(ConnectContext.get(),
-                                resourceDesc.getName(),
-                                PrivPredicate.USAGE)) {
-                            ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
-                                    "USAGE denied to user '" + ConnectContext.get().getQualifiedUser()
-                                            + "'@'" + ConnectContext.get().getRemoteIP()
-                                            + "' for resource '" + resourceDesc.getName() + "'");
-                        }
-                    }
                 } else if (brokerDesc != null) {
                     etlJobType = EtlJobType.BROKER;
                 } else {
@@ -135,17 +124,19 @@ public class LoadStmtAnalyzer {
                 if (etlJobType == EtlJobType.SPARK && database != null) {
                     for (DataDescription dataDescription : dataDescriptions) {
                         String tableName = dataDescription.getTableName();
-                        Database db = GlobalStateMgr.getCurrentState().getDb(database);
+                        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(database);
                         if (db == null) {
                             continue;
                         }
-                        db.readLock();
+                        Locker locker = new Locker();
+                        locker.lockDatabase(db.getId(), LockType.READ);
                         try {
-                            Table table = db.getTable(tableName);
+                            Table table = GlobalStateMgr.getCurrentState().getLocalMetastore()
+                                        .getTable(db.getFullName(), tableName);
                             if (table == null) {
                                 continue;
                             }
-                            if (table.isOlapOrLakeTable()) {
+                            if (table.isOlapOrCloudNativeTable()) {
                                 OlapTable olapTable = (OlapTable) table;
                                 if (olapTable.getPartitionInfo().getType() == PartitionType.EXPR_RANGE) {
                                     ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
@@ -153,7 +144,7 @@ public class LoadStmtAnalyzer {
                                 }
                             }
                         } finally {
-                            db.readUnlock();
+                            locker.unLockDatabase(db.getId(), LockType.READ);
                         }
                     }
                 }

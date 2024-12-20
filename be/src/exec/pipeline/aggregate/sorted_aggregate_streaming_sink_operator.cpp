@@ -14,6 +14,7 @@
 
 #include "exec/pipeline/aggregate/sorted_aggregate_streaming_sink_operator.h"
 
+#include "column/vectorized_fwd.h"
 #include "exec/sorted_streaming_aggregator.h"
 #include "runtime/current_thread.h"
 
@@ -21,7 +22,7 @@ namespace starrocks::pipeline {
 SortedAggregateStreamingSinkOperator::SortedAggregateStreamingSinkOperator(
         OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence,
         std::shared_ptr<SortedStreamingAggregator> aggregator)
-        : Operator(factory, id, "sorted_aggregate_streaming_sink", plan_node_id, driver_sequence),
+        : Operator(factory, id, "sorted_aggregate_streaming_sink", plan_node_id, false, driver_sequence),
           _aggregator(std::move(aggregator)) {
     _aggregator->ref();
 }
@@ -39,7 +40,7 @@ void SortedAggregateStreamingSinkOperator::close(RuntimeState* state) {
 }
 
 bool SortedAggregateStreamingSinkOperator::need_input() const {
-    return !is_finished() && _aggregator->chunk_buffer_size() < Aggregator::MAX_CHUNK_BUFFER_SIZE;
+    return !is_finished() && !_aggregator->is_chunk_buffer_full();
 }
 
 bool SortedAggregateStreamingSinkOperator::is_finished() const {
@@ -54,7 +55,7 @@ Status SortedAggregateStreamingSinkOperator::set_finishing(RuntimeState* state) 
         _accumulator.push(std::move(res));
     }
     _accumulator.finalize();
-    if (_accumulator.has_output()) {
+    while (_accumulator.has_output()) {
         auto accumulated = std::move(_accumulator.pull());
         _aggregator->offer_chunk_to_buffer(accumulated);
     }
@@ -75,9 +76,14 @@ Status SortedAggregateStreamingSinkOperator::push_chunk(RuntimeState* state, con
 
     RETURN_IF_ERROR(_aggregator->evaluate_groupby_exprs(chunk.get()));
     RETURN_IF_ERROR(_aggregator->evaluate_agg_fn_exprs(chunk.get()));
-    ASSIGN_OR_RETURN(auto res, _aggregator->streaming_compute_agg_state(chunk_size));
+    ChunkPtr res;
+    if (!_aggregator->only_group_by_exprs()) {
+        ASSIGN_OR_RETURN(res, _aggregator->streaming_compute_agg_state(chunk_size));
+    } else {
+        ASSIGN_OR_RETURN(res, _aggregator->streaming_compute_distinct(chunk_size));
+    }
     DCHECK(_accumulator.need_input());
-    if (!res->is_empty()) {
+    if (res && !res->is_empty()) {
         _accumulator.push(std::move(res));
     }
     if (_accumulator.has_output()) {

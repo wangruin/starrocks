@@ -12,34 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.physical;
 
-import com.starrocks.catalog.Column;
-import com.starrocks.catalog.Table;
+import com.starrocks.connector.iceberg.IcebergMORParams;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
-import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.ScanOperatorPredicates;
-import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
-import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalIcebergScanOperator;
 
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 public class PhysicalIcebergScanOperator extends PhysicalScanOperator {
     private ScanOperatorPredicates predicates;
+    private List<IcebergMORParams> tableFullMORParams = new ArrayList<>();
+    private IcebergMORParams morParams = IcebergMORParams.EMPTY;
 
-    public PhysicalIcebergScanOperator(Table table,
-                                       Map<ColumnRefOperator, Column> columnRefMap,
-                                       ScanOperatorPredicates predicates,
-                                       long limit,
-                                       ScalarOperator predicate,
-                                       Projection projection) {
-        super(OperatorType.PHYSICAL_ICEBERG_SCAN, table, columnRefMap, limit, predicate, projection);
-        this.predicates = predicates;
+    public PhysicalIcebergScanOperator(LogicalIcebergScanOperator scanOperator) {
+        super(OperatorType.PHYSICAL_ICEBERG_SCAN, scanOperator);
+        this.predicates = scanOperator.getScanOperatorPredicates();
     }
 
     @Override
@@ -50,6 +44,22 @@ public class PhysicalIcebergScanOperator extends PhysicalScanOperator {
     @Override
     public void setScanOperatorPredicates(ScanOperatorPredicates predicates) {
         this.predicates = predicates;
+    }
+
+    public List<IcebergMORParams> getTableFullMORParams() {
+        return tableFullMORParams;
+    }
+
+    public void setTableFullMORParams(List<IcebergMORParams> tableFullMORParams) {
+        this.tableFullMORParams = tableFullMORParams;
+    }
+
+    public IcebergMORParams getMORParams() {
+        return morParams;
+    }
+
+    public void setMORParams(IcebergMORParams morParams) {
+        this.morParams = morParams;
     }
 
     @Override

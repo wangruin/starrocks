@@ -17,10 +17,14 @@ package com.starrocks.sql.optimizer.rewrite.scalar;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.starrocks.catalog.ArrayType;
+import com.starrocks.analysis.ArithmeticExpr;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.MapType;
 import com.starrocks.catalog.Type;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariableConstants;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.common.TypeManager;
@@ -34,6 +38,7 @@ import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LikePredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.MapOperator;
 import com.starrocks.sql.optimizer.operator.scalar.MultiInPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriteContext;
@@ -73,7 +78,8 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
             // functions with various data types do not need to implicit cast, such as following functions.
             if (fn.functionName().equals(FunctionSet.ARRAY_MAP) ||
                     fn.functionName().equals(FunctionSet.EXCHANGE_BYTES) ||
-                    fn.functionName().equals(FunctionSet.EXCHANGE_SPEED)) {
+                    fn.functionName().equals(FunctionSet.EXCHANGE_SPEED) ||
+                    fn.functionName().equals(FunctionSet.ARRAY_SORTBY)) {
                 return call;
             }
             if (!call.isAggregate() || FunctionSet.AVG.equalsIgnoreCase(fn.functionName())) {
@@ -81,14 +87,16 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
                         String.format("Resolved function %s has wildcard decimal as argument type", fn.functionName()));
             }
 
+            boolean needAdjustScale = ArithmeticExpr.DECIMAL_SCALE_ADJUST_OPERATOR_SET
+                    .contains(fn.getFunctionName().getFunction());
             for (int i = 0; i < fn.getNumArgs(); i++) {
                 Type type = fn.getArgs()[i];
                 ScalarOperator child = call.getChild(i);
 
-                //Cast from array(null), direct assignment type to avoid passing null_literal into be
-                if (type.isArrayType() && child.getType().isArrayType()
-                        && ((ArrayType) child.getType()).getItemType().isNull()) {
-                    child.setType(type);
+                // For compatibility, decimal ArithmeticExpr(+-*/%) use Type::equals instead of Type::matchesType to
+                // determine whether to cast child of the ArithmeticExpr
+                if (needAdjustScale && type.isDecimalOfAnyVersion() && !type.equals(child.getType())) {
+                    addCastChild(type, call, i);
                     continue;
                 }
 
@@ -115,7 +123,19 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
     @Override
     public ScalarOperator visitBetweenPredicate(BetweenPredicateOperator predicate,
                                                 ScalarOperatorRewriteContext context) {
-        return castForBetweenAndIn(predicate);
+        return castForBetweenAndIn(predicate, true);
+    }
+
+    @Override
+    public ScalarOperator visitMap(MapOperator map, ScalarOperatorRewriteContext context) {
+        MapType mapType = (MapType) map.getType();
+        Type[] kvType = {mapType.getKeyType(), mapType.getValueType()};
+        for (int i = 0; i < map.getChildren().size(); i++) {
+            if (!map.getChildren().get(i).getType().matchesType(kvType[i % 2])) {
+                addCastChild(kvType[i % 2], map, i);
+            }
+        }
+        return map;
     }
 
     @Override
@@ -127,7 +147,7 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
         Type type2 = rightChild.getType();
 
         // For a query like: select 'a' <=> NULL, we should cast Constant Null to the type of the other side
-        if (predicate.getBinaryType() == BinaryPredicateOperator.BinaryType.EQ_FOR_NULL &&
+        if (predicate.getBinaryType() == BinaryType.EQ_FOR_NULL &&
                 (leftChild.isConstantNull() || rightChild.isConstantNull())) {
             if (leftChild.isConstantNull()) {
                 predicate.setChild(0, ConstantOperator.createNull(type2));
@@ -143,30 +163,18 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
         }
 
         // we will try cast const operator to variable operator
-        if (rightChild.isVariable() && leftChild.isConstantRef()) {
-            Optional<ScalarOperator> op = Utils.tryCastConstant(leftChild, type2);
-            if (op.isPresent()) {
-                predicate.getChildren().set(0, op.get());
-                return predicate;
-            } else if (rightChild.getType().isDateType() && Type.canCastTo(leftChild.getType(), rightChild.getType())) {
-                // For like MySQL, convert to date type as much as possible
-                addCastChild(rightChild.getType(), predicate, 0);
-                return predicate;
-            }
-        } else if (leftChild.isVariable() && rightChild.isConstantRef()) {
-            Optional<ScalarOperator> op = Utils.tryCastConstant(rightChild, type1);
-            if (op.isPresent()) {
-                predicate.getChildren().set(1, op.get());
-                return predicate;
-            } else if (leftChild.getType().isDateType() && Type.canCastTo(rightChild.getType(), leftChild.getType())) {
-                // For like MySQL, convert to date type as much as possible
-                addCastChild(leftChild.getType(), predicate, 1);
-                return predicate;
+        if ((rightChild.isVariable() && leftChild.isConstantRef()) ||
+                (leftChild.isVariable() && rightChild.isConstantRef())) {
+            int constant = leftChild.isVariable() ? 1 : 0;
+            int variable = 1 - constant;
+            Optional<BinaryPredicateOperator> optional = optimizeConstantAndVariable(predicate, constant, variable);
+            if (optional.isPresent()) {
+                return optional.get();
             }
         }
 
-        Type compatibleType = TypeManager.getCompatibleTypeForBinary(
-                predicate.getBinaryType().isNotRangeComparison(), type1, type2);
+        Type compatibleType =
+                TypeManager.getCompatibleTypeForBinary(predicate.getBinaryType().isRange(), type1, type2);
 
         if (!type1.matchesType(compatibleType)) {
             addCastChild(compatibleType, predicate, 0);
@@ -175,6 +183,50 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
             addCastChild(compatibleType, predicate, 1);
         }
         return predicate;
+    }
+
+    private Optional<BinaryPredicateOperator> optimizeConstantAndVariable(BinaryPredicateOperator predicate,
+                                                                          int constantIndex, int variableIndex) {
+        ScalarOperator constant = predicate.getChild(constantIndex);
+        ScalarOperator variable = predicate.getChild(variableIndex);
+        Type typeConstant = constant.getType();
+        Type typeVariable = variable.getType();
+
+        boolean checkStringCastToNumber = false;
+        if (typeVariable.isNumericType() && typeConstant.isStringType()) {
+            if (predicate.getBinaryType().isNotRangeComparison()) {
+                String baseType = ConnectContext.get() != null ?
+                        ConnectContext.get().getSessionVariable().getCboEqBaseType() : SessionVariableConstants.VARCHAR;
+                checkStringCastToNumber = SessionVariableConstants.DECIMAL.equals(baseType) ||
+                        SessionVariableConstants.DOUBLE.equals(baseType);
+            } else {
+                // range compare, base type must be double
+                checkStringCastToNumber = true;
+            }
+        }
+
+        // strict check, only support white check
+        if ((typeVariable.isNumericType() && typeConstant.isNumericType()) ||
+                (typeVariable.isNumericType() && typeConstant.isBoolean()) ||
+                (typeVariable.isDateType() && typeConstant.isNumericType()) ||
+                (typeVariable.isDateType() && typeConstant.isStringType()) ||
+                (typeVariable.isFixedPointType() && typeConstant.isStringType() &&
+                        predicate.getBinaryType() == BinaryType.EQ) ||
+                (typeVariable.isBoolean() && typeConstant.isStringType()) ||
+                checkStringCastToNumber) {
+
+            Optional<ScalarOperator> op = Utils.tryCastConstant(constant, variable.getType());
+            if (op.isPresent()) {
+                predicate.getChildren().set(constantIndex, op.get());
+                return Optional.of(predicate);
+            } else if (variable.getType().isDateType() && Type.canCastTo(constant.getType(), variable.getType())) {
+                // For like MySQL, convert to date type as much as possible
+                addCastChild(variable.getType(), predicate, constantIndex);
+                return Optional.of(predicate);
+            }
+        }
+
+        return Optional.empty();
     }
 
     @Override
@@ -193,7 +245,7 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
 
     @Override
     public ScalarOperator visitInPredicate(InPredicateOperator predicate, ScalarOperatorRewriteContext context) {
-        return castForBetweenAndIn(predicate);
+        return castForBetweenAndIn(predicate, false);
     }
 
     @Override
@@ -255,7 +307,7 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
         return operator;
     }
 
-    private ScalarOperator castForBetweenAndIn(ScalarOperator predicate) {
+    private ScalarOperator castForBetweenAndIn(ScalarOperator predicate, boolean isBetween) {
         Type firstType = predicate.getChildren().get(0).getType();
         if (predicate.getChildren().stream().skip(1).allMatch(o -> firstType.matchesType(o.getType()))) {
             return predicate;
@@ -278,7 +330,7 @@ public class ImplicitCastRule extends TopDownScalarOperatorRewriteRule {
             }
         }
 
-        Type compatibleType = TypeManager.getCompatibleTypeForBetweenAndIn(types);
+        Type compatibleType = TypeManager.getCompatibleTypeForBetweenAndIn(types, isBetween);
         for (int i = 0; i < predicate.getChildren().size(); i++) {
             Type childType = predicate.getChild(i).getType();
 

@@ -15,6 +15,7 @@
 
 package com.starrocks.analysis;
 
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
@@ -89,8 +90,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -360,8 +360,7 @@ public class CreateTableWithPartitionTest {
                 "\"dynamic_partition.prefix\" = \"p\",\n" +
                 "\"dynamic_partition.buckets\" = \"4\",\n" +
                 "\"dynamic_partition.start_day_of_week\" = \"4\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -529,8 +528,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -601,8 +599,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -627,8 +624,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -664,8 +660,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -698,8 +693,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -728,8 +722,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -753,8 +746,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -783,8 +775,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -808,8 +799,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -832,8 +822,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -857,8 +846,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
     }
@@ -881,8 +869,7 @@ public class CreateTableWithPartitionTest {
                 "DISTRIBUTED BY HASH(`k2`) BUCKETS 10\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");";
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(createTableSql, ctx);
         PartitionDesc partitionDesc = createTableStmt.getPartitionDesc();
@@ -891,6 +878,223 @@ public class CreateTableWithPartitionTest {
         Assert.assertTrue(partitionDesc.toString().contains("PARTITION p3 VALUES [('3'), ('4'))"));
         Assert.assertFalse(partitionDesc.toString().contains("PARTITION p4 VALUES [('4'), ('5'))"));
 
+    }
+
+    @Test
+    public void testAnalyzeRetentionConditionWithListPartition1() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE t1 (\n" +
+                    " id BIGINT,\n" +
+                    " age SMALLINT,\n" +
+                    " dt datetime not null,\n" +
+                    " province VARCHAR(64) not null\n" +
+                    ")\n" +
+                    "PARTITION BY (province, dt) \n" +
+                    "DISTRIBUTED BY RANDOM\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'dt > current_date() - interval 1 month'\n" +
+                    ")");
+            starRocksAssert.dropTable("t1");
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    @Test
+    public void testAnalyzeRetentionConditionWithListPartition2() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE t1 (\n" +
+                    " id BIGINT,\n" +
+                    " age SMALLINT,\n" +
+                    " dt datetime not null,\n" +
+                    " province VARCHAR(64) not null\n" +
+                    ")\n" +
+                    "PARTITION BY (province, dt) \n" +
+                    "DISTRIBUTED BY RANDOM\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'dt2 > current_date() - interval 1 month'\n" +
+                    ")");
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Column 'dt2' cannot be resolved"));
+        }
+    }
+
+    @Test
+    public void testAnalyzeRetentionConditionWithListPartition3() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE t1 (\n" +
+                    " id BIGINT,\n" +
+                    " age SMALLINT,\n" +
+                    " dt datetime not null,\n" +
+                    " province VARCHAR(64) not null\n" +
+                    ")\n" +
+                    "PARTITION BY (province, dt) \n" +
+                    "DISTRIBUTED BY RANDOM\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'cast(id as date) > current_date() - interval 1 month'\n" +
+                    ")");
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Column is not a partition column which can not be " +
+                    "used in where clause for drop partition"));
+        }
+    }
+
+    @Test
+    public void testAnalyzeRetentionConditionWithListPartition4() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE t1 (\n" +
+                    " id BIGINT,\n" +
+                    " age SMALLINT,\n" +
+                    " dt datetime not null,\n" +
+                    " province VARCHAR(64) not null\n" +
+                    ")\n" +
+                    "DISTRIBUTED BY RANDOM\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'cast(id as date) > current_date() - interval 1 month'\n" +
+                    ")");
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Can't drop partitions with where expression " +
+                    "since it is not partitioned"));
+        }
+    }
+
+    @Test
+    public void testAnalyzeRetentionConditionWithRangePartition1() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE r1 \n" +
+                    "(\n" +
+                    "    dt date,\n" +
+                    "    k2 int,\n" +
+                    "    v1 int \n" +
+                    ")\n" +
+                    "PARTITION BY RANGE(dt)\n" +
+                    "(\n" +
+                    "    PARTITION p0 values [('2024-01-29'),('2024-01-30')),\n" +
+                    "    PARTITION p1 values [('2024-01-30'),('2024-01-31')),\n" +
+                    "    PARTITION p2 values [('2024-01-31'),('2024-02-01')),\n" +
+                    "    PARTITION p3 values [('2024-02-01'),('2024-02-02')) \n" +
+                    ")\n" +
+                    "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'dt > current_date() - interval 1 month'\n" +
+                    ")");
+            starRocksAssert.dropTable("r1");
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    @Test
+    public void testListTableWithRetentionCondition() {
+        try {
+            starRocksAssert.withTable("CREATE TABLE t1 (\n" +
+                    " id BIGINT,\n" +
+                    " age SMALLINT,\n" +
+                    " dt datetime not null,\n" +
+                    " province VARCHAR(64) not null\n" +
+                    ")\n" +
+                    "PARTITION BY (province, dt) \n" +
+                    "DISTRIBUTED BY RANDOM\n" +
+                    "PROPERTIES (\n" +
+                    "'replication_num' = '1',\n" +
+                    "'partition_retention_condition' = 'dt > current_date() - interval 1 month'\n" +
+                    ")");
+            OlapTable t1 = (OlapTable) starRocksAssert.getTable("db1", "t1");
+            String retentionCondition = t1.getTableProperty().getPartitionRetentionCondition();
+            Assert.assertEquals("dt > current_date() - interval 1 month", retentionCondition);
+
+            {
+                String alterTableSql = "ALTER TABLE t1 SET ('partition_retention_condition' = " +
+                        "'last_day(dt) > current_date() - interval 2 month')";
+                starRocksAssert.alterTableProperties(alterTableSql);
+            }
+            {
+                String alterTableSql = "ALTER TABLE t1 SET ('partition_retention_condition' = " +
+                        "'dt > current_date() - interval 1 month or last_day(dt) > current_date() - interval 2 month')";
+                starRocksAssert.alterTableProperties(alterTableSql);
+            }
+
+            {
+                String alterTableSql = "ALTER TABLE t1 SET ('partition_retention_condition' = " +
+                        "'date_format(dt, \\'%m月%Y年\\') > current_date() - interval 2 month')";
+                starRocksAssert.alterTableProperties(alterTableSql);
+            }
+
+            retentionCondition = t1.getTableProperty().getPartitionRetentionCondition();
+            Assert.assertEquals("date_format(dt, '%m月%Y年') > current_date() - interval 2 month", retentionCondition);
+            starRocksAssert.dropTable("t1");
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    @Test
+    public void testRangeTableWithRetentionCondition() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE r1 \n" +
+                "(\n" +
+                "    dt date,\n" +
+                "    k2 int,\n" +
+                "    v1 int \n" +
+                ")\n" +
+                "PARTITION BY RANGE(dt)\n" +
+                "(\n" +
+                "    PARTITION p0 values [('2024-01-29'),('2024-01-30')),\n" +
+                "    PARTITION p1 values [('2024-01-30'),('2024-01-31')),\n" +
+                "    PARTITION p2 values [('2024-01-31'),('2024-02-01')),\n" +
+                "    PARTITION p3 values [('2024-02-01'),('2024-02-02')) \n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
+                "PROPERTIES (\n" +
+                "'replication_num' = '1',\n" +
+                "'partition_retention_condition' = 'dt > current_date() - interval 1 month'\n" +
+                ")");
+        OlapTable r1 = (OlapTable) starRocksAssert.getTable("db1", "r1");
+        String retentionCondition = r1.getTableProperty().getPartitionRetentionCondition();
+        Assert.assertEquals("dt > current_date() - interval 1 month", retentionCondition);
+
+        try {
+            String alterTableSql = "ALTER TABLE r1 SET ('partition_retention_condition' = " +
+                    "'last_day(dt) > current_date() - interval 2 month')";
+            starRocksAssert.alterTableProperties(alterTableSql);
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Retention condition must only contain monotonic functions " +
+                    "for range partition tables but contains: last_day"));
+        }
+
+        try {
+            String alterTableSql = "ALTER TABLE r1 SET ('partition_retention_condition' = " +
+                    "'dt > current_date() - interval 1 month or last_day(dt) > current_date() - interval 2 month')";
+            starRocksAssert.alterTableProperties(alterTableSql);
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Retention condition must only contain monotonic functions " +
+                    "for range partition tables but contains: last_day"));
+        }
+
+        try {
+            String alterTableSql = "ALTER TABLE r1 SET ('partition_retention_condition' = " +
+                    "'date_format(dt, \\'%m月%Y年\\') > current_date() - interval 2 month')";
+            starRocksAssert.alterTableProperties(alterTableSql);
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Retention condition must only contain monotonic functions " +
+                    "for range partition tables but contains: date_format"));
+        }
+
+        try {
+            String alterTableSql = "ALTER TABLE r1 SET ('partition_retention_condition' = " +
+                    "'date_format(dt, \\'%a-%Y\\') > current_date() - interval 2 month')";
+            starRocksAssert.alterTableProperties(alterTableSql);
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Retention condition must only contain monotonic functions " +
+                    "for range partition tables but contains: date_format"));
+        }
+        retentionCondition = r1.getTableProperty().getPartitionRetentionCondition();
+        Assert.assertEquals("dt > current_date() - interval 1 month", retentionCondition);
+        starRocksAssert.dropTable("r1");
     }
 }
 

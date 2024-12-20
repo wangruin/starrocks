@@ -254,5 +254,4 @@ public class AnalyzeState {
     public List<Expr> getColumnNotInGroupBy() {
         return columnNotInGroupBy;
     }
-
 }

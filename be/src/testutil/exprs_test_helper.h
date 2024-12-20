@@ -14,8 +14,14 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
+
 #include "column/chunk.h"
+#include "column/column_helper.h"
+#include "common/object_pool.h"
+#include "common/status.h"
 #include "exprs/array_expr.h"
+#include "exprs/map_expr.h"
 #include "exprs/mock_vectorized_expr.h"
 #include "gen_cpp/Descriptors_types.h"
 #include "gen_cpp/PlanNodes_types.h"
@@ -23,11 +29,24 @@
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
+#include "testutil/assert.h"
 
 namespace starrocks {
 
 class ExprsTestHelper {
 public:
+    template <LogicalType Type>
+    static TExpr create_column_ref_t_expr(SlotId slot_id, bool is_nullable) {
+        TExpr expr;
+        expr.nodes.emplace_back(TExprNode());
+        expr.nodes[0].__set_type(TypeDescriptor(Type).to_thrift());
+        expr.nodes[0].__set_node_type(TExprNodeType::SLOT_REF);
+        expr.nodes[0].__set_is_nullable(is_nullable);
+        expr.nodes[0].__set_slot_ref(TSlotRef());
+        expr.nodes[0].slot_ref.__set_slot_id(slot_id);
+        return expr;
+    }
+
     static TTypeDesc create_scalar_type_desc(const TPrimitiveType::type t_type) {
         TTypeDesc type;
 
@@ -98,6 +117,17 @@ public:
         return create_array_expr(type.to_thrift());
     }
 
+    static std::unique_ptr<Expr> create_map_expr(const TypeDescriptor& type) {
+        TExprNode node;
+        node.__set_node_type(TExprNodeType::MAP_EXPR);
+        node.__set_is_nullable(true);
+        node.__set_type(type.to_thrift());
+        node.__set_num_children(0);
+
+        auto* expr = MapExprFactory::from_thrift(node);
+        return std::unique_ptr<Expr>(expr);
+    }
+
     static TExprNode create_slot_expr_node(TupleId tuple_id, SlotId slot_id, TTypeDesc t_type, bool is_nullable) {
         TExprNode slot_ref;
         slot_ref.node_type = TExprNodeType::SLOT_REF;
@@ -153,7 +183,6 @@ public:
         return expr;
     }
 };
-
 class TExprBuilder {
 public:
     TExprBuilder& operator<<(const LogicalType& slot_type) {

@@ -19,9 +19,10 @@ import com.starrocks.analysis.AnalyticExpr;
 import com.starrocks.analysis.AnalyticWindow;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
-import com.starrocks.analysis.IntLiteral;
-import com.starrocks.analysis.LargeIntLiteral;
+import com.starrocks.analysis.LiteralExpr;
+import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.OrderByElement;
+import com.starrocks.analysis.UserVariableExpr;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
@@ -29,6 +30,8 @@ import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 
 import java.math.BigDecimal;
+
+import static com.starrocks.catalog.FunctionSet.STATISTIC_FUNCTIONS;
 
 public class AnalyticAnalyzer {
     public static void verifyAnalyticExpression(AnalyticExpr analyticExpr) {
@@ -38,7 +41,7 @@ public class AnalyticAnalyzer {
                         + e.toSql() + " (in " + analyticExpr.toSql() + ")", e.getPos());
             }
             if (!e.getType().canPartitionBy()) {
-                throw new SemanticException("HLL, BITMAP and PERCENTILE type can't as partition by column", e.getPos());
+                throw new SemanticException(e.getType().toSql() + " type can't as partition by column", e.getPos());
             }
         }
 
@@ -48,7 +51,7 @@ public class AnalyticAnalyzer {
                         + e.getExpr().toSql() + " (in " + analyticExpr.toSql() + ")", e.getPos());
             }
             if (!e.getExpr().getType().canOrderBy()) {
-                throw new SemanticException("HLL, BITMAP and PERCENTILE type can't as order by column", e.getPos());
+                throw new SemanticException(e.getExpr().getType().toString() + " type can't as order by column", e.getPos());
             }
         }
 
@@ -89,14 +92,37 @@ public class AnalyticAnalyzer {
                                 analyticFunction.toSql(), analyticFunction.getPos());
             }
 
-            // check the default, which needs to be a constant at the moment
             // TODO: remove this check when the backend can handle non-constants
-            if (analyticFunction.getChildren().size() > 2) {
-                if (!analyticFunction.getChild(2).isConstant()) {
-                    throw new SemanticException(
-                            "The default parameter (parameter 3) of LEAD/LAG must be a constant: " +
-                                    analyticFunction.toSql(), analyticFunction.getPos());
+            if (analyticFunction.getChildren().size() == 2) {
+                // do nothing
+            } else if (analyticFunction.getChildren().size() == 3) {
+                Type firstType = analyticFunction.getChild(0).getType();
+
+                if (analyticFunction.getChild(0) instanceof NullLiteral) {
+                    firstType = analyticFunction.getFn().getArgs()[0];
                 }
+
+                try {
+                    analyticFunction.uncheckedCastChild(firstType, 2);
+                } catch (AnalysisException e) {
+                    throw new SemanticException("The third parameter of LEAD/LAG can't convert to " + firstType,
+                            analyticFunction.getChild(2).getPos());
+                }
+
+                // When the parameter is const and nullable in lead/lag, BE use create_const_null_column to store it.
+                // but the nullable info in FE is a more relax than BE (such as the nullable info in upper('a') is true,
+                // but the actually derived column in BE is not nullableColumn)
+                // which make the input colum in chunk not match the _agg_input_column in BE. so add this check in FE.
+                Expr theThirdChild = analyticFunction.getChild(2);
+                if (theThirdChild instanceof UserVariableExpr) {
+                    theThirdChild = ((UserVariableExpr) theThirdChild).getValue();
+                }
+                if (!theThirdChild.isLiteral() && theThirdChild.isNullable()) {
+                    throw new SemanticException("The type of the third parameter of LEAD/LAG not match the type " + firstType,
+                            analyticFunction.getChild(2).getPos());
+                }
+            } else {
+                throw new SemanticException("The number of parameter in LEAD/LAG is uncorrected", analyticFunction.getPos());
             }
         }
 
@@ -109,32 +135,16 @@ public class AnalyticAnalyzer {
             }
         }
 
+
         if (analyticExpr.getWindow() != null) {
-            if ((isRankingFn(analyticFunction.getFn()) || isOffsetFn(analyticFunction.getFn()) ||
-                    isHllAggFn(analyticFunction.getFn()))) {
+            if ((isRankingFn(analyticFunction.getFn()) || isCumeFn(analyticFunction.getFn()) ||
+                    isOffsetFn(analyticFunction.getFn()) || isHllAggFn(analyticFunction.getFn()))) {
                 throw new SemanticException("Windowing clause not allowed with '" + analyticFunction.toSql() + "'",
                         analyticExpr.getPos());
             }
 
             verifyWindowFrame(analyticExpr);
         }
-    }
-
-    private static boolean isPositiveConstantInteger(Expr expr) {
-        if (!expr.isConstant()) {
-            return false;
-        }
-
-        double value = 0;
-        if (expr instanceof IntLiteral) {
-            IntLiteral intl = (IntLiteral) expr;
-            value = intl.getDoubleValue();
-        } else if (expr instanceof LargeIntLiteral) {
-            LargeIntLiteral intl = (LargeIntLiteral) expr;
-            value = intl.getDoubleValue();
-        }
-
-        return value > 0;
     }
 
     private static void verifyWindowFrame(AnalyticExpr analyticExpr) {
@@ -252,7 +262,8 @@ public class AnalyticAnalyzer {
                     isPos = false;
                 }
             } catch (AnalysisException exc) {
-                throw new SemanticException("Couldn't evaluate PRECEDING/FOLLOWING expression: " + exc.getMessage(), e.getPos());
+                throw new SemanticException("Couldn't evaluate PRECEDING/FOLLOWING expression: " + exc.getMessage(),
+                        e.getPos());
             }
         }
 
@@ -331,6 +342,15 @@ public class AnalyticAnalyzer {
                 || fn.functionName().equalsIgnoreCase(AnalyticExpr.NTILE);
     }
 
+    private static boolean isCumeFn(Function fn) {
+        if (!isAnalyticFn(fn)) {
+            return false;
+        }
+
+        return fn.functionName().equalsIgnoreCase(AnalyticExpr.CUMEDIST)
+                || fn.functionName().equalsIgnoreCase(AnalyticExpr.PERCENTRANK);
+    }
+
     private static boolean isNtileFn(Function fn) {
         if (!isAnalyticFn(fn)) {
             return false;
@@ -339,11 +359,26 @@ public class AnalyticAnalyzer {
         return fn.functionName().equalsIgnoreCase(AnalyticExpr.NTILE);
     }
 
+    private static boolean isStatisticFn(Function fn) {
+        return STATISTIC_FUNCTIONS.contains(fn.functionName().toLowerCase());
+    }
+
     private static boolean isHllAggFn(Function fn) {
         if (!isAnalyticFn(fn)) {
             return false;
         }
 
         return fn.functionName().equalsIgnoreCase(AnalyticExpr.HLL_UNION_AGG);
+    }
+
+    private static boolean isPositiveConstantInteger(Expr offset) {
+        if (offset instanceof UserVariableExpr) {
+            offset = ((UserVariableExpr) offset).getValue();
+        }
+
+        if (offset instanceof LiteralExpr && offset.getType().isFixedPointType()) {
+            return ((LiteralExpr) offset).getLongValue() > 0;
+        }
+        return false;
     }
 }

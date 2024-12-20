@@ -50,6 +50,8 @@ public:
 
     bool stream_data_source() const override { return true; }
 
+    const TupleDescriptor* tuple_descriptor(RuntimeState* state) const override;
+
 protected:
     ConnectorScanNode* _scan_node;
     const TBinlogScanNode _binlog_scan_node;
@@ -62,6 +64,7 @@ public:
     ~BinlogDataSource() override = default;
 
     BinlogDataSource(const BinlogDataSourceProvider* provider, const TScanRange& scan_range);
+    std::string name() const override;
     Status open(RuntimeState* state) override;
     void close(RuntimeState* state) override;
     Status get_next(RuntimeState* state, ChunkPtr* chunk) override;

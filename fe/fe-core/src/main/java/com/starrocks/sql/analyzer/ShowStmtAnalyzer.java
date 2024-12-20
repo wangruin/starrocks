@@ -17,6 +17,7 @@ package com.starrocks.sql.analyzer;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LikePredicate;
@@ -29,28 +30,32 @@ import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.KeysType;
-import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.MysqlTable;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.TableFunctionTable;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
+import com.starrocks.common.SchemaConstants;
 import com.starrocks.common.proc.ExternalTableProcDir;
 import com.starrocks.common.proc.PartitionsProcDir;
 import com.starrocks.common.proc.ProcNodeInterface;
 import com.starrocks.common.proc.ProcService;
 import com.starrocks.common.proc.TableProcDir;
 import com.starrocks.common.util.OrderByPair;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ShowTemporaryTableStmt;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.DescribeStmt;
 import com.starrocks.sql.ast.ShowAlterStmt;
-import com.starrocks.sql.ast.ShowClustersStmt;
 import com.starrocks.sql.ast.ShowColumnStmt;
 import com.starrocks.sql.ast.ShowCreateDbStmt;
 import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
@@ -74,7 +79,7 @@ import com.starrocks.sql.ast.ShowTableStatusStmt;
 import com.starrocks.sql.ast.ShowTableStmt;
 import com.starrocks.sql.ast.ShowTabletStmt;
 import com.starrocks.sql.ast.ShowTransactionStmt;
-import com.starrocks.sql.ast.ShowWarehousesStmt;
+import com.starrocks.sql.common.MetaUtils;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,7 +98,7 @@ public class ShowStmtAnalyzer {
         new ShowStmtAnalyzerVisitor().analyze(stmt, session);
     }
 
-    static class ShowStmtAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class ShowStmtAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
 
         private static final Logger LOGGER = LoggerFactory.getLogger(ShowStmtAnalyzerVisitor.class);
 
@@ -118,6 +123,20 @@ public class ShowStmtAnalyzer {
             db = getDatabaseName(db, context);
             node.setDb(db);
             return null;
+        }
+
+        @Override
+        public Void visitShowTemporaryTablesStatement(ShowTemporaryTableStmt node, ConnectContext context) {
+            String catalogName;
+            if (node.getCatalogName() != null) {
+                catalogName = node.getCatalogName();
+            } else {
+                catalogName = context.getCurrentCatalog();
+            }
+            if (!CatalogMgr.isInternalCatalog(catalogName)) {
+                throw new SemanticException("show temporary table is not supported under non-default catalog");
+            }
+            return visitShowTableStatement(node, context);
         }
 
         @Override
@@ -176,25 +195,6 @@ public class ShowStmtAnalyzer {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_NO_TABLES_USED);
             }
             node.getTbl().normalization(context);
-            return null;
-        }
-
-        @Override
-        public Void visitShowWarehousesStatement(ShowWarehousesStmt node, ConnectContext context) {
-            return null;
-        }
-
-        @Override
-        public Void visitShowClusterStatement(ShowClustersStmt node, ConnectContext context) {
-            String warehouseName;
-            if (node.getWarehouseName() != null) {
-                warehouseName = node.getWarehouseName();
-            } else {
-                warehouseName = context.getCurrentWarehouse();
-            }
-            if (!GlobalStateMgr.getCurrentState().getWarehouseMgr().warehouseExists(warehouseName)) {
-                ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_WAREHOUSE_ERROR, warehouseName);
-            }
             return null;
         }
 
@@ -310,6 +310,11 @@ public class ShowStmtAnalyzer {
 
         @Override
         public Void visitDescTableStmt(DescribeStmt node, ConnectContext context) {
+            if (node.isTableFunctionTable()) {
+                descTableFunctionTable(node, context);
+                return null;
+            }
+
             node.getDbTableName().normalization(context);
             TableName tableName = node.getDbTableName();
             String catalogName = tableName.getCatalog();
@@ -333,22 +338,47 @@ public class ShowStmtAnalyzer {
             return null;
         }
 
+        private void descTableFunctionTable(DescribeStmt node, ConnectContext context) {
+            Table table = null;
+            try {
+                table = new TableFunctionTable(node.getTableFunctionProperties());
+            } catch (DdlException e) {
+                throw new StorageAccessException(e);
+            }
+
+            List<Column> columns = table.getFullSchema();
+            for (Column column : columns) {
+                List<String> row = Arrays.asList(
+                        column.getName(),
+                        column.getType().canonicalName().toLowerCase(),
+                        column.isAllowNull() ? SchemaConstants.YES : SchemaConstants.NO);
+                node.getTotalRows().add(row);
+            }
+        }
+
         private void descInternalCatalogTable(DescribeStmt node, ConnectContext context) {
-            Database db = GlobalStateMgr.getCurrentState().getDb(node.getDb());
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(node.getDb());
             if (db == null) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_DB_ERROR, node.getDb());
             }
-            db.readLock();
+            Locker locker = new Locker();
+            locker.lockDatabase(db.getId(), LockType.READ);
             try {
-                Table table = db.getTable(node.getTableName());
+                Table table = null;
+                try {
+                    table = MetaUtils.getSessionAwareTable(context, db, node.getDbTableName());
+                } catch (Exception e) {
+                    // if table is not found, may be is statement "desc materialized-view-name",
+                    // ignore this exception.
+                }
                 //if getTable not find table, may be is statement "desc materialized-view-name"
                 if (table == null) {
-                    for (Table tb : db.getTables()) {
+                    for (Table tb : GlobalStateMgr.getCurrentState().getLocalMetastore().getTables(db.getId())) {
                         if (tb.getType() == Table.TableType.OLAP) {
                             OlapTable olapTable = (OlapTable) tb;
-                            for (MaterializedIndex mvIdx : olapTable.getVisibleIndex()) {
-                                if (olapTable.getIndexNameById(mvIdx.getId()).equalsIgnoreCase(node.getTableName())) {
-                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvIdx.getId());
+                            for (MaterializedIndexMeta mvMeta : olapTable.getVisibleIndexMetas()) {
+                                if (olapTable.getIndexNameById(mvMeta.getIndexId()).equalsIgnoreCase(node.getTableName())) {
+                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvMeta.getIndexId());
                                     for (Column column : columns) {
                                         // Extra string (aggregation and bloom filter)
                                         List<String> extras = Lists.newArrayList();
@@ -359,12 +389,12 @@ public class ShowStmtAnalyzer {
                                         String defaultStr = column.getMetaDefaultValue(extras);
                                         String extraStr = StringUtils.join(extras, ",");
                                         List<String> row = Arrays.asList(
-                                                column.getDisplayName(),
+                                                column.getName(),
                                                 // In Mysql, the Type column should lowercase, and the Null column should uppercase.
                                                 // If you do not follow this specification, it may cause the BI system,
                                                 // such as superset, to fail to recognize the column type.
                                                 column.getType().canonicalName().toLowerCase(),
-                                                column.isAllowNull() ? "YES" : "NO",
+                                                column.isAllowNull() ? SchemaConstants.YES : SchemaConstants.NO,
                                                 ((Boolean) column.isKey()).toString(),
                                                 defaultStr,
                                                 extraStr);
@@ -401,10 +431,10 @@ public class ShowStmtAnalyzer {
                         throw new SemanticException(String.format("Unknown proc node path: %s", procString));
                     }
                 } else {
-                    if (table.isNativeTable()) {
+                    if (table.isNativeTableOrMaterializedView()) {
                         node.setOlapTable(true);
                         OlapTable olapTable = (OlapTable) table;
-                        Set<String> bfColumns = olapTable.getCopiedBfColumns();
+                        Set<String> bfColumns = olapTable.getBfColumnNames();
                         Map<Long, List<Column>> indexIdToSchema = olapTable.getIndexIdToSchema();
 
                         // indices order
@@ -438,12 +468,12 @@ public class ShowStmtAnalyzer {
                                 String extraStr = StringUtils.join(extras, ",");
                                 List<String> row = Arrays.asList("",
                                         "",
-                                        column.getDisplayName(),
+                                        column.getName(),
                                         // In Mysql, the Type column should lowercase, and the Null column should uppercase.
                                         // If you do not follow this specification, it may cause the BI system,
                                         // such as superset, to fail to recognize the column type.
                                         column.getType().canonicalName().toLowerCase(),
-                                        column.isAllowNull() ? "YES" : "NO",
+                                        column.isAllowNull() ? SchemaConstants.YES : SchemaConstants.NO,
                                         ((Boolean) column.isKey()).toString(),
                                         defaultStr,
                                         extraStr);
@@ -467,15 +497,15 @@ public class ShowStmtAnalyzer {
                                 mysqlTable.getPort(),
                                 mysqlTable.getUserName(),
                                 mysqlTable.getPasswd(),
-                                mysqlTable.getMysqlDatabaseName(),
-                                mysqlTable.getMysqlTableName());
+                                mysqlTable.getCatalogDBName(),
+                                mysqlTable.getCatalogTableName());
                         node.getTotalRows().add(row);
                     } else {
                         ErrorReport.reportSemanticException(ErrorCode.ERR_UNKNOWN_STORAGE_ENGINE, table.getType());
                     }
                 }
             } finally {
-                db.readUnlock();
+                locker.unLockDatabase(db.getId(), LockType.READ);
             }
         }
 
@@ -486,7 +516,7 @@ public class ShowStmtAnalyzer {
             try {
                 node.setNode(ProcService.getInstance().open(procString));
             } catch (AnalysisException e) {
-                throw new SemanticException(String.format("Unknown proc node path: %s", procString));
+                throw new SemanticException(String.format("Unknown proc node path: %s. msg: %s", procString, e.getMessage()));
             }
         }
 
@@ -499,7 +529,7 @@ public class ShowStmtAnalyzer {
             try {
                 node.setNode(ProcService.getInstance().open(path));
             } catch (AnalysisException e) {
-                throw new SemanticException(String.format("Unknown proc node path: %s", path));
+                throw new SemanticException(String.format("Unknown proc node path: %s. msg: %s", path, e.getMessage()));
             }
             return null;
         }
@@ -530,15 +560,17 @@ public class ShowStmtAnalyzer {
             if (statement.getWhereClause() != null) {
                 analyzeSubPredicate(filterMap, statement.getWhereClause());
             }
-            Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
             if (db == null) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
             }
+
             final String tableName = statement.getTableName();
             final boolean isTempPartition = statement.isTempPartition();
-            db.readLock();
+            Locker locker = new Locker();
+            locker.lockDatabase(db.getId(), LockType.READ);
             try {
-                Table table = db.getTable(tableName);
+                Table table = MetaUtils.getSessionAwareTable(context, db, new TableName(dbName, tableName));
                 if (!(table instanceof OlapTable)) {
                     throw new SemanticException("Table[" + tableName + "] does not exists or is not OLAP table");
                 }
@@ -567,7 +599,7 @@ public class ShowStmtAnalyzer {
                         analyzeOrderBy(statement.getOrderByElements(), statement.getNode());
                 statement.setOrderByPairs(orderByPairs);
             } finally {
-                db.readUnlock();
+                locker.unLockDatabase(db.getId(), LockType.READ);
             }
             return null;
         }
@@ -614,7 +646,7 @@ public class ShowStmtAnalyzer {
 
         private void binaryPredicateHandler(Expr subExpr, String leftKey, boolean filter) {
             BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-            if (filter && binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+            if (filter && binaryPredicate.getOp() != BinaryType.EQ) {
                 throw new SemanticException(String.format("Only operator =|like are supported for %s", leftKey));
             }
             if (leftKey.equalsIgnoreCase(ShowPartitionsStmt.FILTER_LAST_CONSISTENCY_CHECK_TIME)) {

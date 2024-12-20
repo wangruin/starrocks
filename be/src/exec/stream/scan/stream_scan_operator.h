@@ -35,8 +35,8 @@ class StreamChunkSource;
 
 class StreamScanOperatorFactory final : public ConnectorScanOperatorFactory {
 public:
-    StreamScanOperatorFactory(int32_t id, ScanNode* scan_node, size_t dop, ChunkBufferLimiterPtr buffer_limiter,
-                              bool is_stream_pipeline);
+    StreamScanOperatorFactory(int32_t id, ScanNode* scan_node, RuntimeState* state, size_t dop,
+                              ChunkBufferLimiterPtr buffer_limiter, bool is_stream_pipeline);
 
     ~StreamScanOperatorFactory() override = default;
 
@@ -62,7 +62,7 @@ public:
     Status set_epoch_finished(RuntimeState* state) override;
 
     Status do_prepare(RuntimeState* state) override {
-        ConnectorScanOperator::do_prepare(state);
+        RETURN_IF_ERROR(ConnectorScanOperator::do_prepare(state));
         _stream_epoch_manager = state->query_ctx()->stream_epoch_manager();
         DCHECK(_stream_epoch_manager);
         return Status::OK();
@@ -85,7 +85,7 @@ public:
 
 private:
     StatusOr<ChunkPtr> _mark_mock_data_finished();
-    void _reset_chunk_source(RuntimeState* state, int chunk_source_index);
+    Status _reset_chunk_source(RuntimeState* state, int chunk_source_index);
 
     std::atomic<int32_t> _chunk_num{0};
     bool _is_epoch_start{false};
@@ -102,23 +102,23 @@ private:
 
 class StreamChunkSource : public ConnectorChunkSource {
 public:
-    StreamChunkSource(int32_t scan_operator_id, RuntimeProfile* runtime_profile, MorselPtr&& morsel, ScanOperator* op,
-                      ConnectorScanNode* scan_node, BalancedChunkBuffer& chunk_buffer);
+    StreamChunkSource(ScanOperator* op, RuntimeProfile* runtime_profile, MorselPtr&& morsel,
+                      ConnectorScanNode* scan_node, BalancedChunkBuffer& chunk_buffer, bool enable_adaptive_io_task);
 
     Status prepare(RuntimeState* state) override;
 
     Status set_stream_offset(int64_t table_version, int64_t changelog_id);
     void set_epoch_limit(int64_t epoch_rows_limit, int64_t epoch_time_limit);
-    void reset_status();
+    Status reset_status();
     int64_t get_lane_owner() {
         auto [lane_owner, version] = _morsel->get_lane_owner_and_version();
         return lane_owner;
     }
 
 protected:
-    bool _reach_eof() override;
+    bool _reach_eof() const override;
 
-    connector::StreamDataSource* _get_stream_data_source() {
+    connector::StreamDataSource* _get_stream_data_source() const {
         return down_cast<connector::StreamDataSource*>(_data_source.get());
     }
 

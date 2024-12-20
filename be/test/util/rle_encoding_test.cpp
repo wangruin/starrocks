@@ -395,7 +395,7 @@ TEST_F(TestRle, TestRoundTripRandomSequencesWithRuns) {
         std::string roundtrip_str;
         int rem_to_read = num_bits;
         size_t run_len;
-        bool val;
+        bool val = false;
         while (rem_to_read > 0 && (run_len = decoder.GetNextRun(&val, std::min(kMaxToReadAtOnce, rem_to_read))) != 0) {
             ASSERT_LE(run_len, kMaxToReadAtOnce);
             roundtrip_str.append(run_len, val ? '1' : '0');
@@ -476,6 +476,49 @@ TEST_F(TestRle, TestBatch) {
     std::vector<int> to_check(2048);
     auto n = decoder.GetBatch(&to_check[0], 2048);
     ASSERT_EQ(1024, n);
+}
+
+TEST_F(TestRle, TestGetBatchWithDict) {
+    faststring buffer;
+    RleEncoder<int> encoder(&buffer, 16);
+    std::vector<int> values;
+    std::vector<int> dict;
+    for (int i = 0; i < 1024; ++i) {
+        dict.push_back(i % 5);
+        values.push_back(dict[i]);
+        encoder.Put(i);
+    }
+    encoder.Flush();
+
+    RleBatchDecoder<int> decoder(buffer.data(), buffer.size(), 16);
+    std::vector<int> to_check(2048);
+    auto n = decoder.GetBatchWithDict(dict.data(), dict.size(), &to_check[0], 2048);
+    for (int i = 0; i < values.size(); i++) {
+        ASSERT_EQ(to_check[i], values[i]);
+    }
+    ASSERT_EQ(1024, n);
+}
+
+TEST_F(TestRle, TestGetBatchWithDictOutOfRange) {
+    faststring buffer;
+    RleEncoder<int> encoder(&buffer, 16);
+    std::vector<int> values;
+    std::vector<int> dict;
+    for (int i = 0; i < 1023; i++) {
+        dict.push_back(i % 5);
+    }
+    for (int i = 0; i < 1023; ++i) {
+        values.push_back(dict[i]);
+        encoder.Put(i);
+    }
+    values.push_back(dict[0]);
+    encoder.Put(1024);
+    encoder.Flush();
+
+    RleBatchDecoder<int> decoder(buffer.data(), buffer.size(), 16);
+    std::vector<int> to_check(2048);
+    auto n = decoder.GetBatchWithDict(dict.data(), dict.size(), &to_check[0], 2048);
+    ASSERT_EQ(-1, n);
 }
 
 } // namespace starrocks

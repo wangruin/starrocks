@@ -15,79 +15,94 @@
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReport;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.sql.ast.AlterWarehouseStmt;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.AstVisitor;
-import com.starrocks.sql.ast.CreateWarehouseStmt;
-import com.starrocks.sql.ast.DropWarehouseStmt;
-import com.starrocks.sql.ast.ResumeWarehouseStmt;
-import com.starrocks.sql.ast.SetWarehouseStmt;
 import com.starrocks.sql.ast.ShowStmt;
 import com.starrocks.sql.ast.StatementBase;
-import com.starrocks.sql.ast.SuspendWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.AlterWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.CreateWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.DropWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.ResumeWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.SetWarehouseStmt;
+import com.starrocks.sql.ast.warehouse.ShowWarehousesStmt;
+import com.starrocks.sql.ast.warehouse.SuspendWarehouseStmt;
 
 public class WarehouseAnalyzer {
     public static void analyze(StatementBase stmt, ConnectContext session) {
-        new WarehouseAnalyzer.WarehouseAnalyzerVisitor().visit(stmt, session);
+        new WarehouseAnalyzerVisitor().visit(stmt, session);
     }
 
-    static class WarehouseAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class WarehouseAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
         public void analyze(ShowStmt statement, ConnectContext session) {
             visit(statement, session);
         }
 
         @Override
-        public Void visitSetWarehouseStatement(SetWarehouseStmt statement, ConnectContext context) {
+        public Void visitCreateWarehouseStatement(CreateWarehouseStmt statement, ConnectContext context) {
             String whName = statement.getWarehouseName();
             if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
             }
             FeNameFormat.checkWarehouseName(whName);
-            return null;
-        }
-
-        @Override
-        public Void visitCreateWarehouseStatement(CreateWarehouseStmt statement, ConnectContext context) {
-            String whName = statement.getFullWhName();
-            if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
-            }
-            FeNameFormat.checkWarehouseName(whName);
-            return null;
-        }
-
-        @Override
-        public Void visitAlterWarehouseStatement(AlterWarehouseStmt statement, ConnectContext context) {
-            String whName = statement.getFullWhName();
-            if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
-            }
             return null;
         }
 
         @Override
         public Void visitSuspendWarehouseStatement(SuspendWarehouseStmt statement, ConnectContext context) {
-            String whName = statement.getFullWhName();
+            String whName = statement.getWarehouseName();
             if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
             }
             return null;
         }
 
         public Void visitResumeWarehouseStatement(ResumeWarehouseStmt statement, ConnectContext context) {
-            String whName = statement.getFullWhName();
+            String whName = statement.getWarehouseName();
             if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
             }
             return null;
         }
 
         @Override
         public Void visitDropWarehouseStatement(DropWarehouseStmt statement, ConnectContext context) {
-            String whName = statement.getFullWhName();
+            String whName = statement.getWarehouseName();
             if (Strings.isNullOrEmpty(whName)) {
-                throw new SemanticException("warehouse name can not be null or empty");
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
             }
+
+            if (whName.equals(WarehouseManager.DEFAULT_WAREHOUSE_NAME)) {
+                throw new SemanticException("Can't drop the default_warehouse");
+            }
+
+            return null;
+        }
+
+        @Override
+        public Void visitSetWarehouseStatement(SetWarehouseStmt statement, ConnectContext context) {
+            String whName = statement.getWarehouseName();
+            if (Strings.isNullOrEmpty(whName)) {
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
+            }
+            FeNameFormat.checkWarehouseName(whName);
+            return null;
+        }
+
+        @Override
+        public Void visitShowWarehousesStatement(ShowWarehousesStmt node, ConnectContext context) {
+            return null;
+        }
+
+        @Override
+        public Void visitAlterWarehouseStatement(AlterWarehouseStmt statement, ConnectContext context) {
+            String whName = statement.getWarehouseName();
+            if (Strings.isNullOrEmpty(whName)) {
+                ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_WAREHOUSE_NAME);
+            }
+
             return null;
         }
     }

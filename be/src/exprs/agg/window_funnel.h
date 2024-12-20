@@ -24,6 +24,7 @@
 #include "column/array_column.h"
 #include "column/binary_column.h"
 #include "column/column_helper.h"
+#include "column/const_column.h"
 #include "column/datum.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
@@ -92,14 +93,35 @@ struct WindowFunnelState {
         TimestampType last_timestamp = -1;
     };
     using TimestampVector = std::vector<TimestampTypePair>;
-    int64_t window_size;
+
+    // `window_size` is guaranteed to be non-negative by the analyzer in FE,
+    // so use -1 to indicate `window_size` hasn't been initialized.
+    static constexpr int64_t ABSENT_WINDOW_SIZE = -1;
+
+    int64_t window_size = ABSENT_WINDOW_SIZE;
     mutable int32_t mode = 0;
     uint8_t events_size;
     bool sorted = true;
     char buffer[reserve_list_size * sizeof(TimestampEvent)];
     stack_memory_resource mr;
     mutable std::pmr::vector<TimestampEvent> events_list;
+
     WindowFunnelState() : mr(buffer, sizeof(buffer)), events_list(&mr) { events_list.reserve(reserve_list_size); }
+
+    void init_once(FunctionContext* ctx) {
+        if (window_size != ABSENT_WINDOW_SIZE) {
+            return;
+        }
+
+        // `agg_expr_ctxs` is different between update and merge mode of the AggregationOperator.
+        // - update mode: [InitLiteral(BIGINT), SlotRef(DATE/DATETIME), IntLiteral(INT), SlotRef(Array<BOOLEAN>)]
+        // - merge mode: [SlotRef(ARRAY<BIGINT>), InitLiteral(BIGINT), IntLiteral(INT)]
+        // Therefore, the index of `window_size` is 0 or 1.
+        size_t window_size_col_index = ctx->get_constant_column(0) != nullptr ? 0 : 1;
+        window_size = ColumnHelper::get_const_value<TYPE_BIGINT>(ctx->get_constant_column(window_size_col_index));
+
+        mode = ColumnHelper::get_const_value<TYPE_INT>(ctx->get_constant_column(2));
+    }
 
     void sort() const { std::stable_sort(std::begin(events_list), std::end(events_list)); }
 
@@ -124,8 +146,6 @@ struct WindowFunnelState {
         }
 
         std::vector<TimestampEvent> other_list;
-        window_size = ColumnHelper::get_const_value<TYPE_BIGINT>(ctx->get_constant_column(1));
-        mode = ColumnHelper::get_const_value<TYPE_INT>(ctx->get_constant_column(2));
 
         events_size = (uint8_t)array[0];
         bool other_sorted = (uint8_t)array[1];
@@ -419,8 +439,7 @@ public:
                 size_t row_num) const override {
         DCHECK(columns[2]->is_constant());
 
-        this->data(state).window_size = down_cast<const Int64Column*>(columns[0])->get_data()[0];
-        this->data(state).mode = ColumnHelper::get_const_value<TYPE_INT>(columns[2]);
+        this->data(state).init_once(ctx);
 
         // get timestamp
         TimeType tv;
@@ -434,12 +453,26 @@ public:
 
         // get event
         uint8_t event_level = 0;
-        const auto* event_column = down_cast<const ArrayColumn*>(columns[3]);
+        const ArrayColumn* event_column = nullptr;
+        size_t offset = 0;
+        size_t array_size = 0;
 
-        const UInt32Column& offsets = event_column->offsets();
-        auto offsets_ptr = offsets.get_data().data();
-        size_t offset = offsets_ptr[row_num];
-        size_t array_size = offsets_ptr[row_num + 1] - offsets_ptr[row_num];
+        DCHECK(!columns[3]->only_null());
+        if (columns[3]->is_constant()) {
+            event_column =
+                    down_cast<const ArrayColumn*>(down_cast<const ConstColumn*>(columns[3])->data_column().get());
+            const UInt32Column& offsets = event_column->offsets();
+            auto offsets_ptr = offsets.get_data().data();
+            offset = offsets_ptr[0];
+            array_size = offsets_ptr[1] - offsets_ptr[0];
+        } else {
+            DCHECK(columns[3]->is_array());
+            event_column = down_cast<const ArrayColumn*>(columns[3]);
+            const UInt32Column& offsets = event_column->offsets();
+            auto offsets_ptr = offsets.get_data().data();
+            offset = offsets_ptr[row_num];
+            array_size = offsets_ptr[row_num + 1] - offsets_ptr[row_num];
+        }
 
         const Column& elements = event_column->elements();
         if (elements.is_nullable()) {
@@ -481,6 +514,9 @@ public:
     void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         DCHECK(column->is_array());
         DCHECK(!column->is_nullable());
+
+        this->data(state).init_once(ctx);
+
         const auto* input_column = down_cast<const ArrayColumn*>(column);
         const auto& offsets = input_column->offsets().get_data();
         const auto& elements = input_column->elements();

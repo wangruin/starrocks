@@ -12,89 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.plan;
 
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.io.CharStreams;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
-import com.starrocks.catalog.Table;
-import com.starrocks.common.Config;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.MaterializedView;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.Pair;
-import com.starrocks.persist.gson.GsonUtils;
-import com.starrocks.planner.MaterializedViewTPCHTest;
-import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.StmtExecutor;
+import com.starrocks.planner.TpchSQL;
+import com.starrocks.qe.DefaultCoordinator;
+import com.starrocks.qe.scheduler.dag.FragmentInstance;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.ast.StatementBase;
-import com.starrocks.sql.optimizer.LogicalPlanPrinter;
-import com.starrocks.sql.parser.SqlParser;
-import com.starrocks.thrift.TExplainLevel;
+import com.starrocks.thrift.TScanRangeParams;
 import com.starrocks.utframe.StarRocksAssert;
-import com.starrocks.utframe.UtFrameUtils;
-import kotlin.text.Charsets;
-import org.apache.commons.io.FileUtils;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.ListUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.junit.AfterClass;
-import org.junit.Assert;
 import org.junit.BeforeClass;
-import org.junit.Rule;
-import org.junit.rules.ErrorCollector;
-import org.junit.rules.ExpectedException;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
-public class PlanTestBase {
+public class PlanTestBase extends PlanTestNoneDBBase {
+
+    private static final Logger LOG = LogManager.getLogger(PlanTestBase.class);
+
     // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    public static ConnectContext connectContext;
-    public static StarRocksAssert starRocksAssert;
-
-    @Rule
-    public ExpectedException expectedEx = ExpectedException.none();
-
-    @Rule
-    public ErrorCollector collector = new ErrorCollector();
-
     @BeforeClass
     public static void beforeClass() throws Exception {
         // disable checking tablets
-        Config.tablet_sched_max_scheduling_tablets = -1;
-        FeConstants.default_scheduler_interval_millisecond = 1;
-        UtFrameUtils.createMinStarRocksCluster();
-        // create connect context
-        connectContext = UtFrameUtils.createDefaultCtx();
-        starRocksAssert = new StarRocksAssert(connectContext);
+        PlanTestNoneDBBase.beforeClass();
         String dbName = "test";
         starRocksAssert.withDatabase(dbName).useDatabase(dbName);
-
-
-        connectContext.getSessionVariable().setMaxTransformReorderJoins(8);
-        connectContext.getSessionVariable().setOptimizerExecuteTimeout(30000);
-        connectContext.getSessionVariable().setEnableReplicationJoin(false);
-        connectContext.getSessionVariable().setEnableLocalShuffleAgg(false);
-        connectContext.getSessionVariable().setCboPushDownAggregateMode(-1);
 
         starRocksAssert.withTable("CREATE TABLE `t0` (\n" +
                 "  `v1` bigint NULL COMMENT \"\",\n" +
@@ -105,8 +58,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t1` (\n" +
@@ -118,8 +70,18 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v4`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `part_t1` (\n" +
+                "  `v4` bigint NULL COMMENT \"\",\n" +
+                "  `v5` bigint NULL COMMENT \"\",\n" +
+                "  `v6` bigint NULL\n" +
+                ") ENGINE=OLAP\n" +
+                "PARTITION BY list(v4) ( partition p1 values in ('1'), partition p2 values in ('2')) \n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t2` (\n" +
@@ -131,8 +93,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v7`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t3` (\n" +
@@ -144,8 +105,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v10`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t4` (\n" +
@@ -157,8 +117,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v13`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t5` (\n" +
@@ -170,8 +129,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v16`, `v17`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t6` (\n" +
@@ -184,8 +142,27 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `t7` (\n" +
+                "  `k1` string NULL COMMENT \"\",\n" +
+                "  `k2` string NULL COMMENT \"\",\n" +
+                "  `k3` string NULL\n" +
+                ") ENGINE=OLAP\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `t8` (\n" +
+                "  `k1` string NULL COMMENT \"\",\n" +
+                "  `k2` string NULL COMMENT \"\",\n" +
+                "  `k3` string NULL\n" +
+                ") ENGINE=OLAP\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `colocate_t0` (\n" +
@@ -198,7 +175,6 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\",\n" +
                 "\"colocate_with\" = \"colocate_group_1\"" +
                 ");");
 
@@ -212,7 +188,6 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\",\n" +
                 "\"colocate_with\" = \"colocate_group_1\"" +
                 ");");
 
@@ -226,7 +201,6 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\",\n" +
                 "\"colocate_with\" = \"colocate_group_2\"" +
                 ");");
 
@@ -240,7 +214,6 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\",\n" +
                 "\"colocate_with\" = \"colocate_group_2\"" +
                 ");");
 
@@ -261,8 +234,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`t1a`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_all_type_not_null` (\n" +
@@ -282,8 +254,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`t1a`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE IF NOT EXISTS `test_object` (\n" +
@@ -343,159 +314,17 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`ta`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
-        starRocksAssert.withTable("CREATE TABLE region ( R_REGIONKEY  INTEGER NOT NULL,\n" +
-                "                            R_NAME       CHAR(25) NOT NULL,\n" +
-                "                            R_COMMENT    VARCHAR(152),\n" +
-                "                            PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`r_regionkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`r_regionkey`) BUCKETS 1\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE supplier ( S_SUPPKEY     INTEGER NOT NULL,\n" +
-                "                             S_NAME        CHAR(25) NOT NULL,\n" +
-                "                             S_ADDRESS     VARCHAR(40) NOT NULL, \n" +
-                "                             S_NATIONKEY   INTEGER NOT NULL,\n" +
-                "                             S_PHONE       CHAR(15) NOT NULL,\n" +
-                "                             S_ACCTBAL     double NOT NULL,\n" +
-                "                             S_COMMENT     VARCHAR(101) NOT NULL,\n" +
-                "                             PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`s_suppkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`s_suppkey`) BUCKETS 1\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE partsupp ( PS_PARTKEY     INTEGER NOT NULL,\n" +
-                "                             PS_SUPPKEY     INTEGER NOT NULL,\n" +
-                "                             PS_AVAILQTY    INTEGER NOT NULL,\n" +
-                "                             PS_SUPPLYCOST  double  NOT NULL,\n" +
-                "                             PS_COMMENT     VARCHAR(199) NOT NULL,\n" +
-                "                             PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`ps_partkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`ps_partkey`) BUCKETS 10\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE orders  ( O_ORDERKEY       INTEGER NOT NULL,\n" +
-                "                           O_CUSTKEY        INTEGER NOT NULL,\n" +
-                "                           O_ORDERSTATUS    CHAR(1) NOT NULL,\n" +
-                "                           O_TOTALPRICE     double NOT NULL,\n" +
-                "                           O_ORDERDATE      DATE NOT NULL,\n" +
-                "                           O_ORDERPRIORITY  CHAR(15) NOT NULL,  \n" +
-                "                           O_CLERK          CHAR(15) NOT NULL, \n" +
-                "                           O_SHIPPRIORITY   INTEGER NOT NULL,\n" +
-                "                           O_COMMENT        VARCHAR(79) NOT NULL,\n" +
-                "                           PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`o_orderkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`o_orderkey`) BUCKETS 10\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE customer ( C_CUSTKEY     INTEGER NOT NULL,\n" +
-                "                             C_NAME        VARCHAR(25) NOT NULL,\n" +
-                "                             C_ADDRESS     VARCHAR(40) NOT NULL,\n" +
-                "                             C_NATIONKEY   INTEGER NOT NULL,\n" +
-                "                             C_PHONE       CHAR(15) NOT NULL,\n" +
-                "                             C_ACCTBAL     double   NOT NULL,\n" +
-                "                             C_MKTSEGMENT  CHAR(10) NOT NULL,\n" +
-                "                             C_COMMENT     VARCHAR(117) NOT NULL,\n" +
-                "                             PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`c_custkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`c_custkey`) BUCKETS 10\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE `nation` (\n" +
-                "  `N_NATIONKEY` int(11) NOT NULL COMMENT \"\",\n" +
-                "  `N_NAME` char(25) NOT NULL COMMENT \"\",\n" +
-                "  `N_REGIONKEY` int(11) NOT NULL COMMENT \"\",\n" +
-                "  `N_COMMENT` varchar(152) NULL COMMENT \"\",\n" +
-                "  `PAD` char(1) NOT NULL COMMENT \"\"\n" +
-                ") ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`N_NATIONKEY`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`N_NATIONKEY`) BUCKETS 1\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE part  ( P_PARTKEY     INTEGER NOT NULL,\n" +
-                "                          P_NAME        VARCHAR(55) NOT NULL,\n" +
-                "                          P_MFGR        CHAR(25) NOT NULL,\n" +
-                "                          P_BRAND       CHAR(10) NOT NULL,\n" +
-                "                          P_TYPE        VARCHAR(25) NOT NULL,\n" +
-                "                          P_SIZE        INTEGER NOT NULL,\n" +
-                "                          P_CONTAINER   CHAR(10) NOT NULL,\n" +
-                "                          P_RETAILPRICE double NOT NULL,\n" +
-                "                          P_COMMENT     VARCHAR(23) NOT NULL,\n" +
-                "                          PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`p_partkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`p_partkey`) BUCKETS 10\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
-
-        starRocksAssert.withTable("CREATE TABLE lineitem ( L_ORDERKEY    INTEGER NOT NULL,\n" +
-                "                             L_PARTKEY     INTEGER NOT NULL,\n" +
-                "                             L_SUPPKEY     INTEGER NOT NULL,\n" +
-                "                             L_LINENUMBER  INTEGER NOT NULL,\n" +
-                "                             L_QUANTITY    double NOT NULL,\n" +
-                "                             L_EXTENDEDPRICE  double NOT NULL,\n" +
-                "                             L_DISCOUNT    double NOT NULL,\n" +
-                "                             L_TAX         double NOT NULL,\n" +
-                "                             L_RETURNFLAG  CHAR(1) NOT NULL,\n" +
-                "                             L_LINESTATUS  CHAR(1) NOT NULL,\n" +
-                "                             L_SHIPDATE    DATE NOT NULL,\n" +
-                "                             L_COMMITDATE  DATE NOT NULL,\n" +
-                "                             L_RECEIPTDATE DATE NOT NULL,\n" +
-                "                             L_SHIPINSTRUCT CHAR(25) NOT NULL,\n" +
-                "                             L_SHIPMODE     CHAR(10) NOT NULL,\n" +
-                "                             L_COMMENT      VARCHAR(44) NOT NULL,\n" +
-                "                             PAD char(1) NOT NULL)\n" +
-                "ENGINE=OLAP\n" +
-                "DUPLICATE KEY(`l_orderkey`)\n" +
-                "COMMENT \"OLAP\"\n" +
-                "DISTRIBUTED BY HASH(`l_orderkey`) BUCKETS 20\n" +
-                "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
-                ");");
+        starRocksAssert.withTable(TpchSQL.REGION);
+        starRocksAssert.withTable(TpchSQL.SUPPLIER);
+        starRocksAssert.withTable(TpchSQL.PARTSUPP);
+        starRocksAssert.withTable(TpchSQL.ORDERS);
+        starRocksAssert.withTable(TpchSQL.CUSTOMER);
+        starRocksAssert.withTable(TpchSQL.NATION);
+        starRocksAssert.withTable(TpchSQL.PART);
+        starRocksAssert.withTable(TpchSQL.LINEITEM);
 
         starRocksAssert.withTable("CREATE TABLE `lineorder_flat_for_mv` (\n" +
                 "  `LO_ORDERDATE` date NOT NULL COMMENT \"\",\n" +
@@ -550,12 +379,8 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`LO_ORDERKEY`) BUCKETS 150 \n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ")");
-
-        starRocksAssert.withMaterializedView("CREATE MATERIALIZED VIEW lo_count_mv as " +
-                "select LO_ORDERDATE,count(LO_LINENUMBER) from lineorder_flat_for_mv group by LO_ORDERDATE;");
 
         starRocksAssert.withTable("CREATE TABLE `lineitem_partition` (\n" +
                 "  `L_ORDERKEY` int(11) NOT NULL COMMENT \"\",\n" +
@@ -568,7 +393,7 @@ public class PlanTestBase {
                 "  `L_TAX` double NOT NULL COMMENT \"\",\n" +
                 "  `L_RETURNFLAG` char(1) NOT NULL COMMENT \"\",\n" +
                 "  `L_LINESTATUS` char(1) NOT NULL COMMENT \"\",\n" +
-                "  `L_SHIPDATE` date NOT NULL COMMENT \"\",\n" +
+                "  `L_SHIPDATE` date NULL COMMENT \"\",\n" +
                 "  `L_COMMITDATE` date NOT NULL COMMENT \"\",\n" +
                 "  `L_RECEIPTDATE` date NOT NULL COMMENT \"\",\n" +
                 "  `L_SHIPINSTRUCT` char(25) NOT NULL COMMENT \"\",\n" +
@@ -589,8 +414,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`L_ORDERKEY`) BUCKETS 48\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `lineitem_partition_colocate` (\n" +
@@ -626,8 +450,7 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"colocate_with\" = \"colocate_group\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"colocate_with\" = \"colocate_group\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `emp` (\n" +
@@ -641,8 +464,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`id`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ")");
 
         starRocksAssert.withTable("CREATE TABLE `dept` (\n" +
@@ -654,8 +476,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`dept_id`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ")");
 
         starRocksAssert.withTable("CREATE TABLE `bonus` (\n" +
@@ -666,8 +487,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`emp_name`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ")\n");
 
         starRocksAssert.withView("create view tview as select * from t0;");
@@ -681,8 +501,19 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `tmap` (\n" +
+                "  `v1` bigint NULL COMMENT \"\",\n" +
+                "  `v2` bigint NULL COMMENT \"\",\n" +
+                "  `v3` map<bigint(20), char(20)>  NULL\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(`v1`, `v2`)\n" +
+                "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `ods_order` (\n" +
@@ -835,8 +666,7 @@ public class PlanTestBase {
                         "DISTRIBUTED BY HASH(`k1`) BUCKETS 5\n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");")
                 .withTable("create table test.jointest\n" +
                         "(k1 int, k2 int) distributed by hash(k1) buckets 1\n" +
@@ -892,7 +722,7 @@ public class PlanTestBase {
                         "\"password\"=\"test_passwd\",\n" +
                         "\"driver_url\"=\"test_driver_url\",\n" +
                         "\"driver_class\"=\"test.driver.class\",\n" +
-                        "\"jdbc_uri\"=\"test_uri\"\n" +
+                        "\"jdbc_uri\"=\"jdbc:mariadb://127.0.0.1:3306\"\n" +
                         ");")
                 .withTable("create external table test.jdbc_test\n" +
                         "(a int, b varchar(20), c float)\n" +
@@ -912,8 +742,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_bool` (\n" +
@@ -934,8 +763,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`t1a`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_all_type_distributed_by_datetime` (\n" +
@@ -955,8 +783,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`id_datetime`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_all_type_distributed_by_date` (\n" +
@@ -976,8 +803,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`id_date`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_all_type_partition_by_datetime` (\n" +
@@ -1001,8 +827,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`t1a`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_all_type_partition_by_date` (\n" +
@@ -1026,8 +851,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`t1a`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `test_partition_prune_optimize_by_date` (\n" +
@@ -1046,8 +870,7 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`session_id`) BUCKETS 5 \n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("create table test.colocate1\n" +
@@ -1072,8 +895,7 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"replicated_storage\" = \"false\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `tprimary_auto_increment` (\n" +
@@ -1086,8 +908,7 @@ public class PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"replicated_storage\" = \"true\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `tprimary1` (\n" +
@@ -1099,8 +920,20 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`pk1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `tprimary_bool` (\n" +
+                "  `pk1` bigint NOT NULL COMMENT \"\",\n" +
+                "  `pk2` BOOLEAN NOT NULL COMMENT \"\",\n" +
+                "  `v3` string NOT NULL COMMENT \"\",\n" +
+                "  `v4` int NOT NULL\n" +
+                ") ENGINE=OLAP\n" +
+                "PRIMARY KEY(pk1, pk2)\n" +
+                "DISTRIBUTED BY HASH(pk1, pk2) BUCKETS 3\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `tjson` (\n" +
@@ -1111,525 +944,97 @@ public class PlanTestBase {
                 "DISTRIBUTED BY HASH(`v_int`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
-        connectContext.getSessionVariable().setEnableLowCardinalityOptimize(false);
+        starRocksAssert.withTable("CREATE TABLE `test_agg_group_single_unique_key` (\n" +
+                "  `id` int(11) NOT NULL COMMENT \"\",\n" +
+                "  `big_value` bigint(20) NULL COMMENT \"\",\n" +
+                "  `double_value` double NULL COMMENT \"\",\n" +
+                "  `decimal_value` decimal(10, 5) NULL COMMENT \"\",\n" +
+                "  `varchar_value` varchar(255) NULL COMMENT \"\"\n" +
+                ") ENGINE=OLAP\n" +
+                "UNIQUE KEY(`id`)\n" +
+                "DISTRIBUTED BY HASH(`id`) BUCKETS 10\n" +
+                "PROPERTIES (\n" +
+                "\"compression\" = \"LZ4\",\n" +
+                "\"fast_schema_evolution\" = \"true\",\n" +
+                "\"replicated_storage\" = \"true\",\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
+        starRocksAssert.withTable("CREATE TABLE `test_agg_group_multi_unique_key` (\n" +
+                "  `id` int(11) NOT NULL COMMENT \"\",\n" +
+                "  `big_value` bigint(20) NULL COMMENT \"\",\n" +
+                "  `double_value` double NULL COMMENT \"\",\n" +
+                "  `decimal_value` decimal(10, 5) NULL COMMENT \"\",\n" +
+                "  `varchar_value` varchar(255) NULL COMMENT \"\"\n" +
+                ") ENGINE=OLAP\n" +
+                "UNIQUE KEY(`id`, `big_value`)\n" +
+                "DISTRIBUTED BY HASH(`id`) BUCKETS 10\n" +
+                "PROPERTIES (\n" +
+                "\"compression\" = \"LZ4\",\n" +
+                "\"fast_schema_evolution\" = \"true\",\n" +
+                "\"replicated_storage\" = \"true\",\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
         connectContext.getGlobalStateMgr().setStatisticStorage(new MockTpchStatisticStorage(connectContext, 1));
-        GlobalStateMgr.getCurrentAnalyzeMgr().getBasicStatsMetaMap().clear();
+        GlobalStateMgr.getCurrentState().getAnalyzeMgr().getBasicStatsMetaMap().clear();
+
+        connectContext.getSessionVariable().setMaxTransformReorderJoins(8);
+        connectContext.getSessionVariable().setEnableReplicationJoin(false);
+        connectContext.getSessionVariable().setEnableLocalShuffleAgg(false);
+        connectContext.getSessionVariable().setCboPushDownAggregateMode(-1);
+        connectContext.getSessionVariable().setEnableLowCardinalityOptimize(false);
+        connectContext.getSessionVariable().setEnableShortCircuit(true);
+        connectContext.getSessionVariable().setCboPushDownGroupingSet(false);
     }
 
     @AfterClass
     public static void afterClass() {
         connectContext.getSessionVariable().setEnableLowCardinalityOptimize(true);
         connectContext.getSessionVariable().setEnableLocalShuffleAgg(true);
+        connectContext.getSessionVariable().setCboPushDownGroupingSet(true);
     }
 
-    public static void assertContains(String text, String... pattern) {
-        for (String s : pattern) {
-            Assert.assertTrue(text, text.contains(s));
-        }
+    // NOTE: for JUnit 5
+    @BeforeAll
+    public static void beforeAll() throws Exception {
+        beforeClass();
     }
 
-    public void assertCContains(String text, String... pattern) {
-        try {
-            for (String s : pattern) {
-                Assert.assertTrue(text, text.contains(s));
-            }
-        } catch (Error error) {
-            collector.addError(error);
-        }
+    // NOTE: for JUnit 5
+    @AfterAll
+    public static void afterAll() throws Exception {
+        afterClass();
     }
 
-    public static void assertNotContains(String text, String pattern) {
-        Assert.assertFalse(text, text.contains(pattern));
-    }
-
-    public static void setTableStatistics(OlapTable table, long rowCount) {
-        for (Partition partition : table.getAllPartitions()) {
-            partition.getBaseIndex().setRowCount(rowCount);
-        }
-    }
-
-    public static void setPartitionStatistics(OlapTable table, String partitionName, long rowCount) {
-        for (Partition partition : table.getAllPartitions()) {
-            if (partition.getName().equals(partitionName)) {
-                partition.getBaseIndex().setRowCount(rowCount);
-            }
-        }
-    }
-
-    public ExecPlan getExecPlan(String sql) throws Exception {
-        return UtFrameUtils.getPlanAndFragment(connectContext, sql).second;
-    }
-
-    public String getFragmentPlan(String sql) throws Exception {
-        return UtFrameUtils.getPlanAndFragment(connectContext, sql).second.
-                getExplainString(TExplainLevel.NORMAL);
-    }
-
-    public String getLogicalFragmentPlan(String sql) throws Exception {
-        return LogicalPlanPrinter.print(UtFrameUtils.getPlanAndFragment(
-                connectContext, sql).second.getPhysicalPlan());
-    }
-
-    public String getVerboseExplain(String sql) throws Exception {
-        return UtFrameUtils.getPlanAndFragment(connectContext, sql).second.
-                getExplainString(TExplainLevel.VERBOSE);
-    }
-
-    public String getCostExplain(String sql) throws Exception {
-        return UtFrameUtils.getPlanAndFragment(connectContext, sql).second.
-                getExplainString(TExplainLevel.COSTS);
-    }
-
-    public String getDumpString(String sql) throws Exception {
-        UtFrameUtils.getPlanAndFragment(connectContext, sql);
-        return GsonUtils.GSON.toJson(connectContext.getDumpInfo());
-    }
-
-    public String getThriftPlan(String sql) throws Exception {
-        return UtFrameUtils.getPlanThriftString(connectContext, sql);
-    }
-
-    public static int getPlanCount(String sql) throws Exception {
-        connectContext.getSessionVariable().setUseNthExecPlan(1);
-        int planCount = UtFrameUtils.getPlanAndFragment(connectContext, sql).second.getPlanCount();
-        connectContext.getSessionVariable().setUseNthExecPlan(0);
-        return planCount;
-    }
-
-
-    public String getSQLFile(String filename) {
-        String path = Objects.requireNonNull(ClassLoader.getSystemClassLoader().getResource("sql")).getPath();
-        File file = new File(path + "/" + filename + ".sql");
-
-        String sql;
-        try (BufferedReader re = new BufferedReader(new FileReader(file))) {
-            sql = re.lines().collect(Collectors.joining());
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-
-        return sql;
-    }
-
-    public void runFileUnitTest(String filename, boolean debug) {
-        String path = Objects.requireNonNull(ClassLoader.getSystemClassLoader().getResource("sql")).getPath();
-        File file = new File(path + "/" + filename + ".sql");
-
-        String mode = "";
-        String tempStr;
-        StringBuilder sql = new StringBuilder();
-        StringBuilder result = new StringBuilder();
-        StringBuilder fragment = new StringBuilder();
-        StringBuilder comment = new StringBuilder();
-        StringBuilder fragmentStatistics = new StringBuilder();
-        StringBuilder dumpInfoString = new StringBuilder();
-        StringBuilder planEnumerate = new StringBuilder();
-        StringBuilder exceptString = new StringBuilder();
-
-        boolean isDebug = debug;
-        boolean isComment = false;
-        boolean hasResult = false;
-        boolean hasFragment = false;
-        boolean hasFragmentStatistics = false;
-        boolean isDump = false;
-        boolean isEnumerate = false;
-        int planCount = -1;
-
-        File debugFile = new File(file.getPath() + ".debug");
-        BufferedWriter writer = null;
-
-        if (isDebug) {
-            try {
-                FileUtils.write(debugFile, "", StandardCharsets.UTF_8);
-                writer = new BufferedWriter(new FileWriter(debugFile, true));
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-            System.out.println("DEBUG MODE!");
-            System.out.println("DEBUG FILE: " + debugFile.getPath());
-        }
-
-        Pattern regex = Pattern.compile("\\[plan-(\\d+)]");
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            int nth = 0;
-            while ((tempStr = reader.readLine()) != null) {
-                if (tempStr.startsWith("/*")) {
-                    isComment = true;
-                    comment.append(tempStr).append("\n");
-                }
-                if (tempStr.endsWith("*/")) {
-                    isComment = false;
-                    comment.append(tempStr).append("\n");
-                    continue;
-                }
-
-                if (isComment || tempStr.startsWith("//")) {
-                    comment.append(tempStr);
-                    continue;
-                }
-
-                Matcher m = regex.matcher(tempStr);
-                if (m.find()) {
-                    isEnumerate = true;
-                    planEnumerate = new StringBuilder();
-                    mode = "enum";
-                    nth = Integer.parseInt(m.group(1));
-                    connectContext.getSessionVariable().setUseNthExecPlan(nth);
-                    continue;
-                }
-
-                switch (tempStr) {
-                    case "[debug]":
-                        isDebug = true;
-                        // will create new file
-                        if (null == writer) {
-                            writer = new BufferedWriter(new FileWriter(debugFile, true));
-                            System.out.println("DEBUG MODE!");
-                        }
-                        continue;
-                    case "[planCount]":
-                        mode = "planCount";
-                        continue;
-                    case "[sql]":
-                        sql = new StringBuilder();
-                        mode = "sql";
-                        continue;
-                    case "[result]":
-                        result = new StringBuilder();
-                        mode = "result";
-                        hasResult = true;
-                        continue;
-                    case "[fragment]":
-                        fragment = new StringBuilder();
-                        mode = "fragment";
-                        hasFragment = true;
-                        continue;
-                    case "[fragment statistics]":
-                        fragmentStatistics = new StringBuilder();
-                        mode = "fragment statistics";
-                        hasFragmentStatistics = true;
-                        continue;
-                    case "[dump]":
-                        dumpInfoString = new StringBuilder();
-                        mode = "dump";
-                        isDump = true;
-                        continue;
-                    case "[except]":
-                        exceptString = new StringBuilder();
-                        mode = "except";
-                        continue;
-                    case "[end]":
-                        Pair<String, ExecPlan> pair = null;
-                        try {
-                            pair = UtFrameUtils.getPlanAndFragment(connectContext, sql.toString());
-                        } catch (Exception ex) {
-                            if (!exceptString.toString().isEmpty()) {
-                                Assert.assertEquals(exceptString.toString(), ex.getMessage());
-                                continue;
-                            }
-                            Assert.fail("Planning failed, message: " + ex.getMessage() + ", sql: " + sql);
-                        }
-
-                        try {
-                            String fra = null;
-                            String statistic = null;
-                            String dumpStr = null;
-
-                            if (hasResult && !debug) {
-                                checkWithIgnoreTabletList(result.toString().trim(), pair.first.trim());
-                            }
-                            if (hasFragment) {
-                                fra = format(pair.second.getExplainString(TExplainLevel.NORMAL));
-                                if (!debug) {
-                                    checkWithIgnoreTabletList(fragment.toString().trim(), fra.trim());
-                                }
-                            }
-                            if (hasFragmentStatistics) {
-                                statistic = format(pair.second.getExplainString(TExplainLevel.COSTS));
-                                if (!debug) {
-                                    checkWithIgnoreTabletList(fragmentStatistics.toString().trim(), statistic.trim());
-                                }
-                            }
-                            if (isDump) {
-                                dumpStr = Stream.of(toPrettyFormat(getDumpString(sql.toString())).split("\n"))
-                                        .filter(s -> !s.contains("\"session_variables\""))
-                                        .collect(Collectors.joining("\n"));
-                                if (!debug) {
-                                    Assert.assertEquals(dumpInfoString.toString().trim(), dumpStr.trim());
-                                }
-                            }
-                            if (isDebug) {
-                                debugSQL(writer, hasResult, hasFragment, isDump, hasFragmentStatistics, nth,
-                                        sql.toString(), pair.first, fra, dumpStr, statistic, comment.toString());
-                            }
-                            if (isEnumerate) {
-                                Assert.assertEquals("plan count mismatch", planCount, pair.second.getPlanCount());
-                                checkWithIgnoreTabletList(planEnumerate.toString().trim(), pair.first.trim());
-                                connectContext.getSessionVariable().setUseNthExecPlan(0);
-                            }
-                        } catch (Error error) {
-                            collector.addError(new Throwable(nth + " plan " + "\n" + sql, error));
-                        }
-
-                        hasResult = false;
-                        hasFragment = false;
-                        hasFragmentStatistics = false;
-                        isDump = false;
-                        comment = new StringBuilder();
-                        continue;
-                }
-
-                switch (mode) {
-                    case "sql":
-                        sql.append(tempStr).append("\n");
-                        break;
-                    case "planCount":
-                        planCount = Integer.parseInt(tempStr);
-                        break;
-                    case "result":
-                        result.append(tempStr).append("\n");
-                        break;
-                    case "fragment":
-                        fragment.append(tempStr.trim()).append("\n");
-                        break;
-                    case "fragment statistics":
-                        fragmentStatistics.append(tempStr.trim()).append("\n");
-                        break;
-                    case "dump":
-                        dumpInfoString.append(tempStr).append("\n");
-                        break;
-                    case "enum":
-                        planEnumerate.append(tempStr).append("\n");
-                        break;
-                    case "except":
-                        exceptString.append(tempStr);
-                        break;
+    public static void cleanupEphemeralMVs(StarRocksAssert starRocksAssert, long startTime) throws Exception {
+        String currentDb = starRocksAssert.getCtx().getDatabase();
+        if (StringUtils.isNotEmpty(currentDb)) {
+            Database testDb = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(currentDb);
+            for (MaterializedView mv : ListUtils.emptyIfNull(testDb.getMaterializedViews())) {
+                if (startTime > 0 && mv.getCreateTime() > startTime) {
+                    starRocksAssert.dropMaterializedView(mv.getName());
+                    LOG.warn("cleanup mv after test case: {}", mv.getName());
                 }
             }
-        } catch (Exception e) {
-            System.out.println(sql);
-            e.printStackTrace();
-            Assert.fail();
-        }
-    }
-
-    public void runFileUnitTest(String filename) {
-        runFileUnitTest(filename, false);
-    }
-
-    public static String format(String result) {
-        StringBuilder sb = new StringBuilder();
-        Arrays.stream(result.split("\n")).forEach(d -> sb.append(d.trim()).append("\n"));
-        return sb.toString().trim();
-    }
-
-    private void debugSQL(BufferedWriter writer, boolean hasResult, boolean hasFragment, boolean hasDump,
-                          boolean hasStatistics, int nthPlan, String sql, String plan, String fragment, String dump,
-                          String statistic,
-                          String comment) {
-        try {
-            if (!comment.trim().isEmpty()) {
-                writer.append(comment).append("\n");
+            if (CollectionUtils.isNotEmpty(testDb.getMaterializedViews())) {
+                LOG.warn("database [{}] still contains {} materialized views",
+                        testDb.getFullName(), testDb.getMaterializedViews().size());
             }
-            if (nthPlan <= 1) {
-                writer.append("[sql]\n");
-                writer.append(sql.trim());
+        }
+    }
+
+    public static List<TScanRangeParams> collectAllScanRangeParams(DefaultCoordinator coordinator) {
+        List<TScanRangeParams> scanRangeParams = new ArrayList<>();
+        for (FragmentInstance instance : coordinator.getExecutionDAG().getInstances()) {
+            for (List<TScanRangeParams> x : instance.getNode2ScanRanges().values()) {
+                scanRangeParams.addAll(x);
             }
-
-            if (hasResult) {
-                writer.append("\n[result]\n");
-                writer.append(plan);
-            }
-            if (nthPlan > 0) {
-                writer.append("\n[plan-").append(String.valueOf(nthPlan)).append("]\n");
-                writer.append(plan);
-            }
-
-            if (hasFragment) {
-                writer.append("\n[fragment]\n");
-                writer.append(fragment.trim());
-            }
-
-            if (hasStatistics) {
-                writer.append("\n[fragment statistics]\n");
-                writer.append(statistic.trim());
-            }
-
-            if (hasDump) {
-                writer.append("\n[dump]\n");
-                writer.append(dump.trim());
-            }
-
-            writer.append("\n[end]\n\n");
-            writer.flush();
-        } catch (IOException e) {
-            e.printStackTrace();
         }
-    }
-
-    private static String toPrettyFormat(String json) {
-        JsonObject jsonObject = JsonParser.parseString(json).getAsJsonObject();
-        Gson gson = new GsonBuilder().setPrettyPrinting().create();
-        return gson.toJson(jsonObject);
-    }
-
-    /**
-     * Whether ignore explicit column ref ids when checking the expected plans.
-     */
-    protected boolean isIgnoreExplicitColRefIds() {
-        return false;
-    }
-
-    private void checkWithIgnoreTabletList(String expect, String actual) {
-        expect = Stream.of(expect.split("\n")).
-                filter(s -> !s.contains("tabletList")).collect(Collectors.joining("\n"));
-        if (isIgnoreExplicitColRefIds()) {
-            checkWithIgnoreTabletListAndColRefIds(expect, actual);
-        } else {
-            expect = Stream.of(expect.split("\n")).filter(s -> !s.contains("tabletList")).collect(Collectors.joining("\n"));
-            actual = Stream.of(actual.split("\n")).filter(s -> !s.contains("tabletList")).collect(Collectors.joining("\n"));
-            Assert.assertEquals(expect, actual);
-        }
-    }
-
-    private void checkWithIgnoreTabletListAndColRefIds(String expect, String actual) {
-        expect = Stream.of(expect.split("\n")).filter(s -> !s.contains("tabletList"))
-                .map(str -> str.replaceAll("\\d+", ""))
-                .collect(Collectors.joining("\n"));
-        actual = Stream.of(actual.split("\n")).filter(s -> !s.contains("tabletList"))
-                .map(str -> str.replaceAll("\\d+", ""))
-                .collect(Collectors.joining("\n"));
-        Assert.assertEquals(expect, actual);
-    }
-
-    protected void assertPlanContains(String sql, String... explain) throws Exception {
-        String explainString = getFragmentPlan(sql);
-
-        for (String expected : explain) {
-            Assert.assertTrue("expected is: " + expected + " but plan is \n" + explainString,
-                    StringUtils.containsIgnoreCase(explainString.toLowerCase(), expected));
-        }
-    }
-
-    protected void assertLogicalPlanContains(String sql, String... explain) throws Exception {
-        String explainString = getLogicalFragmentPlan(sql);
-
-        for (String expected : explain) {
-            Assert.assertTrue("expected is: " + expected + " but plan is \n" + explainString,
-                    StringUtils.containsIgnoreCase(explainString.toLowerCase(), expected));
-        }
-    }
-
-    protected void assertVerbosePlanContains(String sql, String... explain) throws Exception {
-        String explainString = getVerboseExplain(sql);
-
-        for (String expected : explain) {
-            Assert.assertTrue("expected is: " + expected + " but plan is \n" + explainString,
-                    StringUtils.containsIgnoreCase(explainString.toLowerCase(), expected));
-        }
-    }
-
-    protected void assertVerbosePlanNotContains(String sql, String... explain) throws Exception {
-        String explainString = getVerboseExplain(sql);
-
-        for (String expected : explain) {
-            Assert.assertFalse("expected is: " + expected + " but plan is \n" + explainString,
-                    StringUtils.containsIgnoreCase(explainString.toLowerCase(), expected));
-        }
-    }
-
-    protected void assertExceptionMessage(String sql, String message) {
-        try {
-            getFragmentPlan(sql);
-            throw new Error();
-        } catch (Exception e) {
-            Assert.assertEquals(message, e.getMessage());
-        }
-    }
-
-    public Table getTable(String t) {
-        GlobalStateMgr globalStateMgr = starRocksAssert.getCtx().getGlobalStateMgr();
-        return globalStateMgr.getDb("test").getTable(t);
-    }
-
-    public OlapTable getOlapTable(String t) {
-        return (OlapTable) getTable(t);
-    }
-
-    public static List<Pair<String, String>> zipSqlAndPlan(List<String> sqls, List<String> plans) {
-        Preconditions.checkState(sqls.size() == plans.size(), "sqls and plans should have same size");
-        List<Pair<String, String>> zips = Lists.newArrayList();
-        for (int i = 0; i < sqls.size(); i++) {
-            zips.add(Pair.create(sqls.get(i), plans.get(i)));
-        }
-        return zips;
-    }
-
-    protected static void createTables(String dirName, List<String> fileNames) {
-        getSqlList(dirName, fileNames).forEach(createTblSql -> {
-            System.out.println("create table sql:" + createTblSql);
-            try {
-                starRocksAssert.withTable(createTblSql);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-    }
-
-    protected static void createMaterializedViews(String dirName, List<String> fileNames) {
-        getSqlList(dirName, fileNames).forEach(sql -> {
-            System.out.println("create mv sql:" + sql);
-            try {
-                starRocksAssert.withMaterializedView(sql);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-    }
-
-    protected static List<String> getSqlList(String dirName, List<String> fileNames) {
-        ClassLoader loader = PlanTestBase.class.getClassLoader();
-        List<String> createTableSqlList = fileNames.stream().map(n -> {
-            System.out.println("file name:" + n);
-            try {
-                return CharStreams.toString(
-                        new InputStreamReader(
-                                Objects.requireNonNull(loader.getResourceAsStream(dirName + n + ".sql")),
-                                Charsets.UTF_8));
-            } catch (Throwable e) {
-                return null;
-            }
-        }).collect(Collectors.toList());
-        Assert.assertFalse(createTableSqlList.contains(null));
-        return createTableSqlList;
-    }
-
-    public static String getFileContent(String fileName) throws Exception {
-        ClassLoader loader = MaterializedViewTPCHTest.class.getClassLoader();
-        System.out.println("file name:" + fileName);
-        String content = "";
-        try {
-            content = CharStreams.toString(
-                    new InputStreamReader(
-                            Objects.requireNonNull(loader.getResourceAsStream(fileName)),
-                            Charsets.UTF_8));
-        } catch (Throwable e) {
-            throw e;
-        }
-        return content;
-    }
-
-    protected static void executeSqlFile(String fileName) throws Exception {
-        String sql = getFileContent(fileName);
-        List<StatementBase> statements = SqlParser.parse(sql, connectContext.getSessionVariable().getSqlMode());
-        for (StatementBase stmt : statements) {
-            StmtExecutor stmtExecutor = new StmtExecutor(connectContext, stmt);
-            stmtExecutor.execute();
-            Assert.assertEquals("", connectContext.getState().getErrorMessage());
-        }
+        // remove empty scan range introduced in incremental scan ranges feature.
+        return scanRangeParams.stream().filter(x -> !(x.isSetEmpty() && x.isEmpty())).collect(Collectors.toList());
     }
 }

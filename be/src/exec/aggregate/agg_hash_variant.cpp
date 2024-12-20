@@ -17,6 +17,8 @@
 #include <type_traits>
 #include <variant>
 
+#include "util/phmap/phmap.h"
+
 namespace starrocks {
 
 namespace detail {
@@ -214,9 +216,18 @@ size_t AggHashMapVariant::size() const {
     });
 }
 
+bool AggHashMapVariant::need_expand(size_t increasement) const {
+    size_t capacity = this->capacity();
+    // TODO: think about two-level hashmap
+    size_t size = this->size() + increasement;
+    // see detail implement in reset_growth_left
+    return size >= capacity - capacity / 8;
+}
+
 size_t AggHashMapVariant::reserved_memory_usage(const MemPool* pool) const {
     return visit([pool](const auto& hash_map_with_key) {
-        return hash_map_with_key->hash_map.dump_bound() + pool->total_reserved_bytes();
+        size_t pool_bytes = (pool != nullptr) ? pool->total_reserved_bytes() : 0;
+        return hash_map_with_key->hash_map.dump_bound() + pool_bytes;
     });
 }
 
@@ -228,9 +239,9 @@ size_t AggHashMapVariant::allocated_memory_usage(const MemPool* pool) const {
     });
 }
 
-void AggHashSetVariant::init(RuntimeState* state, Type type_, AggStatistics* agg_stat) {
-    type = type_;
-    switch (type_) {
+void AggHashSetVariant::init(RuntimeState* state, Type type, AggStatistics* agg_stat) {
+    _type = type;
+    switch (_type) {
 #define M(NAME)                                                                                                    \
     case Type::NAME:                                                                                               \
         hash_set_with_key = std::make_unique<detail::AggHashSetVariantTypeTraits<Type::NAME>::HashSetWithKeyType>( \
@@ -242,7 +253,7 @@ void AggHashSetVariant::init(RuntimeState* state, Type type_, AggStatistics* agg
 }
 
 #define CONVERT_TO_TWO_LEVEL_SET(DST, SRC)                                                                            \
-    if (type == AggHashSetVariant::Type::SRC) {                                                                       \
+    if (_type == AggHashSetVariant::Type::SRC) {                                                                      \
         auto dst = std::make_unique<detail::AggHashSetVariantTypeTraits<Type::DST>::HashSetWithKeyType>(              \
                 state->chunk_size());                                                                                 \
         std::visit(                                                                                                   \
@@ -254,7 +265,7 @@ void AggHashSetVariant::init(RuntimeState* state, Type type_, AggStatistics* agg
                     }                                                                                                 \
                 },                                                                                                    \
                 hash_set_with_key);                                                                                   \
-        type = AggHashSetVariant::Type::DST;                                                                          \
+        _type = AggHashSetVariant::Type::DST;                                                                         \
         hash_set_with_key = std::move(dst);                                                                           \
         return;                                                                                                       \
     }
@@ -283,9 +294,17 @@ size_t AggHashSetVariant::size() const {
     });
 }
 
+bool AggHashSetVariant::need_expand(size_t increasement) const {
+    size_t capacity = this->capacity();
+    size_t size = this->size() + increasement;
+    // see detail implement in reset_growth_left
+    return size >= capacity - capacity / 8;
+}
+
 size_t AggHashSetVariant::reserved_memory_usage(const MemPool* pool) const {
     return visit([&](auto& hash_set_with_key) {
-        return hash_set_with_key->hash_set.dump_bound() + pool->total_reserved_bytes();
+        size_t pool_bytes = pool != nullptr ? pool->total_reserved_bytes() : 0;
+        return hash_set_with_key->hash_set.dump_bound() + pool_bytes;
     });
 }
 

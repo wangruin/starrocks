@@ -35,6 +35,7 @@
 namespace cpp starrocks
 namespace java com.starrocks.thrift
 
+include "CloudConfiguration.thrift"
 include "Exprs.thrift"
 include "Types.thrift"
 include "Descriptors.thrift"
@@ -50,14 +51,29 @@ enum TDataSinkType {
     OLAP_TABLE_SINK,
     MEMORY_SCRATCH_SINK,
     MULTI_CAST_DATA_STREAM_SINK,
-    SCHEMA_TABLE_SINK
+    SCHEMA_TABLE_SINK,
+    ICEBERG_TABLE_SINK,
+    HIVE_TABLE_SINK,
+    TABLE_FUNCTION_TABLE_SINK,
+    BLACKHOLE_TABLE_SINK,
+    DICTIONARY_CACHE_SINK,
+    MULTI_OLAP_TABLE_SINK
 }
 
 enum TResultSinkType {
     MYSQL_PROTOCAL,
     FILE,
     STATISTIC,
-    VARIABLE
+    VARIABLE,
+    HTTP_PROTOCAL,
+    METADATA_ICEBERG,
+    CUSTOMIZED,
+    ARROW_FLIGHT_PROTOCAL
+}
+
+enum TResultSinkFormatType {
+    JSON,
+    OTHERS
 }
 
 struct TParquetOptions {
@@ -96,7 +112,10 @@ struct TPlanFragmentDestination {
   1: required Types.TUniqueId fragment_instance_id
 
   // ... which is being executed on this server
-  2: required Types.TNetworkAddress server
+
+  // 'deprecated_server' changed from required to optional in version 3.2
+  // can be removed in version 4.0
+  2: optional Types.TNetworkAddress deprecated_server
   3: optional Types.TNetworkAddress brpc_server
 
   4: optional i32 pipeline_driver_sequence
@@ -139,6 +158,8 @@ struct TMultiCastDataStreamSink {
 struct TResultSink {
     1: optional TResultSinkType type;
     2: optional TResultFileSinkOptions file_options;
+    3: optional TResultSinkFormatType format;
+    4: optional bool is_binary_row;
 }
 
 struct TMysqlTableSink {
@@ -171,6 +192,15 @@ struct TExportSink {
     30: optional string file_name_prefix
 }
 
+struct TDictionaryCacheSink {
+    1: optional list<Types.TNetworkAddress> nodes
+    2: optional i64 dictionary_id
+    3: optional i64 txn_id
+    4: optional Descriptors.TOlapTableSchemaParam schema
+    5: optional i64 memory_limit
+    6: optional i32 key_size
+}
+
 struct TOlapTableSink {
     1: required Types.TUniqueId load_id
     2: required i64 txn_id
@@ -194,13 +224,49 @@ struct TOlapTableSink {
     20: optional string merge_condition
     21: optional bool null_expr_in_auto_increment
     22: optional bool miss_auto_increment_column
-    23: optional bool abort_delete
-    24: optional i32 auto_increment_slot_id;
+    23: optional bool abort_delete // Deprecated
+    24: optional i32 auto_increment_slot_id
+    25: optional Types.TPartialUpdateMode partial_update_mode
+    26: optional string label
+    // enable colocated for sync mv 
+    27: optional bool enable_colocate_mv_index 
+    28: optional i64 automatic_bucket_size
+    29: optional bool write_txn_log
+    30: optional bool ignore_out_of_partition
+    31: optional binary encryption_meta;
+    32: optional bool dynamic_overwrite
 }
 
 struct TSchemaTableSink {
     1: optional string table
     2: optional Descriptors.TNodesInfo nodes_info
+}
+
+struct TIcebergTableSink {
+    1: optional string location
+    2: optional string file_format
+    3: optional i64 target_table_id
+    4: optional Types.TCompressionType compression_type
+    5: optional bool is_static_partition_sink
+    6: optional CloudConfiguration.TCloudConfiguration cloud_configuration
+    7: optional i64 target_max_file_size
+}
+
+struct THiveTableSink {
+    1: optional string staging_dir
+    2: optional string file_format
+    3: optional list<string> data_column_names
+    4: optional list<string> partition_column_names
+    5: optional Types.TCompressionType compression_type
+    6: optional bool is_static_partition_sink
+    7: optional CloudConfiguration.TCloudConfiguration cloud_configuration
+    8: optional i64 target_max_file_size
+    9: optional Descriptors.TTextFileDesc text_file_desc // for textfile format
+}
+
+struct TTableFunctionTableSink {
+    1: optional Descriptors.TTableFunctionTable target_table
+    2: optional CloudConfiguration.TCloudConfiguration cloud_configuration
 }
 
 struct TDataSink {
@@ -213,23 +279,10 @@ struct TDataSink {
   8: optional TMemoryScratchSink memory_scratch_sink
   9: optional TMultiCastDataStreamSink multi_cast_stream_sink
   10: optional TSchemaTableSink schema_table_sink
-}
-
-struct TIcebergColumnStats {
-    1: optional map<i32, i64> columnSizes
-    2: optional map<i32, i64> valueCounts
-    3: optional map<i32, i64> nullValueCounts
-    4: optional map<i32, i64> nanValueCounts
-    5: optional map<i32, binary> lowerBounds;
-    6: optional map<i32, binary> upperBounds;
-}
-
-struct TIcebergDataFile {
-    1: optional string path
-    2: optional string format
-    3: optional i64 record_count
-    4: optional i64 file_size_in_bytes
-    5: optional string partition_path;
-    6: optional list<i64> split_offsets;
-    7: optional TIcebergColumnStats column_stats;
+  11: optional TIcebergTableSink iceberg_table_sink
+  12: optional THiveTableSink hive_table_sink
+  13: optional TTableFunctionTableSink table_function_table_sink
+  14: optional TDictionaryCacheSink dictionary_cache_sink
+  15: optional list<TDataSink> multi_olap_table_sinks
+  16: optional i64 sink_id
 }

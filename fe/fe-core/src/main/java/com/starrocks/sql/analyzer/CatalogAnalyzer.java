@@ -16,10 +16,13 @@ package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.connector.ConnectorType;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.AlterCatalogStmt;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.DropCatalogStmt;
+import com.starrocks.sql.ast.ModifyTablePropertiesClause;
 import com.starrocks.sql.ast.SetCatalogStmt;
 import com.starrocks.sql.ast.ShowStmt;
 import com.starrocks.sql.ast.StatementBase;
@@ -27,7 +30,6 @@ import com.starrocks.sql.ast.UseCatalogStmt;
 
 import java.util.Map;
 
-import static com.starrocks.connector.ConnectorMgr.SUPPORT_CONNECTOR_TYPE;
 import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.isResourceMappingCatalog;
 import static com.starrocks.sql.ast.CreateCatalogStmt.TYPE;
 
@@ -40,7 +42,7 @@ public class CatalogAnalyzer {
         new CatalogAnalyzerVisitor().visit(stmt, session);
     }
 
-    static class CatalogAnalyzerVisitor extends AstVisitor<Void, ConnectContext> {
+    static class CatalogAnalyzerVisitor implements AstVisitor<Void, ConnectContext> {
         public void analyze(ShowStmt statement, ConnectContext session) {
             visit(statement, session);
         }
@@ -55,7 +57,9 @@ public class CatalogAnalyzer {
             FeNameFormat.checkCatalogName(catalogName);
 
             if (catalogName.equals(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)) {
-                throw new SemanticException("External catalog name can't be the same as internal catalog name 'default'");
+                throw new SemanticException(
+                        String.format("External catalog name can't be the same as internal catalog name '%s'",
+                                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME));
             }
             Map<String, String> properties = statement.getProperties();
             String catalogType = properties.get(TYPE);
@@ -63,7 +67,7 @@ public class CatalogAnalyzer {
                 throw new SemanticException("'type' can not be null or empty");
             }
             statement.setCatalogType(catalogType);
-            if (!SUPPORT_CONNECTOR_TYPE.contains(catalogType)) {
+            if (!ConnectorType.isSupport(catalogType)) {
                 throw new SemanticException("[type : %s] is not supported", catalogType);
             }
             return null;
@@ -111,6 +115,22 @@ public class CatalogAnalyzer {
             }
 
             FeNameFormat.checkCatalogName(statement.getCatalogName());
+            return null;
+        }
+
+        @Override
+        public Void visitAlterCatalogStatement(AlterCatalogStmt statement, ConnectContext context) {
+            if (statement.getAlterClause() instanceof ModifyTablePropertiesClause) {
+                ModifyTablePropertiesClause modifyTablePropertiesClause =
+                        (ModifyTablePropertiesClause) statement.getAlterClause();
+                Map<String, String> properties = modifyTablePropertiesClause.getProperties();
+
+                for (Map.Entry<String, String> property : properties.entrySet()) {
+                    if (!property.getKey().equals("ranger.plugin.hive.service.name")) {
+                        throw new SemanticException("Not support alter catalog property " + property.getKey());
+                    }
+                }
+            }
             return null;
         }
     }

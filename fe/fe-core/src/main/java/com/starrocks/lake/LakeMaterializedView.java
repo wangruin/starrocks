@@ -18,11 +18,16 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.staros.proto.FileCacheInfo;
 import com.staros.proto.FilePathInfo;
+import com.starrocks.alter.AlterJobV2Builder;
+import com.starrocks.catalog.CatalogUtils;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DistributionInfo;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.MaterializedIndex;
+import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.MaterializedView;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.TableProperty;
 import com.starrocks.common.io.DeepCopy;
@@ -35,7 +40,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
@@ -44,50 +48,49 @@ import java.util.Map;
 
 /**
  * Metadata for StarRocks lake materialized view
+ * todo: Rename to CloudNativeMaterializedView
  */
 public class LakeMaterializedView extends MaterializedView {
 
     private static final Logger LOG = LogManager.getLogger(LakeMaterializedView.class);
 
+    public LakeMaterializedView() {
+        this.type = TableType.CLOUD_NATIVE_MATERIALIZED_VIEW;
+    }
+
     public LakeMaterializedView(long id, long dbId, String mvName, List<Column> baseSchema, KeysType keysType,
                                 PartitionInfo partitionInfo, DistributionInfo defaultDistributionInfo,
                                 MvRefreshScheme refreshScheme) {
         super(id, dbId, mvName, baseSchema, keysType, partitionInfo, defaultDistributionInfo, refreshScheme);
-        this.type = TableType.LAKE_MATERIALIZED_VIEW;
+        this.type = TableType.CLOUD_NATIVE_MATERIALIZED_VIEW;
     }
 
-    private FilePathInfo getDefaultFilePathInfo() {
-        return tableProperty.getStorageInfo().getFilePathInfo();
-    }
-
-    @Override
-    public String getStoragePath() {
-        return getDefaultFilePathInfo().getFullPath();
-    }
-
-    @Override
-    public FilePathInfo getPartitionFilePathInfo() {
-        return getDefaultFilePathInfo();
+    public LakeMaterializedView(Database db, String mvName,
+                            MaterializedIndexMeta indexMeta, OlapTable baseTable,
+                            PartitionInfo partitionInfo, DistributionInfo distributionInfo,
+                            MvRefreshScheme refreshScheme) {
+        super(db, mvName, indexMeta, baseTable, partitionInfo, distributionInfo, refreshScheme);
+        this.type = TableType.CLOUD_NATIVE_MATERIALIZED_VIEW;
     }
 
     @Override
     public FileCacheInfo getPartitionFileCacheInfo(long partitionId) {
         FileCacheInfo cacheInfo = null;
-        StorageCacheInfo storageCacheInfo = partitionInfo.getStorageCacheInfo(partitionId);
-        if (storageCacheInfo == null) {
+        DataCacheInfo dataCacheInfo = partitionInfo.getDataCacheInfo(partitionId);
+        if (dataCacheInfo == null) {
             cacheInfo = tableProperty.getStorageInfo().getCacheInfo();
         } else {
-            cacheInfo = storageCacheInfo.getCacheInfo();
+            cacheInfo = dataCacheInfo.getCacheInfo();
         }
         return cacheInfo;
     }
 
     @Override
-    public void setStorageInfo(FilePathInfo pathInfo, StorageCacheInfo storageCacheInfo) {
+    public void setStorageInfo(FilePathInfo pathInfo, DataCacheInfo dataCacheInfo) {
         if (tableProperty == null) {
             tableProperty = new TableProperty(new HashMap<>());
         }
-        tableProperty.setStorageInfo(new StorageInfo(pathInfo, storageCacheInfo.getCacheInfo()));
+        tableProperty.setStorageInfo(new StorageInfo(pathInfo, dataCacheInfo.getCacheInfo()));
     }
 
     @Override
@@ -108,16 +111,23 @@ public class LakeMaterializedView extends MaterializedView {
     }
 
     @Override
-    public void write(DataOutput out) throws IOException {
-        // write type first
-        Text.writeString(out, type.name());
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
+    public boolean isDeleteRetryable() {
+        return true;
     }
 
     @Override
-    public Runnable delete(boolean replay) {
-        GlobalStateMgr.getCurrentState().getLocalMetastore().onEraseTable(this, replay);
-        return replay ? null : new DeleteLakeTableTask(this);
+    public boolean delete(long dbId, boolean replay) {
+        return LakeTableHelper.deleteTable(dbId, this, replay);
+    }
+
+    @Override
+    public boolean deleteFromRecycleBin(long dbId, boolean replay) {
+        return LakeTableHelper.deleteTableFromRecycleBin(dbId, this, replay);
+    }
+
+    @Override
+    public AlterJobV2Builder alterTable() {
+        return LakeTableHelper.alterTable(this);
     }
 
     @Override
@@ -126,13 +136,9 @@ public class LakeMaterializedView extends MaterializedView {
         if (tableProperty != null) {
             StorageInfo storageInfo = tableProperty.getStorageInfo();
             if (storageInfo != null) {
-                // enable_storage_cache
-                properties.put(PropertyAnalyzer.PROPERTIES_ENABLE_STORAGE_CACHE,
-                        String.valueOf(storageInfo.isEnableStorageCache()));
-
-                // storage_cache_ttl
-                properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_CACHE_TTL,
-                        String.valueOf(storageInfo.getStorageCacheTtlS()));
+                // datacache.enable
+                properties.put(PropertyAnalyzer.PROPERTIES_DATACACHE_ENABLE,
+                        String.valueOf(storageInfo.isEnableDataCache()));
 
                 // enable_async_write_back
                 properties.put(PropertyAnalyzer.PROPERTIES_ENABLE_ASYNC_WRITE_BACK,
@@ -148,20 +154,20 @@ public class LakeMaterializedView extends MaterializedView {
 
         Map<String, String> storageProperties = getProperties();
 
-        // enable_storage_cache
+        // datacache.enable
         sb.append(StatsConstants.TABLE_PROPERTY_SEPARATOR)
-                .append(PropertyAnalyzer.PROPERTIES_ENABLE_STORAGE_CACHE).append("\" = \"");
-        sb.append(storageProperties.get(PropertyAnalyzer.PROPERTIES_ENABLE_STORAGE_CACHE)).append("\"");
-
-        // storage_cache_ttl
-        sb.append(StatsConstants.TABLE_PROPERTY_SEPARATOR)
-                .append(PropertyAnalyzer.PROPERTIES_STORAGE_CACHE_TTL).append("\" = \"");
-        sb.append(storageProperties.get(PropertyAnalyzer.PROPERTIES_STORAGE_CACHE_TTL)).append("\"");
+                .append(PropertyAnalyzer.PROPERTIES_DATACACHE_ENABLE).append("\" = \"");
+        sb.append(storageProperties.get(PropertyAnalyzer.PROPERTIES_DATACACHE_ENABLE)).append("\"");
 
         // allow_sync_write_back
         sb.append(StatsConstants.TABLE_PROPERTY_SEPARATOR)
                 .append(PropertyAnalyzer.PROPERTIES_ENABLE_ASYNC_WRITE_BACK).append("\" = \"");
         sb.append(storageProperties.get(PropertyAnalyzer.PROPERTIES_ENABLE_ASYNC_WRITE_BACK)).append("\"");
+
+        // storage_volume
+        String volume = GlobalStateMgr.getCurrentState().getStorageVolumeMgr().getStorageVolumeNameOfTable(id);
+        sb.append(StatsConstants.TABLE_PROPERTY_SEPARATOR).append(
+                PropertyAnalyzer.PROPERTIES_STORAGE_VOLUME).append("\" = \"").append(volume).append("\"");
     }
 
     @Override
@@ -170,5 +176,21 @@ public class LakeMaterializedView extends MaterializedView {
             return comment;
         }
         return TableType.MATERIALIZED_VIEW.name();
+    }
+
+    @Override
+    public String getDisplayComment() {
+        if (!Strings.isNullOrEmpty(comment)) {
+            return CatalogUtils.addEscapeCharacter(comment);
+        }
+        return TableType.MATERIALIZED_VIEW.name();
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        super.gsonPostProcess();
+        if (getMaxColUniqueId() <= 0) {
+            setMaxColUniqueId(LakeTableHelper.restoreColumnUniqueId(this));
+        }
     }
 }

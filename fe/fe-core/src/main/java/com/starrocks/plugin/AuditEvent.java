@@ -34,8 +34,12 @@
 
 package com.starrocks.plugin;
 
+import com.google.common.base.Joiner;
+import com.starrocks.server.WarehouseManager;
+
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.util.List;
 
 /*
  * AuditEvent contains all information about audit log info.
@@ -117,12 +121,27 @@ public class AuditEvent {
     public double planMemCosts = -1;
     @AuditField(value = "PendingTimeMs")
     public long pendingTimeMs = -1;
+    @AuditField(value = "Slots")
+    public int numSlots = -1;
     @AuditField(value = "BigQueryLogCPUSecondThreshold")
     public long bigQueryLogCPUSecondThreshold = -1;
     @AuditField(value = "BigQueryLogScanBytesThreshold")
     public long bigQueryLogScanBytesThreshold = -1;
     @AuditField(value = "BigQueryLogScanRowsThreshold")
     public long bigQueryLogScanRowsThreshold = -1;
+    @AuditField(value = "SpilledBytes", ignore_zero = true)
+    public long spilledBytes = -1;
+    @AuditField(value = "Warehouse")
+    public String warehouse = WarehouseManager.DEFAULT_WAREHOUSE_NAME;
+
+    // Materialized View usage info
+    @AuditField(value = "CandidateMVs", ignore_zero = true)
+    public String candidateMvs;
+    @AuditField(value = "HitMvs", ignore_zero = true)
+    public String hitMVs;
+
+    @AuditField(value = "IsForwardToLeader")
+    public boolean isForwardToLeader = false;
 
     public static class AuditEventBuilder {
 
@@ -218,6 +237,16 @@ public class AuditEvent {
             return this;
         }
 
+        public AuditEventBuilder setSpilledBytes(long spilledBytes) {
+            auditEvent.spilledBytes = spilledBytes;
+            return this;
+        }
+
+        public AuditEventBuilder setWarehouse(String warehouse) {
+            auditEvent.warehouse = warehouse;
+            return this;
+        }
+
         public AuditEventBuilder setStmtId(long stmtId) {
             auditEvent.stmtId = stmtId;
             return this;
@@ -263,6 +292,11 @@ public class AuditEvent {
             return this;
         }
 
+        public AuditEventBuilder setNumSlots(int numSlots) {
+            auditEvent.numSlots = numSlots;
+            return this;
+        }
+
         public AuditEventBuilder setBigQueryLogCPUSecondThreshold(long bigQueryLogCPUSecondThreshold) {
             auditEvent.bigQueryLogCPUSecondThreshold = bigQueryLogCPUSecondThreshold;
             return this;
@@ -275,6 +309,25 @@ public class AuditEvent {
 
         public AuditEventBuilder setBigQueryLogScanRowsThreshold(long bigQueryLogScanRowsThreshold) {
             auditEvent.bigQueryLogScanRowsThreshold = bigQueryLogScanRowsThreshold;
+            return this;
+        }
+
+        public AuditEventBuilder setCandidateMvs(List<String> mvs) {
+            this.auditEvent.candidateMvs = Joiner.on(",").join(mvs);
+            return this;
+        }
+
+        public AuditEventBuilder setHitMvs(List<String> mvs) {
+            this.auditEvent.hitMVs = Joiner.on(",").join(mvs);
+            return this;
+        }
+
+        public String getHitMvs() {
+            return this.auditEvent.hitMVs;
+        }
+
+        public AuditEventBuilder setIsForwardToLeader(boolean isForwardToLeader) {
+            auditEvent.isForwardToLeader = isForwardToLeader;
             return this;
         }
 

@@ -18,7 +18,12 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/testutil")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/testutil")
 
 add_library(TestUtil
+    assert.cpp
     desc_tbl_builder.cc
     function_utils.cpp
+    sync_point.cc
+    sync_point_impl.cc
+    schema_test_helper.cpp
+    tablet_test_helper.cpp
 )
 

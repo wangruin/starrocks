@@ -14,18 +14,24 @@
 
 #include "connector/file_connector.h"
 
+#include "exec/avro_scanner.h"
 #include "exec/csv_scanner.h"
 #include "exec/exec_node.h"
 #include "exec/json_scanner.h"
 #include "exec/orc_scanner.h"
 #include "exec/parquet_scanner.h"
 #include "exprs/expr.h"
+#include "file_chunk_sink.h"
 
 namespace starrocks::connector {
 
 DataSourceProviderPtr FileConnector::create_data_source_provider(ConnectorScanNode* scan_node,
                                                                  const TPlanNode& plan_node) const {
     return std::make_unique<FileDataSourceProvider>(scan_node, plan_node);
+}
+
+std::unique_ptr<ConnectorChunkSinkProvider> FileConnector::create_data_sink_provider() const {
+    return std::make_unique<FileChunkSinkProvider>();
 }
 
 // ================================
@@ -35,6 +41,10 @@ FileDataSourceProvider::FileDataSourceProvider(ConnectorScanNode* scan_node, con
 
 DataSourcePtr FileDataSourceProvider::create_data_source(const TScanRange& scan_range) {
     return std::make_unique<FileDataSource>(this, scan_range);
+}
+
+const TupleDescriptor* FileDataSourceProvider::tuple_descriptor(RuntimeState* state) const {
+    return state->desc_tbl().get_tuple_descriptor(_file_scan_node.tuple_id);
 }
 
 // ================================
@@ -52,6 +62,10 @@ FileDataSource::FileDataSource(const FileDataSourceProvider* provider, const TSc
     }
 }
 
+std::string FileDataSource::name() const {
+    return "FileDataSource";
+}
+
 Status FileDataSource::open(RuntimeState* state) {
     DCHECK(state != nullptr);
     RETURN_IF_CANCELLED(state);
@@ -67,6 +81,11 @@ Status FileDataSource::_create_scanner() {
     if (_scan_range.ranges.empty()) {
         return Status::EndOfFile("scan range is empty");
     }
+    if (_runtime_state->enable_log_rejected_record() &&
+        _scan_range.ranges[0].format_type != TFileFormatType::FORMAT_CSV_PLAIN &&
+        _scan_range.ranges[0].format_type != TFileFormatType::FORMAT_JSON) {
+        return Status::InternalError("only support csv/json format to log rejected record");
+    }
     // create scanner object and open
     if (_scan_range.ranges[0].format_type == TFileFormatType::FORMAT_ORC) {
         _scanner = std::make_unique<ORCScanner>(_runtime_state, _runtime_profile, _scan_range, &_counter);
@@ -75,9 +94,7 @@ Status FileDataSource::_create_scanner() {
     } else if (_scan_range.ranges[0].format_type == TFileFormatType::FORMAT_JSON) {
         _scanner = std::make_unique<JsonScanner>(_runtime_state, _runtime_profile, _scan_range, &_counter);
     } else if (_scan_range.ranges[0].format_type == TFileFormatType::FORMAT_AVRO) {
-        // TODO(yangzaorang): we use json as an intermediate format to parse avro format, but there are
-        // performance issues here, and we could directly parse avro format data later.
-        _scanner = std::make_unique<JsonScanner>(_runtime_state, _runtime_profile, _scan_range, &_counter);
+        _scanner = std::make_unique<AvroScanner>(_runtime_state, _runtime_profile, _scan_range, &_counter);
     } else {
         _scanner = std::make_unique<CSVScanner>(_runtime_state, _runtime_profile, _scan_range, &_counter);
     }
@@ -96,7 +113,6 @@ void FileDataSource::close(RuntimeState* state) {
     if (_scanner != nullptr) {
         _scanner->close();
     }
-    Expr::close(_conjunct_ctxs, state);
 }
 
 Status FileDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
@@ -120,12 +136,8 @@ Status FileDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
 
         size_t before_rows = (*chunk)->num_rows();
 
-        const TQueryOptions& query_options = state->query_options();
-        if (query_options.__isset.load_job_type && query_options.load_job_type == TLoadJobType::BROKER) {
-            size_t before_size = (*chunk)->bytes_usage();
-            state->update_num_rows_load_from_source(before_rows);
-            state->update_num_bytes_load_from_source(before_size);
-        }
+        state->update_num_rows_load_from_source(before_rows);
+        state->update_num_bytes_load_from_source((*chunk)->bytes_usage());
 
         _counter.filtered_rows_read += before_rows;
         // eval conjuncts
@@ -140,6 +152,10 @@ Status FileDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
         }
     }
     return Status::OK();
+}
+
+const std::string FileDataSource::get_custom_coredump_msg() const {
+    return strings::Substitute("Load file path: $0", _scan_range.ranges[0].path);
 }
 
 int64_t FileDataSource::raw_rows_read() const {
@@ -161,13 +177,18 @@ int64_t FileDataSource::cpu_time_spent() const {
 void FileDataSource::_init_counter() {
     // Profile
     _scanner_total_timer = ADD_TIMER(_runtime_profile, "ScannerTotalTime");
-    RuntimeProfile* p = _runtime_profile->create_child("FileScanner", true, true);
-    _scanner_fill_timer = ADD_TIMER(p, "FillTime");
-    _scanner_read_timer = ADD_TIMER(p, "ReadTime");
-    _scanner_cast_chunk_timer = ADD_TIMER(p, "CastChunkTime");
-    _scanner_materialize_timer = ADD_TIMER(p, "MaterializeTime");
-    _scanner_init_chunk_timer = ADD_TIMER(p, "CreateChunkTime");
-    _scanner_file_reader_timer = ADD_TIMER(p->create_child("FilePRead", true, true), "FileReadTime");
+    {
+        static const char* prefix = "FileScanner";
+        ADD_COUNTER(_runtime_profile, prefix, TUnit::NONE);
+        RuntimeProfile* p = _runtime_profile;
+        _scanner_fill_timer = ADD_CHILD_TIMER(p, "FillTime", prefix);
+        _scanner_read_timer = ADD_CHILD_TIMER(p, "ReadTime", prefix);
+        _scanner_cast_chunk_timer = ADD_CHILD_TIMER(p, "CastChunkTime", prefix);
+        _scanner_materialize_timer = ADD_CHILD_TIMER(p, "MaterializeTime", prefix);
+        _scanner_init_chunk_timer = ADD_CHILD_TIMER(p, "CreateChunkTime", prefix);
+        _scanner_file_reader_timer = ADD_CHILD_TIMER(p, "FileReadTime", prefix);
+        _scanner_file_read_count = ADD_CHILD_COUNTER(p, "FileReadCount", TUnit::UNIT, prefix);
+    }
 }
 
 void FileDataSource::_update_counter() {
@@ -181,6 +202,7 @@ void FileDataSource::_update_counter() {
     COUNTER_UPDATE(_scanner_materialize_timer, _counter.materialize_ns);
     COUNTER_UPDATE(_scanner_init_chunk_timer, _counter.init_chunk_ns);
     COUNTER_UPDATE(_scanner_file_reader_timer, _counter.file_read_ns);
+    COUNTER_UPDATE(_scanner_file_read_count, _counter.file_read_count);
 }
 
 } // namespace starrocks::connector

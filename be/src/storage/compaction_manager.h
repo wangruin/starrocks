@@ -38,7 +38,9 @@ class CompactionManager {
 public:
     CompactionManager();
 
-    ~CompactionManager();
+    ~CompactionManager() = default;
+
+    void stop();
 
     void init_max_task_num(int32_t num);
 
@@ -53,9 +55,11 @@ public:
 
     bool pick_candidate(CompactionCandidate* candidate);
 
-    void update_tablet_async(TabletSharedPtr tablet);
+    void submit_compaction_task(const CompactionCandidate& compaction_candidate);
 
-    void update_tablet(TabletSharedPtr tablet);
+    void update_tablet_async(const TabletSharedPtr& tablet);
+
+    void update_tablet(const TabletSharedPtr& tablet);
 
     bool register_task(CompactionTask* compaction_task);
 
@@ -63,9 +67,15 @@ public:
 
     void clear_tasks();
 
+    void get_running_status(std::string* json_result);
+
     uint16_t running_tasks_num() {
         std::lock_guard lg(_tasks_mutex);
-        return _running_tasks.size();
+        size_t res = 0;
+        for (const auto& it : _running_tasks) {
+            res += it.second.size();
+        }
+        return res;
     }
 
     bool check_if_exceed_max_task_num() {
@@ -75,14 +85,21 @@ public:
             exceed = true;
         }
         std::lock_guard lg(_tasks_mutex);
-        if (_running_tasks.size() >= _max_task_num) {
+        size_t running_tasks_num = 0;
+        for (const auto& it : _running_tasks) {
+            running_tasks_num += it.second.size();
+        }
+        if (running_tasks_num >= _max_task_num) {
             VLOG(2) << "register compaction task failed for running tasks reach max limit:" << _max_task_num;
             exceed = true;
         }
         return exceed;
     }
 
-    int32_t max_task_num() { return _max_task_num; }
+    int32_t max_task_num() const {
+        std::lock_guard lg(_tasks_mutex);
+        return _max_task_num;
+    }
 
     uint16_t running_cumulative_tasks_num_for_dir(DataDir* data_dir) {
         std::lock_guard lg(_tasks_mutex);
@@ -100,6 +117,32 @@ public:
 
     Status update_max_threads(int max_threads);
 
+    int32_t compute_max_compaction_task_num() const;
+
+    void set_max_compaction_concurrency(int threads_num);
+
+    double max_score();
+
+    double last_score();
+
+    int64_t base_compaction_concurrency();
+
+    int64_t cumulative_compaction_concurrency();
+
+    bool has_running_task(const TabletSharedPtr& tablet);
+
+    void stop_compaction(const TabletSharedPtr& tablet);
+
+    bool check_compaction_disabled(const CompactionCandidate& candidate);
+
+    std::unordered_set<CompactionTask*> get_running_task(const TabletSharedPtr& tablet);
+
+    int get_waiting_task_num();
+
+    ThreadPool* TEST_get_compaction_thread_pool() { return _compaction_pool.get(); }
+
+    void disable_table_compaction(int64_t table_id, int64_t deadline);
+
 private:
     CompactionManager(const CompactionManager& compaction_manager) = delete;
     CompactionManager(CompactionManager&& compaction_manager) = delete;
@@ -108,6 +151,8 @@ private:
 
     void _dispatch_worker();
     bool _check_precondition(const CompactionCandidate& candidate);
+    bool _check_compaction_disabled(const CompactionCandidate& candidate);
+    void _set_force_cumulative(CompactionCandidate* candidate);
     void _schedule();
     void _notify();
     // wait until current running tasks are below max_concurrent_num
@@ -119,12 +164,13 @@ private:
     // protect by _mutex
     std::set<CompactionCandidate, CompactionCandidateComparator> _compaction_candidates;
 
-    std::mutex _tasks_mutex;
+    mutable std::mutex _tasks_mutex;
     std::atomic<uint64_t> _next_task_id;
-    std::unordered_set<CompactionTask*> _running_tasks;
+    std::map<int64_t, std::unordered_set<CompactionTask*>> _running_tasks;
     std::unordered_map<DataDir*, uint16_t> _data_dir_to_cumulative_task_num_map;
     std::unordered_map<DataDir*, uint16_t> _data_dir_to_base_task_num_map;
     std::unordered_map<CompactionType, uint16_t> _type_to_task_num_map;
+    std::unordered_map<int64_t, int64_t> _table_to_disable_deadline_map;
     std::unique_ptr<ThreadPool> _update_candidate_pool;
     std::mutex _dispatch_mutex;
     std::thread _dispatch_update_candidate_thread;
@@ -133,6 +179,10 @@ private:
     int32_t _max_dispatch_count = 0;
 
     int32_t _max_task_num = 0;
+    int64_t _base_compaction_concurrency = 0;
+    int64_t _cumulative_compaction_concurrency = 0;
+    double _last_score = 0;
+
     bool _disable_update_tablet = false;
 
     std::atomic<bool> _bg_worker_stopped{false};
@@ -142,6 +192,9 @@ private:
 
     std::unique_ptr<ThreadPool> _compaction_pool = nullptr;
     std::thread _scheduler_thread;
+
+    mutable std::mutex _compact_threads_mutex;
+    int32_t _max_compaction_concurrency = 0;
 };
 
 } // namespace starrocks

@@ -35,32 +35,35 @@
 package com.starrocks.persist;
 
 import com.google.common.base.Objects;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Table;
 import com.starrocks.cluster.ClusterNamespace;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.server.GlobalStateMgr;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 public class CreateTableInfo implements Writable {
     public static final Logger LOG = LoggerFactory.getLogger(CreateTableInfo.class);
 
+    @SerializedName(value = "d")
     private String dbName;
+    @SerializedName(value = "t")
     private Table table;
+    @SerializedName(value = "svId")
+    private String storageVolumeId;
 
     public CreateTableInfo() {
         // for persist
     }
 
-    public CreateTableInfo(String dbName, Table table) {
+    public CreateTableInfo(String dbName, Table table, String storageVolumeId) {
         this.dbName = dbName;
         this.table = table;
+        this.storageVolumeId = storageVolumeId;
     }
 
     public String getDbName() {
@@ -71,26 +74,14 @@ public class CreateTableInfo implements Writable {
         return table;
     }
 
+    public String getStorageVolumeId() {
+        return storageVolumeId;
+    }
+
     public void write(DataOutput out) throws IOException {
         // compatible with old version
         Text.writeString(out, ClusterNamespace.getFullName(dbName));
         table.write(out);
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_30) {
-            dbName = Text.readString(in);
-        } else {
-            dbName = ClusterNamespace.getNameFromFullName(Text.readString(in));
-        }
-
-        table = Table.read(in);
-    }
-
-    public static CreateTableInfo read(DataInput in) throws IOException {
-        CreateTableInfo createTableInfo = new CreateTableInfo();
-        createTableInfo.readFields(in);
-        return createTableInfo;
     }
 
     @Override

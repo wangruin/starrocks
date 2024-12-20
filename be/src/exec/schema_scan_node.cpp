@@ -17,8 +17,8 @@
 #include <boost/algorithm/string.hpp>
 
 #include "column/column_helper.h"
-#include "exec/pipeline/scan/olap_schema_scan_context.h"
-#include "exec/pipeline/scan/olap_schema_scan_operator.h"
+#include "exec/pipeline/scan/schema_scan_context.h"
+#include "exec/pipeline/scan/schema_scan_operator.h"
 #include "exec/schema_scanner/schema_helper.h"
 #include "runtime/runtime_state.h"
 #include "runtime/string_value.h"
@@ -44,7 +44,7 @@ SchemaScanNode::~SchemaScanNode() {
 }
 
 Status SchemaScanNode::init(const TPlanNode& tnode, RuntimeState* state) {
-    RETURN_IF_ERROR(ExecNode::init(tnode, state));
+    RETURN_IF_ERROR(ScanNode::init(tnode, state));
     if (tnode.schema_scan_node.__isset.db) {
         _scanner_param.db = _pool->add(new std::string(tnode.schema_scan_node.db));
     }
@@ -182,7 +182,7 @@ Status SchemaScanNode::open(RuntimeState* state) {
 }
 
 Status SchemaScanNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
-    VLOG(1) << "SchemaScanNode::GetNext";
+    VLOG(2) << "SchemaScanNode::GetNext";
 
     DCHECK(state != nullptr && chunk != nullptr && eos != nullptr);
     DCHECK(_is_init);
@@ -274,14 +274,14 @@ Status SchemaScanNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos)
     return Status::OK();
 }
 
-Status SchemaScanNode::close(RuntimeState* state) {
+void SchemaScanNode::close(RuntimeState* state) {
     if (is_closed()) {
-        return Status::OK();
+        return;
     }
-    exec_debug_action(TExecNodePhase::CLOSE);
+    (void)exec_debug_action(TExecNodePhase::CLOSE);
     SCOPED_TIMER(_runtime_profile->total_time_counter());
 
-    return ScanNode::close(state);
+    ScanNode::close(state);
 }
 
 void SchemaScanNode::debug_string(int indentation_level, std::stringstream* out) const {
@@ -300,16 +300,16 @@ Status SchemaScanNode::set_scan_ranges(const std::vector<TScanRangeParams>& scan
 
 std::vector<std::shared_ptr<pipeline::OperatorFactory>> SchemaScanNode::decompose_to_pipeline(
         pipeline::PipelineBuilderContext* context) {
-    // the dop of SchemaScanOperator should always be 1.
-    size_t dop = 1;
+    auto exec_group = context->find_exec_group_by_plan_node_id(_id);
+    context->set_current_execution_group(exec_group);
+    size_t dop = context->dop_of_source_operator(_id);
 
     size_t buffer_capacity = pipeline::ScanOperator::max_buffer_capacity() * dop;
-    int64_t mem_limit = runtime_state()->query_mem_tracker_ptr()->limit() * config::scan_use_query_mem_ratio;
     pipeline::ChunkBufferLimiterPtr buffer_limiter = std::make_unique<pipeline::DynamicChunkBufferLimiter>(
-            buffer_capacity, buffer_capacity, mem_limit, runtime_state()->chunk_size());
+            buffer_capacity, buffer_capacity, _mem_limit, runtime_state()->chunk_size());
 
-    auto scan_op = std::make_shared<pipeline::OlapSchemaScanOperatorFactory>(context->next_operator_id(), this, dop,
-                                                                             _tnode, std::move(buffer_limiter));
+    auto scan_op = std::make_shared<pipeline::SchemaScanOperatorFactory>(context->next_operator_id(), this, dop, _tnode,
+                                                                         std::move(buffer_limiter));
     return pipeline::decompose_scan_node_to_pipeline(scan_op, this, context);
 }
 

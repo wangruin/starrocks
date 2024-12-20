@@ -14,13 +14,17 @@
 
 package com.starrocks.sql.optimizer.statistics;
 
-import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import static java.lang.Double.NaN;
 
@@ -31,11 +35,13 @@ public class Statistics {
     // Table row count in FE depends on BE reporting，but FE may not get report from BE which just started，
     // this causes the table row count stored in FE to be inaccurate.
     private final boolean tableRowCountMayInaccurate;
+    private final Collection<ColumnRefOperator> shadowColumns;
 
     private Statistics(Builder builder) {
         this.outputRowCount = builder.outputRowCount;
         this.columnStatistics = builder.columnStatistics;
         this.tableRowCountMayInaccurate = builder.tableRowCountMayInaccurate;
+        this.shadowColumns = builder.shadowColumns;
     }
 
     public double getOutputRowCount() {
@@ -46,8 +52,15 @@ public class Statistics {
         double totalSize = 0;
         boolean nonEmpty = false;
         for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : columnStatistics.entrySet()) {
+            if (shadowColumns.contains(entry.getKey())) {
+                continue;
+            }
             if (outputColumns.contains(entry.getKey().getId())) {
-                totalSize += entry.getValue().getAverageRowSize();
+                if (!entry.getValue().isUnknown()) {
+                    totalSize += entry.getValue().getAverageRowSize();
+                } else {
+                    totalSize += entry.getKey().getType().getTypeSize();
+                }
                 nonEmpty = true;
             }
         }
@@ -58,15 +71,33 @@ public class Statistics {
     }
 
     public double getComputeSize() {
+        return getAvgRowSize() * outputRowCount;
+    }
+
+    public double getAvgRowSize() {
         // Make it at least 1 byte, otherwise the cost model would propagate estimate error
-        return Math.max(1.0, this.columnStatistics.values().stream().map(ColumnStatistic::getAverageRowSize).
-                reduce(0.0, Double::sum)) * outputRowCount;
+        double totalSize = 0;
+        for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : columnStatistics.entrySet()) {
+            if (shadowColumns.contains(entry.getKey())) {
+                continue;
+            }
+            if (!entry.getValue().isUnknown()) {
+                totalSize += entry.getValue().getAverageRowSize();
+            } else {
+                totalSize += entry.getKey().getType().getTypeSize();
+            }
+        }
+        return Math.max(totalSize, 1.0);
     }
 
     public ColumnStatistic getColumnStatistic(ColumnRefOperator column) {
-        ColumnStatistic result = columnStatistics.get(column);
-        Preconditions.checkState(result != null, "cannot find statistics of col: %s", column);
-        return result;
+        if (columnStatistics.get(column) == null) {
+            throw new StarRocksPlannerException(ErrorType.INTERNAL_ERROR,
+                    "only found column statistics: %s, but missing statistic of col: %s.",
+                    ColumnRefOperator.toString(columnStatistics.keySet()), column);
+        } else {
+            return columnStatistics.get(column);
+        }
     }
 
     public Map<ColumnRefOperator, ColumnStatistic> getColumnStatistics() {
@@ -95,8 +126,31 @@ public class Statistics {
         return usedColumns;
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        Statistics that = (Statistics) o;
+        return Double.compare(that.outputRowCount, outputRowCount) == 0
+                && tableRowCountMayInaccurate == that.tableRowCountMayInaccurate
+                && Objects.equals(columnStatistics.keySet(), that.columnStatistics.keySet());
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(outputRowCount, columnStatistics.keySet(), tableRowCountMayInaccurate);
+    }
+
     public static Builder buildFrom(Statistics other) {
-        return new Builder(other.getOutputRowCount(), other.columnStatistics, other.tableRowCountMayInaccurate);
+        return new Builder(
+                other.getOutputRowCount(),
+                other.columnStatistics,
+                other.tableRowCountMayInaccurate,
+                other.shadowColumns);
     }
 
     public static Builder builder() {
@@ -107,16 +161,25 @@ public class Statistics {
         private double outputRowCount;
         private final Map<ColumnRefOperator, ColumnStatistic> columnStatistics;
         private boolean tableRowCountMayInaccurate;
+        // columns not used to compute costs
+        // which is used by mv rewrite to make the cost accurate
+        private Collection<ColumnRefOperator> shadowColumns;
 
         public Builder() {
             this(NaN, new HashMap<>(), false);
         }
 
         private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics,
-                        boolean tableRowCountMayInaccurate) {
+                        boolean tableRowCountMayInaccurate, Collection<ColumnRefOperator> shadowColumns) {
             this.outputRowCount = outputRowCount;
             this.columnStatistics = new HashMap<>(columnStatistics);
             this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
+            this.shadowColumns = shadowColumns;
+        }
+
+        private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics,
+                        boolean tableRowCountMayInaccurate) {
+            this(outputRowCount, columnStatistics, tableRowCountMayInaccurate, Lists.newArrayList());
         }
 
         public Builder setOutputRowCount(double outputRowCount) {
@@ -133,9 +196,17 @@ public class Statistics {
             return this;
         }
 
+        public double getOutputRowCount() {
+            return outputRowCount;
+        }
+
         public Builder setTableRowCountMayInaccurate(boolean tableRowCountMayInaccurate) {
             this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
             return this;
+        }
+
+        public boolean getTableRowCountMayInaccurate() {
+            return tableRowCountMayInaccurate;
         }
 
         public Builder addColumnStatistic(ColumnRefOperator column, ColumnStatistic statistic) {
@@ -152,12 +223,18 @@ public class Statistics {
             return this.columnStatistics.get(columnRefOperator);
         }
 
-        public Builder addColumnStatisticsFromOtherStatistic(Statistics statistics, ColumnRefSet hintRefs) {
+        public Builder addColumnStatisticsFromOtherStatistic(Statistics statistics, ColumnRefSet hintRefs, boolean withHist) {
             statistics.getColumnStatistics().forEach((k, v) -> {
                 if (hintRefs.contains(k.getId())) {
-                    this.columnStatistics.put(k, v);
+                    this.columnStatistics.put(k, withHist ? v : ColumnStatistic.buildFrom(v).setHistogram(null).build());
                 }
             });
+            return this;
+        }
+
+
+        public Builder setShadowColumns(Collection<ColumnRefOperator> shadowColumns) {
+            this.shadowColumns = shadowColumns;
             return this;
         }
 

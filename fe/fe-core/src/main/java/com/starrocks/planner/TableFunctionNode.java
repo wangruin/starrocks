@@ -81,11 +81,6 @@ public class TableFunctionNode extends PlanNode {
     }
 
     @Override
-    public boolean canUsePipeLine() {
-        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
-    }
-
-    @Override
     public boolean canUseRuntimeAdaptiveDop() {
         return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
@@ -100,5 +95,10 @@ public class TableFunctionNode extends PlanNode {
         planNode.setTable_function_node(tableFunctionNode);
         planNode.setNode_type(TPlanNodeType.TABLE_FUNCTION_NODE);
         normalizeConjuncts(normalizer, planNode, conjuncts);
+    }
+
+    @Override
+    public boolean needCollectExecStats() {
+        return true;
     }
 }

@@ -97,8 +97,6 @@ public class TabletSchedulerStat {
      */
     @StatField("num of tablet priority upgraded")
     public AtomicLong counterTabletPrioUpgraded = new AtomicLong(0L);
-    @StatField("num of tablet priority downgraded")
-    public AtomicLong counterTabletPrioDowngraded = new AtomicLong(0L);
 
     /*
      * Clone task related
@@ -121,6 +119,8 @@ public class TabletSchedulerStat {
     public AtomicLong counterReplicaVersionMissingErr = new AtomicLong(0L);
     @StatField("num of replica unavailable error")
     public AtomicLong counterReplicaUnavailableErr = new AtomicLong(0L);
+    @StatField("num of replica location mismatch error")
+    public AtomicLong counterReplicaLocMismatchErr = new AtomicLong(0L);
     @StatField("num of replica redundant error")
     public AtomicLong counterReplicaRedundantErr = new AtomicLong(0L);
     @StatField("num of replica missing in cluster error")
@@ -153,7 +153,7 @@ public class TabletSchedulerStat {
                 ((AtomicLong) field.get(lastSnapshot)).set(((AtomicLong) field.get(this)).get());
             }
         } catch (ClassNotFoundException | IllegalArgumentException | IllegalAccessException e) {
-            LOG.warn(e);
+            LOG.warn("Failed to execute snapshot", e);
             lastSnapshot = null;
         }
     }
@@ -178,7 +178,7 @@ public class TabletSchedulerStat {
                 result.add(info);
             }
         } catch (ClassNotFoundException | IllegalArgumentException | IllegalAccessException e) {
-            LOG.warn(e);
+            LOG.warn("Failed to execute getBrief", e);
             return Lists.newArrayList();
         }
         return result;
@@ -204,23 +204,11 @@ public class TabletSchedulerStat {
                 sb.append(current).append(" (+").append(current - last).append(")\n");
             }
         } catch (ClassNotFoundException | IllegalArgumentException | IllegalAccessException e) {
-            LOG.warn(e);
+            LOG.warn("Failed to execute incrementalBrief", e);
             return "";
         }
 
         snapshot();
         return sb.toString();
-    }
-
-    // for test
-    public static void main(String[] args) {
-        TabletSchedulerStat stat = new TabletSchedulerStat();
-
-        stat.counterCloneTask.addAndGet(300);
-        System.out.println(stat.incrementalBrief());
-
-        stat.counterCloneTask.addAndGet(3);
-        stat.counterTabletChecked.incrementAndGet();
-        System.out.println(stat.incrementalBrief());
     }
 }

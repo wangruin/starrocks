@@ -16,12 +16,14 @@
 package com.starrocks.scheduler;
 
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.authentication.AuthenticationManager;
+import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.scheduler.persist.TaskSchedule;
+import com.starrocks.sql.ast.UserIdentity;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -50,6 +52,9 @@ public class Task implements Writable {
     @SerializedName("createTime")
     private long createTime;
 
+    @SerializedName("catalogName")
+    private String catalogName;
+
     @SerializedName("dbName")
     private String dbName;
 
@@ -70,7 +75,13 @@ public class Task implements Writable {
 
     // set default to ROOT is for compatibility
     @SerializedName("createUser")
-    private String createUser = AuthenticationManager.ROOT_USER;
+    @Deprecated
+    private String createUser = AuthenticationMgr.ROOT_USER;
+
+    @SerializedName("createUserIdentity")
+    private UserIdentity userIdentity;
+
+    public Task() {}
 
     public Task(String name) {
         this.name = name;
@@ -129,6 +140,14 @@ public class Task implements Writable {
         this.createTime = createTime;
     }
 
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public void setCatalogName(String catalogName) {
+        this.catalogName = catalogName;
+    }
+
     public String getDbName() {
         return ClusterNamespace.getNameFromFullName(dbName);
     }
@@ -148,6 +167,10 @@ public class Task implements Writable {
 
     public Map<String, String> getProperties() {
         return properties;
+    }
+
+    public String getPropertiesString() {
+        return PropertyAnalyzer.stringifyProperties(properties);
     }
 
     public void setProperties(Map<String, String> properties) {
@@ -178,6 +201,14 @@ public class Task implements Writable {
         this.createUser = createUser;
     }
 
+    public UserIdentity getUserIdentity() {
+        return userIdentity;
+    }
+
+    public void setUserIdentity(UserIdentity userIdentity) {
+        this.userIdentity = userIdentity;
+    }
+
     public String getPostRun() {
         return postRun;
     }
@@ -197,4 +228,22 @@ public class Task implements Writable {
         Text.writeString(out, json);
     }
 
+    @Override
+    public String toString() {
+        return "Task{" +
+                "id=" + id +
+                ", name='" + name + '\'' +
+                ", type=" + type +
+                ", state=" + state +
+                ", schedule=" + schedule +
+                ", createTime=" + createTime +
+                ", dbName='" + dbName + '\'' +
+                ", definition='" + definition + '\'' +
+                ", postRun='" + postRun + '\'' +
+                ", properties=" + properties +
+                ", expireTime=" + expireTime +
+                ", source=" + source +
+                ", createUser='" + createUser + '\'' +
+                '}';
+    }
 }

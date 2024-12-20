@@ -42,20 +42,14 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.MockedAuth;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStorageType;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
-import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Test;
 
 import java.util.LinkedList;
 import java.util.List;
@@ -63,8 +57,6 @@ import java.util.List;
 public class DropMaterializedViewStmtTest {
 
     Analyzer analyzer;
-    @Mocked
-    Auth auth;
     private GlobalStateMgr globalStateMgr;
     @Mocked
     private ConnectContext connectContext;
@@ -72,7 +64,6 @@ public class DropMaterializedViewStmtTest {
     @Before
     public void setUp() {
         analyzer = AccessTestUtil.fetchAdminAnalyzer();
-        MockedAuth.mockedAuth(auth);
         globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
         analyzer = new Analyzer(globalStateMgr, connectContext);
         Database db = new Database(50000L, "test");
@@ -88,8 +79,8 @@ public class DropMaterializedViewStmtTest {
         OlapTable table = new OlapTable(30000, "table",
                 baseSchema, KeysType.AGG_KEYS, singlePartitionInfo, null);
         table.setBaseIndexId(100);
-        db.createTable(table);
-        table.addPartition(new Partition(100, "p",
+        db.registerTableUnlocked(table);
+        table.addPartition(new Partition(100, 101, "p",
                 new MaterializedIndex(200, MaterializedIndex.IndexState.NORMAL), null));
         table.setIndexMeta(200, "mvname", baseSchema, 0, 0, (short) 0,
                 TStorageType.COLUMN, KeysType.AGG_KEYS);
@@ -98,11 +89,6 @@ public class DropMaterializedViewStmtTest {
             @Mock
             GlobalStateMgr getCurrentState() {
                 return globalStateMgr;
-            }
-
-            @Mock
-            Auth getAuth() {
-                return auth;
             }
 
             @Mock

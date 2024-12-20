@@ -37,7 +37,6 @@ package com.starrocks.mysql;
 import com.google.common.collect.ImmutableMap;
 import com.starrocks.authentication.UserAuthenticationInfo;
 import com.starrocks.common.Config;
-import com.starrocks.mysql.privilege.Password;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.UserIdentity;
 import org.apache.logging.log4j.LogManager;
@@ -53,8 +52,7 @@ public class MysqlHandshakePacket extends MysqlPacket {
     private static final int SCRAMBLE_LENGTH = 20;
     // Version of handshake packet, since MySQL 3.21.0, Handshake of protocol 10 is used
     private static final int PROTOCOL_VERSION = 10;
-    // JDBC use this version to check which protocol the server support
-    private static final String SERVER_VERSION = Config.mysql_server_version;
+
     // 33 stands for UTF-8 character set
     private static final int CHARACTER_SET = 33;
     // use default capability for all
@@ -94,7 +92,8 @@ public class MysqlHandshakePacket extends MysqlPacket {
         }
 
         serializer.writeInt1(PROTOCOL_VERSION);
-        serializer.writeNulTerminateString(SERVER_VERSION);
+        // JDBC use this version to check which protocol the server support
+        serializer.writeNulTerminateString(Config.mysql_server_version);
         serializer.writeInt4(connectionId);
         // first 8 bytes of auth plugin data
         serializer.writeBytes(authPluginData, 0, 8);
@@ -138,35 +137,17 @@ public class MysqlHandshakePacket extends MysqlPacket {
         serializer.writeInt1(0);
     }
 
-    @Deprecated
-    // If user use kerberos for authentication, fe need to resend the handshake request.
-    public void buildKrb5AuthRequestDeprecated(MysqlSerializer serializer, String remoteIp, String user) throws Exception {
-        Password password = GlobalStateMgr.getCurrentState().getAuth().getUserPrivTable()
-                .getPasswordByApproximate(user, remoteIp);
-        if (password == null) {
-            String msg = String.format("Can not find password with [user: %s, remoteIp: %s].", user, remoteIp);
-            LOG.error(msg);
-            throw new Exception(msg);
-        }
-
-        String userRealm = password.getUserForAuthPlugin();
-        Class<?> authClazz = GlobalStateMgr.getCurrentState().getAuth().getAuthClazz();
-        Method method = authClazz.getMethod("buildKrb5HandshakeRequest", String.class, String.class);
-        byte[] packet = (byte[]) method.invoke(null, Config.authentication_kerberos_service_principal, userRealm);
-        serializer.writeBytes(packet);
-    }
-
     // If user use kerberos for authentication, fe need to resend the handshake request.
     public void buildKrb5AuthRequest(MysqlSerializer serializer, String remoteIp, String user) throws Exception {
-        Map.Entry<UserIdentity, UserAuthenticationInfo>  authenticationInfo =
-                GlobalStateMgr.getCurrentState().getAuthenticationManager().getBestMatchedUserIdentity(user, remoteIp);
+        Map.Entry<UserIdentity, UserAuthenticationInfo> authenticationInfo =
+                GlobalStateMgr.getCurrentState().getAuthenticationMgr().getBestMatchedUserIdentity(user, remoteIp);
         if (authenticationInfo == null) {
             String msg = String.format("Can not find kerberos authentication with [user: %s, remoteIp: %s].", user, remoteIp);
             LOG.error(msg);
             throw new Exception(msg);
         }
         String userRealm = authenticationInfo.getValue().getTextForAuthPlugin();
-        Class<?> authClazz = GlobalStateMgr.getCurrentState().getAuthenticationManager().getAuthClazz();
+        Class<?> authClazz = GlobalStateMgr.getCurrentState().getAuthenticationMgr().getAuthClazz();
         Method method = authClazz.getMethod("buildKrb5HandshakeRequest", String.class, String.class);
         byte[] packet = (byte[]) method.invoke(null, Config.authentication_kerberos_service_principal, userRealm);
         serializer.writeBytes(packet);

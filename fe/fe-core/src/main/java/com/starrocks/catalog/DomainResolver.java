@@ -37,9 +37,8 @@ package com.starrocks.catalog;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.authentication.AuthenticationManager;
-import com.starrocks.common.util.LeaderDaemon;
-import com.starrocks.mysql.privilege.Auth;
+import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.common.util.FrontendDaemon;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -57,24 +56,16 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * DomainResolver resolve the domain name saved in user property to list of IPs,
  * and refresh password entries in user priv table, periodically.
  */
-public class DomainResolver extends LeaderDaemon {
+public class DomainResolver extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(DomainResolver.class);
     // this is only available in BAIDU, for resolving BNS
     private static final String BNS_RESOLVER_TOOLS_PATH = "/usr/bin/get_instance_by_service";
 
-    private Auth auth;
-    private AuthenticationManager authenticationManager;
+    private AuthenticationMgr authenticationManager;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    public DomainResolver(Auth auth) {
+    public DomainResolver(AuthenticationMgr authenticationManager) {
         super("domain resolver", 10L * 1000);
-        this.auth = auth;
-        this.authenticationManager = null;
-    }
-
-    public DomainResolver(AuthenticationManager authenticationManager) {
-        super("domain resolver", 10L * 1000);
-        this.auth = null;
         this.authenticationManager = authenticationManager;
     }
 
@@ -82,10 +73,9 @@ public class DomainResolver extends LeaderDaemon {
      * if a follower has just transfered to leader, or if it is replaying a AuthUpgrade journal.
      * this function will be called to switch from using Auth to using AuthenticationManager.
      */
-    public void setAuthenticationManager(AuthenticationManager manager) {
+    public void setAuthenticationManager(AuthenticationMgr manager) {
         lock.writeLock().lock();
         try {
-            this.auth = null;
             this.authenticationManager = manager;
         } finally {
             lock.writeLock().unlock();
@@ -99,12 +89,7 @@ public class DomainResolver extends LeaderDaemon {
         try {
             // domain names
             Set<String> allDomains;
-            if (auth != null) {
-                allDomains = Sets.newHashSet();
-                auth.getAllDomains(allDomains);
-            } else {
-                allDomains = authenticationManager.getAllHostnames();
-            }
+            allDomains = authenticationManager.getAllHostnames();
 
             // resolve domain name
             Map<String, Set<String>> resolvedIPsMap = Maps.newHashMap();
@@ -120,11 +105,7 @@ public class DomainResolver extends LeaderDaemon {
             }
 
             // refresh user priv table by resolved IPs
-            if (auth != null) {
-                auth.refreshUserPrivEntriesByResolvedIPs(resolvedIPsMap);
-            } else {
-                authenticationManager.setHostnameToIpSet(resolvedIPsMap);
-            }
+            authenticationManager.setHostnameToIpSet(resolvedIPsMap);
         } finally {
             lock.readLock().unlock();
         }
@@ -208,7 +189,7 @@ public class DomainResolver extends LeaderDaemon {
                     bufferedReader.close();
                 }
             } catch (IOException e) {
-                LOG.error("Close bufferedReader error! " + e);
+                LOG.error("Close bufferedReader error! ", e);
             }
         }
     }

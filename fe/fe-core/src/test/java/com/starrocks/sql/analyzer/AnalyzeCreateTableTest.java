@@ -14,7 +14,11 @@
 
 package com.starrocks.sql.analyzer;
 
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.InternalCatalog;
+import com.starrocks.server.MetadataMgr;
 import com.starrocks.sql.ast.CreateTableStmt;
+import mockit.Expectations;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -248,14 +252,38 @@ public class AnalyzeCreateTableTest {
     @Test
     public void testNullDistribution() {
         String sql = "create table table1 (col1 char(10) not null) engine=olap duplicate key(col1)";
-        analyzeFail(sql);
+        analyzeSuccess(sql);
+    }
+
+    @Test
+    public void testRandomDistribution() {
+        analyzeSuccess("create table table1 (col1 char(10) not null) engine=olap duplicate key(col1) distributed by random");
+        analyzeSuccess("create table table1 (col1 char(10) not null) engine=olap duplicate key(col1) " +
+                "distributed by random buckets 10");
     }
 
     @Test
     public void testExternalTable() {
         analyzeSuccess("create external table table1 (col1 char(10) not null) engine=olap distributed by hash(col1) buckets 10");
-        analyzeFail("create external table table1 (col1 char(10) not null) engine=olap duplicate key(col1)",
-                "Create olap table should contain distribution desc");
+        analyzeSuccess("create external table table1 (col1 char(10) not null) engine=olap " +
+                "distributed by random buckets 10");
+    }
+
+    @Test
+    public void testRandomDistributionForAggKeyDefault() {
+        analyzeFail("create table table1 (col1 char(10) not null, col2 bigint sum) engine=olap aggregate key(col1)");
+    }
+
+    @Test
+    public void testRandomDistributionForAggKey() {
+        analyzeSuccess("create table table1 (col1 char(10) not null, col2 bigint sum) engine=olap aggregate key(col1) " +
+                "distributed by random");
+        analyzeSuccess("create table table1 (col1 char(10) not null, col2 bigint sum) engine=olap aggregate key(col1) " +
+                "distributed by random buckets 10");
+        analyzeFail("create table table1 (col1 char(10) not null, col2 bigint replace) engine=olap aggregate key(col1) " +
+                "distributed by random buckets 10");
+        analyzeFail("create table table1 (col1 char(10) not null, col2 bigint REPLACE_IF_NOT_NULL) " +
+                "engine=olap aggregate key(col1) distributed by random buckets 10");
     }
 
     @Test
@@ -265,24 +293,158 @@ public class AnalyzeCreateTableTest {
         analyzeSuccess("create external table table1 (col0 int, col1 array<array<int>>) " +
                 "engine=hive properties('key' = 'value')");
 
-        analyzeFail("create table table1 (col0 int, col1 array<map<int,int>>) " +
+        analyzeSuccess("create table table1 (col0 int, col1 array<map<int,int>>) " +
                 "engine=olap distributed by hash(col0) buckets 10");
         analyzeSuccess("create external table table1 (col0 int, col1 array<map<int,int>>) " +
                 "engine=hive properties('key' = 'value')");
 
-        analyzeFail("create table table1 (col0 int, col1 array<struct<a int>>) " +
+        analyzeSuccess("create table table1 (col0 int, col1 array<struct<a int>>) " +
                 "engine=olap distributed by hash(col0) buckets 10");
         analyzeSuccess("create external table table1 (col0 int, col1 array<struct<a int>>) " +
                 "engine=hive properties('key' = 'value')");
 
-        analyzeFail("create table table1 (col0 int, col1 map<int,int>) " +
+        analyzeSuccess("create table table1 (col0 int, col1 map<int,int>) " +
                 "engine=olap distributed by hash(col0) buckets 10");
         analyzeSuccess("create external table table1 (col0 int, col1 map<int,int>) " +
                 "engine=hive properties('key' = 'value')");
 
-        analyzeFail("create table table1 (col0 int, col1 struct<a int>) " +
+        analyzeSuccess("create table table1 (col0 int, col1 struct<a int>) " +
                 "engine=olap distributed by hash(col0) buckets 10");
         analyzeSuccess("create external table table1 (col0 int, col1 struct<a int>) " +
                 "engine=hive properties('key' = 'value')");
+    }
+
+    @Test
+    public void testIceberg() throws Exception {
+        analyzeFail("create external table not_exist_catalog.iceberg_db.iceberg_table (k1 int, k2 int)");
+
+        String createIcebergCatalogStmt = "create external catalog iceberg_catalog properties (\"type\"=\"iceberg\", " +
+                "\"hive.metastore.uris\"=\"thrift://hms:9083\", \"iceberg.catalog.type\"=\"hive\")";
+        AnalyzeTestUtil.getStarRocksAssert().withCatalog(createIcebergCatalogStmt);
+
+        MetadataMgr metadata = AnalyzeTestUtil.getConnectContext().getGlobalStateMgr().getMetadataMgr();
+        new Expectations(metadata) {
+            {
+                metadata.getDb("iceberg_catalog", "not_exist_db");
+                result = null;
+                minTimes = 0;
+            }
+        };
+        analyzeFail("create external table iceberg_catalog.not_exist_db.iceberg_table (k1 int, k2 int)");
+
+        new Expectations(metadata) {
+            {
+                metadata.getDb("iceberg_catalog", "iceberg_db");
+                result = new Database();
+                minTimes = 0;
+
+                metadata.tableExists("iceberg_catalog", "iceberg_db", anyString);
+                result = false;
+            }
+        };
+
+        analyzeSuccess("create external table iceberg_catalog.iceberg_db.iceberg_table (k1 int, k2 int)");
+        analyzeSuccess("create external table iceberg_catalog.iceberg_db.iceberg_table (k1 int, k2 int) partition by (k2)");
+
+        analyzeFail("create external table iceberg_catalog.iceberg_db.iceberg_table (k1 int, k2 int) partition by (error_col)");
+        analyzeFail("create external table iceberg_catalog.iceberg_db.iceberg_table (k1 int, dt datetime) partition by days(dt)");
+
+        AnalyzeTestUtil.getConnectContext().setCurrentCatalog("default_catalog");
+        analyzeFail("create external table iceberg_db.iceberg_table (k1 int, k2 int) partition by (k2)");
+
+        AnalyzeTestUtil.getConnectContext().setCurrentCatalog("iceberg_catalog");
+        analyzeSuccess("create external table iceberg_db.iceberg_table (k1 int, k2 int) partition by (k2)");
+
+        AnalyzeTestUtil.getConnectContext().setDatabase("iceberg_db");
+        analyzeSuccess("create external table iceberg_table (k1 int, k2 int) partition by (k2)");
+        analyzeSuccess("create external table iceberg_table (k1 int, k2 int) engine=iceberg partition by (k2)");
+
+        String createHiveCatalogStmt = "create external catalog hive_catalog properties (\"type\"=\"hive\", " +
+                "\"hive.metastore.uris\"=\"thrift://hms:9083\")";
+        AnalyzeTestUtil.getStarRocksAssert().withCatalog(createHiveCatalogStmt);
+        new Expectations(metadata) {
+            {
+                metadata.getDb("hive_catalog", "hive_db");
+                result = new Database();
+                minTimes = 0;
+            }
+        };
+
+        AnalyzeTestUtil.getConnectContext().setCurrentCatalog(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+        AnalyzeTestUtil.getConnectContext().setDatabase("test");
+    }
+
+    @Test
+    public void testGeneratedColumnWithExternalTable() throws Exception {
+        analyzeFail("create external table ex_hive_tbl0 (col_tinyint tinyint null comment \"column tinyint\"," + 
+                    "col_varchar varchar(5), col_boolean boolean null comment \"column boolean\", col_new int" + 
+                    "as col_tinyint+1) ENGINE=hive properties (\"resource\" = \"hive_resource\"," +
+                    "\"table\" = \"hive_hdfs_orc_nocompress\"," +
+                    "\"database\" = \"hive_extbl_test\");");
+    }
+
+    @Test
+    public void testGeneratedColumnOnAGGTable() throws Exception {
+        analyzeFail("CREATE TABLE t ( id BIGINT NOT NULL,  name BIGINT NOT NULL, v1 BIGINT SUM as id)" +
+                    "AGGREGATE KEY (id) DISTRIBUTED BY HASH(id) BUCKETS 1 " +
+                    "PROPERTIES(\"replication_num\" = \"1\", \"replicated_storage\"=\"true\");");
+    }
+
+    @Test
+    public void testNgrambloomIndex() throws Exception {
+        // create index with non-existent column
+        String sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL3) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "INDEX1 column does not exist in table.");
+
+        // create index in non-string column
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 INT," +
+                "INDEX INDEX1(COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "Invalid ngram bloom filter column 'COL2': unsupported type INT");
+
+        // create index with multiple columns
+        sql = "CREATE TABLE TABLE1 (COL1 VARCHAR(10), COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL1, COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "INDEX1 index can only apply to a single column");
+
+        // create index with wrong fpp
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '1', 'GRAM_NUM' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "Bloom filter fpp should in [1.0E-4, 0.05]");
+
+        // create index with wrong gram num
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '0'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "Ngram Bloom filter's gram_num should be positive number");
+
+        // create index with agg mode's non-key column, col3 use sum as agg function
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10), COL3 VARCHAR(10) REPLACE," +
+                "INDEX INDEX1(COL3) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "Ngram Bloom filter index only used in columns of " +
+                "DUP_KEYS/PRIMARY table or key columns of UNIQUE_KEYS/AGG_KEYS table");
+
+        // create index with invalid properties
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2', 'CASE_SENSITIVE' = '2'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeFail(sql, "Ngram Bloom filter's case_sensitive should be true or false");
+
+        // create index with correct fpp and gram num and case-insensitive
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL2) USING NGRAMBF ('BLOOM_FILTER_FPP' = '0.01', 'GRAM_NUM' = '2', 'CASE_SENSITIVE' = 'false'))" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeSuccess(sql);
+
+        // create index with default valus
+        sql = "CREATE TABLE TABLE1 (COL1 INT, COL2 VARCHAR(10)," +
+                "INDEX INDEX1(COL2) USING NGRAMBF)" +
+                "AGGREGATE KEY(COL1, COL2) DISTRIBUTED BY HASH(COL1) BUCKETS 10;";
+        analyzeSuccess(sql);
     }
 }
